@@ -1,13 +1,19 @@
 FROM ruby:3.2-slim
 
-# WhatWeb is not on RubyGems — clone from GitHub
+# build-essential required for native gem extensions (json, racc, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
         git curl \
+        build-essential ruby-dev \
     && git clone --depth 1 https://github.com/urbanadventurer/WhatWeb /opt/whatweb \
-    && cd /opt/whatweb && gem install bundler && bundle install \
+    && cd /opt/whatweb \
+    && gem install bundler --no-document \
+    && bundle config set --local without 'development test' \
+    && bundle install --no-cache \
     && ln -s /opt/whatweb/whatweb /usr/local/bin/whatweb \
-    && rm -rf /var/lib/apt/lists/*
+    # Strip build tools to reduce image size
+    && apt-get purge -y --auto-remove build-essential ruby-dev \
+    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.bundle/cache
 
 WORKDIR /app
 
