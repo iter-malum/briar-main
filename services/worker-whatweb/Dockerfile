@@ -1,9 +1,12 @@
 FROM ruby:3.2-slim
 
+# WhatWeb is not on RubyGems — clone from GitHub
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip python3-venv \
-        git curl build-essential \
-    && gem install whatweb \
+        python3 python3-pip \
+        git curl \
+    && git clone --depth 1 https://github.com/urbanadventurer/WhatWeb /opt/whatweb \
+    && cd /opt/whatweb && gem install bundler && bundle install \
+    && ln -s /opt/whatweb/whatweb /usr/local/bin/whatweb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
