@@ -1,0 +1,224 @@
+# ============================================================
+#  Briar DAST — GitLab CI/CD Integration Template
+# ============================================================
+#
+# Usage
+# -----
+# 1. Copy this file into your application repository.
+# 2. Set the following CI/CD variables in GitLab:
+#    Settings → CI/CD → Variables
+#
+#    BRIAR_URL           — Briar gateway URL  (e.g. https://briar.example.com)
+#    BRIAR_TOKEN         — JWT token for the Briar API
+#    BRIAR_TARGET_URL    — URL to scan           (e.g. https://staging.example.com)
+#    BRIAR_WEBHOOK_TOKEN — Shared secret matching GITLAB_WEBHOOK_TOKEN env var in Briar
+#
+# 3. (Optional) Set BRIAR_TOOLS to a comma-separated list of tools to run.
+#    Default: whatweb,katana,httpx,ffuf,nuclei,zap
+#
+# 4. Add a webhook in GitLab:
+#    Settings → Webhooks → URL: https://briar.example.com/api/v1/integrations/gitlab/webhook
+#    Secret Token: <same as BRIAR_WEBHOOK_TOKEN>
+#    Trigger: Pipeline events
+#
+# Artifacts
+# ---------
+# The SARIF report is uploaded as a DAST artifact and appears in GitLab's
+# Security Dashboard (requires GitLab Ultimate / Gold plan).
+# ============================================================
+
+stages:
+  - test
+  - dast
+  - report
+
+variables:
+  BRIAR_URL: "${BRIAR_URL}"
+  BRIAR_TOKEN: "${BRIAR_TOKEN}"
+  BRIAR_TARGET_URL: "${BRIAR_TARGET_URL}"
+  BRIAR_TOOLS: "whatweb,katana,httpx,ffuf,nuclei,zap"
+  # Maximum seconds to wait for scan completion (default: 3600 = 1 hour)
+  BRIAR_POLL_TIMEOUT: "3600"
+  BRIAR_POLL_INTERVAL: "30"
+
+# ── Stage: dast ────────────────────────────────────────────────────────────────
+
+briar-dast:
+  stage: dast
+  image: curlimages/curl:8.6.0
+  rules:
+    # Run on merge requests targeting main/master
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    # Run on pushes to default branch
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    # Run manually from any branch
+    - when: manual
+      allow_failure: true
+  variables:
+    GIT_STRATEGY: none  # Don't clone the repo — we only call the API
+  script:
+    - |
+      echo "=== Briar DAST Scan ==="
+      echo "Target: ${BRIAR_TARGET_URL}"
+      echo "Tools:  ${BRIAR_TOOLS}"
+
+      # ── Create scan ──────────────────────────────────────────────────────────
+      TOOLS_JSON=$(echo "${BRIAR_TOOLS}" | python3 -c "
+      import sys, json
+      tools = sys.stdin.read().strip().split(',')
+      print(json.dumps(tools))
+      " 2>/dev/null || echo '["katana","nuclei","zap"]')
+
+      SCAN_RESPONSE=$(curl -sf \
+        -X POST "${BRIAR_URL}/api/v1/scans" \
+        -H "Authorization: Bearer ${BRIAR_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"target_url\":\"${BRIAR_TARGET_URL}\",\"tools\":${TOOLS_JSON}}")
+
+      if [ $? -ne 0 ]; then
+        echo "ERROR: Failed to create scan. Check BRIAR_URL and BRIAR_TOKEN."
+        exit 1
+      fi
+
+      SCAN_ID=$(echo "${SCAN_RESPONSE}" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+      if [ -z "${SCAN_ID}" ]; then
+        echo "ERROR: Could not parse scan ID from response:"
+        echo "${SCAN_RESPONSE}"
+        exit 1
+      fi
+
+      echo "Scan created: ${SCAN_ID}"
+      echo "BRIAR_SCAN_ID=${SCAN_ID}" >> briar.env
+
+      # ── Poll for completion ──────────────────────────────────────────────────
+      ELAPSED=0
+      while [ "${ELAPSED}" -lt "${BRIAR_POLL_TIMEOUT}" ]; do
+        sleep "${BRIAR_POLL_INTERVAL}"
+        ELAPSED=$((ELAPSED + BRIAR_POLL_INTERVAL))
+
+        STATUS_RESP=$(curl -sf \
+          "${BRIAR_URL}/api/v1/integrations/gitlab/scans/${SCAN_ID}/status" \
+          -H "Authorization: Bearer ${BRIAR_TOKEN}" || echo '{"status":"error"}')
+
+        STATUS=$(echo "${STATUS_RESP}" | grep -o '"status":"[^"]*"' | head -1 | cut -d'"' -f4)
+        echo "[${ELAPSED}s] Scan status: ${STATUS}"
+
+        case "${STATUS}" in
+          completed|failed)
+            echo "Scan finished with status: ${STATUS}"
+            break
+            ;;
+          error)
+            echo "Failed to poll scan status. Continuing anyway."
+            break
+            ;;
+        esac
+      done
+
+  artifacts:
+    reports: {}   # placeholder; see briar-report job below
+    paths:
+      - briar.env
+    expire_in: 1 day
+  environment:
+    name: dast/${CI_COMMIT_REF_SLUG}
+
+# ── Stage: report ──────────────────────────────────────────────────────────────
+
+briar-sarif-report:
+  stage: report
+  image: curlimages/curl:8.6.0
+  needs:
+    - job: briar-dast
+      artifacts: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |
+      source briar.env 2>/dev/null || true
+
+      if [ -z "${BRIAR_SCAN_ID}" ]; then
+        echo "No BRIAR_SCAN_ID found. Skipping SARIF download."
+        exit 0
+      fi
+
+      echo "Downloading SARIF report for scan ${BRIAR_SCAN_ID}..."
+
+      curl -sf \
+        "${BRIAR_URL}/api/v1/integrations/gitlab/sarif/${BRIAR_SCAN_ID}" \
+        -H "Authorization: Bearer ${BRIAR_TOKEN}" \
+        -o gl-dast-report.sarif
+
+      if [ $? -eq 0 ]; then
+        echo "SARIF report saved to gl-dast-report.sarif"
+        FINDING_COUNT=$(grep -c '"ruleId"' gl-dast-report.sarif 2>/dev/null || echo 0)
+        echo "Total findings in report: ${FINDING_COUNT}"
+      else
+        echo "WARNING: Failed to download SARIF report. Creating empty report."
+        echo '{"version":"2.1.0","runs":[]}' > gl-dast-report.sarif
+      fi
+
+  artifacts:
+    reports:
+      dast: gl-dast-report.sarif
+    paths:
+      - gl-dast-report.sarif
+    expire_in: 30 days
+  environment:
+    name: dast/${CI_COMMIT_REF_SLUG}
+
+# ── Optional: fail pipeline on critical findings ───────────────────────────────
+
+briar-gate:
+  stage: report
+  image: curlimages/curl:8.6.0
+  needs:
+    - job: briar-dast
+      artifacts: true
+  # Remove the allow_failure to make critical findings block the pipeline
+  allow_failure: true
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  variables:
+    GIT_STRATEGY: none
+    # Set to "0" to block pipeline on any critical/high finding
+    BRIAR_MAX_CRITICAL: "0"
+    BRIAR_MAX_HIGH: "5"
+  script:
+    - |
+      source briar.env 2>/dev/null || true
+
+      if [ -z "${BRIAR_SCAN_ID}" ]; then
+        echo "No scan ID, skipping gate check."
+        exit 0
+      fi
+
+      STATUS_RESP=$(curl -sf \
+        "${BRIAR_URL}/api/v1/integrations/gitlab/scans/${BRIAR_SCAN_ID}/status" \
+        -H "Authorization: Bearer ${BRIAR_TOKEN}" || echo '{}')
+
+      CRITICAL=$(echo "${STATUS_RESP}" | grep -o '"critical":[0-9]*' | cut -d: -f2 || echo 0)
+      HIGH=$(echo "${STATUS_RESP}" | grep -o '"high":[0-9]*' | cut -d: -f2 || echo 0)
+      MEDIUM=$(echo "${STATUS_RESP}" | grep -o '"medium":[0-9]*' | cut -d: -f2 || echo 0)
+
+      echo "Findings: critical=${CRITICAL} high=${HIGH} medium=${MEDIUM}"
+
+      FAIL=0
+      if [ "${CRITICAL:-0}" -gt "${BRIAR_MAX_CRITICAL}" ]; then
+        echo "GATE FAILED: ${CRITICAL} critical findings exceed threshold of ${BRIAR_MAX_CRITICAL}"
+        FAIL=1
+      fi
+      if [ "${HIGH:-0}" -gt "${BRIAR_MAX_HIGH}" ]; then
+        echo "GATE FAILED: ${HIGH} high findings exceed threshold of ${BRIAR_MAX_HIGH}"
+        FAIL=1
+      fi
+
+      if [ "${FAIL}" -eq 1 ]; then
+        exit 1
+      fi
+
+      echo "Security gate passed."

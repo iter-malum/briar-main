@@ -1,0 +1,58 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    project: briar-dast
+
+# ── Alerting rules (optional: add alertmanager here) ──────────────────────────
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+# ── Scrape configs ─────────────────────────────────────────────────────────────
+scrape_configs:
+
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: "briar-orchestrator"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["orchestrator:8000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "orchestrator"
+
+  - job_name: "briar-integration-service"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["integration-service:8000"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "integration-service"
+
+  # Workers expose metrics on port 9090 via prometheus_client's default registry.
+  # Since workers are not HTTP servers, we use the push-gateway approach OR
+  # they expose a minimal HTTP server. For simplicity, the BaseWorker metrics
+  # are collected via the orchestrator/integration-service which aggregate them.
+  # To scrape workers directly, enable a metrics HTTP server in each worker.
+
+  - job_name: "rabbitmq"
+    static_configs:
+      - targets: ["rabbitmq:15692"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "rabbitmq"
+
+  - job_name: "postgres"
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: "postgres"
