@@ -7,4 +7,5 @@ asyncpg==0.29.0
 pydantic==2.5.2
 pydantic-settings==2.1.0
 python-dotenv==1.0.0
-python-owasp-zap-v2.4==0.0.21prometheus-client==0.20.0
+python-owasp-zap-v2.4==0.0.21
+prometheus-client==0.20.0
