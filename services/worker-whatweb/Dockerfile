@@ -1,24 +1,35 @@
-FROM ruby:3.2-slim
+# ── Stage 1: build WhatWeb gems ───────────────────────────────────────────────
+FROM ruby:3.2-slim AS ruby-builder
 
-# build-essential required for native gem extensions (json, racc, etc.)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 python3-pip \
-        git curl \
-        build-essential ruby-dev \
+        git curl build-essential ruby-dev \
     && git clone --depth 1 https://github.com/urbanadventurer/WhatWeb /opt/whatweb \
     && cd /opt/whatweb \
     && gem install bundler --no-document \
     && bundle config set --local without 'development test' \
+    && bundle config set --local path '/opt/whatweb/vendor/bundle' \
     && bundle install --no-cache \
-    && ln -s /opt/whatweb/whatweb /usr/local/bin/whatweb \
-    # Strip build tools to reduce image size
-    && apt-get purge -y --auto-remove build-essential ruby-dev \
-    && rm -rf /var/lib/apt/lists/* /tmp/* /root/.bundle/cache
+    && rm -rf /var/lib/apt/lists/* /tmp/*
+
+# ── Stage 2: Python worker with WhatWeb pre-built ─────────────────────────────
+FROM python:3.11-slim
+
+# Ruby runtime (no compiler needed — gems already built in stage 1)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ruby curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy WhatWeb + pre-built gems from builder
+COPY --from=ruby-builder /opt/whatweb /opt/whatweb
+COPY --from=ruby-builder /usr/local/lib/ruby /usr/local/lib/ruby
+COPY --from=ruby-builder /usr/local/bundle /usr/local/bundle
+
+RUN ln -s /opt/whatweb/whatweb /usr/local/bin/whatweb
 
 WORKDIR /app
 
 COPY services/worker-whatweb/requirements.txt ./requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-whatweb/main.py ./main.py
