@@ -86,6 +86,7 @@ services:
       ORCHESTRATOR_URL: http://orchestrator:8000
       AUTH_SERVICE_URL: http://auth-service:8000
       INTEGRATION_SERVICE_URL: http://integration-service:8000
+      UI_SERVICE_URL: http://ui-service:8000
       JWT_SECRET: super_secret_key_for_development_only
       JWT_ALGORITHM: HS256
     ports:
@@ -357,8 +358,10 @@ services:
       - ui-service
       - gateway
     environment:
-      VITE_GATEWAY_URL: http://localhost:8000
-      VITE_UI_API_URL: http://localhost:8003
+      # Proxy targets for Vite dev server (resolved inside Docker network).
+      # NOT injected into the browser bundle — only used server-side by Vite.
+      API_TARGET: http://gateway:8000
+      WS_TARGET: ws://ui-service:8000
     ports:
       - "3000:3000"
     networks:

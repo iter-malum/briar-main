@@ -17,6 +17,7 @@ logger = setup_logger("api-gateway")
 app = FastAPI(title="Briar API Gateway", version="0.1.0")
 
 INTEGRATION_SERVICE_URL = os.getenv("INTEGRATION_SERVICE_URL", "http://integration-service:8000")
+UI_SERVICE_URL          = os.getenv("UI_SERVICE_URL",          "http://ui-service:8000")
 
 # Simple in-memory rate limiter
 RATE_LIMIT_PER_MIN = 120
@@ -24,7 +25,7 @@ rate_limit_store: defaultdict = defaultdict(list)
 
 
 def _validate_token(token: str) -> "JSONResponse | None":
-    """Returns a JSONResponse error if the token is invalid, None if valid."""
+    """Returns JSONResponse on failure, None on success."""
     try:
         jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
         return None
@@ -32,16 +33,45 @@ def _validate_token(token: str) -> "JSONResponse | None":
         return JSONResponse(status_code=401, content={"detail": "Invalid or expired token"})
 
 
+def _route(path: str, method: str) -> str:
+    """
+    Determine the upstream URL base for a given path + method.
+
+    Routing table:
+      POST /api/v1/scans            → orchestrator  (create scan)
+      *    /api/v1/scans/*          → ui-service    (read / sync)
+      GET  /api/v1/scans            → ui-service    (list)
+      GET  /api/v1/vulnerabilities* → ui-service
+      *    /api/v1/integrations/*   → integration-service
+      everything else               → orchestrator
+    """
+    # GitLab integration
+    if path.startswith("/api/v1/integrations/"):
+        return INTEGRATION_SERVICE_URL  # keep full path
+
+    # Scan creation → orchestrator (will strip /api/v1 prefix below)
+    if method == "POST" and path.rstrip("/") == "/api/v1/scans":
+        return settings.ORCHESTRATOR_URL  # strip prefix
+
+    # Read-only scan endpoints + sync → ui-service (keep full path)
+    if path.startswith("/api/v1/scans"):
+        return UI_SERVICE_URL
+
+    # Vulnerabilities → ui-service
+    if path.startswith("/api/v1/vulnerabilities"):
+        return UI_SERVICE_URL
+
+    # Default → orchestrator (strip /api/v1 prefix)
+    return settings.ORCHESTRATOR_URL
+
+
 async def _gateway_dispatch(request: Request, call_next):
     path = request.url.path
 
-    # ── Public paths — no auth, no rate-limit ─────────────────────────────────
-    public_paths = {"/health", "/docs", "/openapi.json", "/redoc"}
-    if path in public_paths:
+    # ── Public paths ─────────────────────────────────────────────────────────
+    if path in {"/health", "/docs", "/openapi.json", "/redoc"}:
         return await call_next(request)
 
-    # ── CORS preflight — already handled by CORSMiddleware (outermost),
-    #    but guard here too for safety ─────────────────────────────────────────
     if request.method == "OPTIONS":
         return Response(status_code=204)
 
@@ -57,26 +87,32 @@ async def _gateway_dispatch(request: Request, call_next):
     rate_limit_store[client_ip].append(now)
 
     # ── Optional JWT auth ─────────────────────────────────────────────────────
-    # GitLab webhook uses X-Gitlab-Token — skip JWT entirely.
-    # For all other routes: if an Authorization header IS present, validate it.
-    # If no header → allow through (token is optional).
+    # GitLab webhook uses X-Gitlab-Token — skip JWT.
+    # Token is OPTIONAL: only validate when the header is actually present.
     is_gitlab_webhook = path.startswith("/api/v1/integrations/gitlab/webhook")
     if not is_gitlab_webhook:
         auth_header = request.headers.get("Authorization", "")
         if auth_header:
             parts = auth_header.split(" ", 1)
             if len(parts) != 2 or parts[0].lower() != "bearer":
-                return JSONResponse(status_code=401, content={"detail": "Invalid Authorization header format"})
-            error = _validate_token(parts[1])
-            if error is not None:
-                return error
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid Authorization header format"},
+                )
+            err = _validate_token(parts[1])
+            if err is not None:
+                return err
 
     # ── Routing ───────────────────────────────────────────────────────────────
-    if path.startswith("/api/v1/integrations/"):
-        target_url = f"{INTEGRATION_SERVICE_URL}{path}"
-    else:
+    base = _route(path, request.method)
+
+    if base == settings.ORCHESTRATOR_URL:
+        # Strip /api/v1 prefix before forwarding to orchestrator
         target_path = path.replace("/api/v1", "", 1) if path.startswith("/api/v1") else path
-        target_url = f"{settings.ORCHESTRATOR_URL}{target_path or '/'}"
+        target_url = f"{base}{target_path or '/'}"
+    else:
+        # ui-service and integration-service already serve /api/v1/* paths
+        target_url = f"{base}{path}"
 
     if request.url.query:
         target_url += f"?{request.url.query}"
@@ -98,7 +134,6 @@ async def _gateway_dispatch(request: Request, call_next):
 
         content_type = resp.headers.get("content-type", "application/json")
 
-        # Pass-through binary/text (SARIF, Prometheus metrics, etc.)
         pass_through_types = (
             "application/sarif",
             "text/plain",
@@ -132,20 +167,19 @@ async def _gateway_dispatch(request: Request, call_next):
         logger.error(f"Proxy error → {target_url}: {exc}")
         return JSONResponse(status_code=502, content={"detail": f"Upstream unreachable: {exc}"})
     except Exception as exc:
-        logger.error(f"Unexpected gateway error: {exc}", exc_info=True)
+        logger.error(f"Gateway error: {exc}", exc_info=True)
         return JSONResponse(status_code=500, content={"detail": f"Gateway error: {exc}"})
 
 
-# ── Middleware registration order matters in Starlette:
-#    add_middleware() prepends — the LAST call becomes the OUTERMOST layer.
-#    We want: CORSMiddleware (outermost) → gateway logic → routes
-#    So: register gateway first, then CORS. ─────────────────────────────────
+# ── Middleware order: register gateway first, then CORS.
+#    Starlette prepends each new middleware → CORS becomes outermost,
+#    so CORS headers appear on ALL responses including early error returns. ─────
 
 app.add_middleware(BaseHTTPMiddleware, dispatch=_gateway_dispatch)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # tighten in production (e.g. ["http://localhost:3000"])
+    allow_origins=["*"],        # restrict in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
