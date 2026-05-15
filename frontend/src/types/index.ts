@@ -27,13 +27,15 @@ export interface Vulnerability {
   vulnerability_type: string | null
   description: string | null
   created_at: string
+  count?: number
+  affected_urls?: string[]
 }
 
 export interface GraphNode {
   id: string
   label: string
   url?: string
-  type: 'endpoint' | 'vulnerability'
+  type: 'endpoint' | 'vulnerability' | 'root'
   method?: string
   discovered_by?: string
   severity?: Severity
@@ -42,6 +44,7 @@ export interface GraphNode {
   has_critical?: boolean
   has_high?: boolean
   description?: string
+  max_severity?: string
   // react-force-graph internal positioning
   x?: number
   y?: number

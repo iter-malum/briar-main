@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink } from 'lucide-react'
-import { fetchScans, createScan } from '../api/client'
+import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink, StopCircle } from 'lucide-react'
+import { fetchScans, createScan, cancelScan } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import type { Scan } from '../types'
 
@@ -98,9 +98,18 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
 }
 
 function ScanRow({ scan }: { scan: Scan }) {
+  const qc = useQueryClient()
   const completed = scan.steps.filter((s) => s.status === 'completed').length
   const total = scan.steps.length
   const pct = total ? Math.round((completed / total) * 100) : 0
+  const runningStep = scan.steps.find((s) => s.status === 'running')
+
+  const cancelMut = useMutation({
+    mutationFn: () => cancelScan(scan.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['scans'] })
+    },
+  })
 
   return (
     <tr className="border-b border-briar-border hover:bg-white/[0.02] transition-colors">
@@ -117,7 +126,14 @@ function ScanRow({ scan }: { scan: Scan }) {
         </a>
       </td>
       <td className="table-cell">
-        <StatusBadge value={scan.status} />
+        <div className="flex items-center gap-2">
+          <StatusBadge value={scan.status} />
+          {scan.status === 'running' && runningStep && (
+            <span className="text-xs font-mono text-emerald-400 bg-emerald-400/10 px-1.5 py-0.5 rounded">
+              {runningStep.tool}
+            </span>
+          )}
+        </div>
       </td>
       <td className="table-cell">
         <div className="flex items-center gap-2">
@@ -139,6 +155,19 @@ function ScanRow({ scan }: { scan: Scan }) {
           <Link to={`/scan/${scan.id}/vulns`} className="btn-ghost py-1 px-2 flex items-center gap-1">
             <ShieldAlert size={14} /> Vulns
           </Link>
+          {scan.status === 'running' && (
+            <button
+              onClick={() => {
+                if (confirm('Cancel this scan?')) cancelMut.mutate()
+              }}
+              disabled={cancelMut.isPending}
+              className="flex items-center gap-1 px-2 py-1 rounded text-red-400 border border-red-500/30 hover:bg-red-500/10 text-xs transition-colors"
+              title="Stop scan"
+            >
+              <StopCircle size={12} />
+              {cancelMut.isPending ? '…' : 'Stop'}
+            </button>
+          )}
         </div>
       </td>
     </tr>

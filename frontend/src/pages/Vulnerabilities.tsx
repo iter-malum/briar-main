@@ -1,18 +1,24 @@
 import { useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowLeft, Download, Filter } from 'lucide-react'
+import { ArrowLeft, Download, Filter, ChevronDown, ChevronRight, Layers, List } from 'lucide-react'
 import { fetchVulnerabilities } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import type { Severity, Vulnerability } from '../types'
 
 const SEVERITIES: Array<Severity | ''> = ['', 'critical', 'high', 'medium', 'low', 'info']
-const TOOLS = ['', 'nuclei', 'zap', 'ffuf']
+const TOOLS = ['', 'nuclei', 'zap', 'sqlmap', 'ffuf']
 
 function exportCsv(rows: Vulnerability[]) {
-  const header = 'id,scan_id,tool,severity,url,type,description,created_at'
+  const header = 'tool,severity,type,count,description'
   const lines = rows.map((r) =>
-    [r.id, r.scan_id, r.tool, r.severity, r.url ?? '', r.vulnerability_type ?? '', (r.description ?? '').replace(/,/g, ';'), r.created_at].join(','),
+    [
+      r.tool,
+      r.severity,
+      r.vulnerability_type ?? '',
+      (r as any).count ?? 1,
+      (r.description ?? '').replace(/,/g, ';'),
+    ].join(','),
   )
   const blob = new Blob([[header, ...lines].join('\n')], { type: 'text/csv' })
   const a = document.createElement('a')
@@ -29,19 +35,73 @@ function exportJson(rows: Vulnerability[]) {
   a.click()
 }
 
+function GroupedRow({ v }: { v: Vulnerability }) {
+  const [open, setOpen] = useState(false)
+  const urls: string[] = (v as any).affected_urls ?? []
+  const count: number = (v as any).count ?? 1
+
+  return (
+    <>
+      <tr
+        className="border-b border-briar-border hover:bg-white/[0.02] transition-colors cursor-pointer"
+        onClick={() => setOpen((x) => !x)}
+      >
+        <td className="table-cell">
+          <StatusBadge value={v.severity} variant="severity" />
+        </td>
+        <td className="table-cell font-medium text-sm">{v.vulnerability_type ?? '—'}</td>
+        <td className="table-cell">
+          <span className="text-xs font-mono text-slate-400">{v.tool}</span>
+        </td>
+        <td className="table-cell text-center">
+          <span className="text-sm font-bold text-slate-200">{count}</span>
+          <span className="text-xs text-slate-500 ml-1">URL{count !== 1 ? 's' : ''}</span>
+        </td>
+        <td className="table-cell max-w-sm">
+          <p className="text-xs text-slate-400 line-clamp-1">{v.description ?? '—'}</p>
+        </td>
+        <td className="table-cell text-slate-500 w-6">
+          {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+        </td>
+      </tr>
+      {open && urls.length > 0 && (
+        <tr className="border-b border-briar-border bg-briar-bg/40">
+          <td colSpan={6} className="px-4 py-2">
+            <div className="space-y-1 max-h-48 overflow-y-auto">
+              {urls.map((url) => (
+                <a
+                  key={url}
+                  href={url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="block text-xs text-briar-accent hover:underline truncate"
+                >
+                  {url}
+                </a>
+              ))}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  )
+}
+
 export default function Vulnerabilities() {
   const { id } = useParams<{ id: string }>()
   const [severity, setSeverity] = useState<string>('')
   const [tool, setTool] = useState<string>('')
+  const [grouped, setGrouped] = useState(true)
 
   const { data: vulns, isLoading, isError } = useQuery({
-    queryKey: ['vulns', id, severity, tool],
+    queryKey: ['vulns', id, severity, tool, grouped],
     queryFn: () =>
       fetchVulnerabilities({
         scan_id: id,
         severity: severity || undefined,
         tool: tool || undefined,
         limit: 500,
+        deduplicate: grouped,
       }),
     refetchInterval: 10000,
   })
@@ -52,6 +112,10 @@ export default function Vulnerabilities() {
         count: vulns.filter((v) => v.severity === s).length,
       }))
     : []
+
+  const totalAffected = grouped
+    ? vulns?.reduce((acc, v) => acc + ((v as any).count ?? 1), 0) ?? 0
+    : vulns?.length ?? 0
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-5">
@@ -68,16 +132,37 @@ export default function Vulnerabilities() {
             {id && <p className="text-slate-400 text-sm mt-0.5">Scan {id.slice(0, 8)}…</p>}
           </div>
         </div>
-        {vulns && vulns.length > 0 && (
-          <div className="flex gap-2">
-            <button onClick={() => exportCsv(vulns)} className="btn-ghost flex items-center gap-1">
-              <Download size={14} /> CSV
+        <div className="flex gap-2 items-center">
+          {/* Grouped / Flat toggle */}
+          <div className="flex items-center gap-1 bg-briar-bg border border-briar-border rounded-lg p-0.5">
+            <button
+              onClick={() => setGrouped(true)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                grouped ? 'bg-briar-accent text-white' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <Layers size={12} /> Grouped
             </button>
-            <button onClick={() => exportJson(vulns)} className="btn-ghost flex items-center gap-1">
-              <Download size={14} /> JSON
+            <button
+              onClick={() => setGrouped(false)}
+              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
+                !grouped ? 'bg-briar-accent text-white' : 'text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <List size={12} /> All
             </button>
           </div>
-        )}
+          {vulns && vulns.length > 0 && (
+            <>
+              <button onClick={() => exportCsv(vulns)} className="btn-ghost flex items-center gap-1">
+                <Download size={14} /> CSV
+              </button>
+              <button onClick={() => exportJson(vulns)} className="btn-ghost flex items-center gap-1">
+                <Download size={14} /> JSON
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Severity summary */}
@@ -87,7 +172,9 @@ export default function Vulnerabilities() {
             <button
               key={sev}
               onClick={() => setSeverity(severity === sev ? '' : sev)}
-              className={`card text-center hover:border-briar-accent/50 transition-colors ${severity === sev ? 'border-briar-accent' : ''}`}
+              className={`card text-center hover:border-briar-accent/50 transition-colors ${
+                severity === sev ? 'border-briar-accent' : ''
+              }`}
             >
               <div className="text-2xl font-bold text-slate-100">{count}</div>
               <StatusBadge value={sev} variant="severity" />
@@ -122,7 +209,12 @@ export default function Vulnerabilities() {
             Clear filters
           </button>
         )}
-        <span className="ml-auto text-xs text-slate-500">{vulns?.length ?? 0} results</span>
+        <span className="ml-auto text-xs text-slate-500">
+          {vulns?.length ?? 0} {grouped ? 'unique types' : 'findings'}
+          {grouped && totalAffected > 0 && (
+            <span className="text-slate-600 ml-1">({totalAffected} total occurrences)</span>
+          )}
+        </span>
       </div>
 
       {/* Table */}
@@ -139,43 +231,33 @@ export default function Vulnerabilities() {
                 <tr>
                   <th className="table-header">Severity</th>
                   <th className="table-header">Type</th>
-                  <th className="table-header">URL</th>
                   <th className="table-header">Tool</th>
+                  <th className="table-header text-center">{grouped ? 'Affected' : 'URL'}</th>
                   <th className="table-header">Description</th>
-                  <th className="table-header">Found</th>
+                  <th className="table-header w-6"></th>
                 </tr>
               </thead>
               <tbody>
-                {vulns.map((v) => (
-                  <tr key={v.id} className="border-b border-briar-border hover:bg-white/[0.02] transition-colors">
-                    <td className="table-cell">
-                      <StatusBadge value={v.severity} variant="severity" />
-                    </td>
-                    <td className="table-cell font-medium">{v.vulnerability_type ?? '—'}</td>
-                    <td className="table-cell max-w-xs">
-                      {v.url ? (
-                        <a
-                          href={v.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-briar-accent hover:underline text-xs truncate block"
-                          title={v.url}
-                        >
-                          {v.url}
-                        </a>
-                      ) : '—'}
-                    </td>
-                    <td className="table-cell">
-                      <span className="text-xs font-mono text-slate-400">{v.tool}</span>
-                    </td>
-                    <td className="table-cell max-w-sm">
-                      <p className="text-xs text-slate-400 line-clamp-2">{v.description ?? '—'}</p>
-                    </td>
-                    <td className="table-cell text-xs text-slate-500 whitespace-nowrap">
-                      {new Date(v.created_at).toLocaleString()}
-                    </td>
-                  </tr>
-                ))}
+                {grouped
+                  ? vulns.map((v) => <GroupedRow key={`${v.vulnerability_type}-${v.tool}`} v={v} />)
+                  : vulns.map((v) => (
+                      <tr key={v.id} className="border-b border-briar-border hover:bg-white/[0.02]">
+                        <td className="table-cell"><StatusBadge value={v.severity} variant="severity" /></td>
+                        <td className="table-cell font-medium text-sm">{v.vulnerability_type ?? '—'}</td>
+                        <td className="table-cell"><span className="text-xs font-mono text-slate-400">{v.tool}</span></td>
+                        <td className="table-cell max-w-xs">
+                          {v.url ? (
+                            <a href={v.url} target="_blank" rel="noreferrer"
+                              className="text-briar-accent hover:underline text-xs truncate block">{v.url}</a>
+                          ) : '—'}
+                        </td>
+                        <td className="table-cell max-w-sm">
+                          <p className="text-xs text-slate-400 line-clamp-2">{v.description ?? '—'}</p>
+                        </td>
+                        <td className="table-cell"></td>
+                      </tr>
+                    ))
+                }
               </tbody>
             </table>
           </div>

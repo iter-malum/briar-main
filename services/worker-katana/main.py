@@ -32,16 +32,21 @@ class KatanaWorker(BaseWorker):
     async def execute_tool(self, target: str, auth_context: Dict[str, Any], task_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Запуск Katana краулера"""
         
-        # ✅ Базовая команда с ПРАВИЛЬНЫМИ флагами
         cmd = [
-            "/usr/local/bin/katana",  # ✅ Полный путь к бинарнику
+            "/usr/local/bin/katana",
             "-u", target,
-            "-jsonl",                  # ✅ JSON Lines output (не -json!)
+            "-jsonl",
             "-depth", str(self.depth),
             "-c", str(self.concurrency),
-            "-silent",                 # Только метаданные, без баннера
+            "-silent",
             "-no-color",
-            "-eof", "raw,body"                # ✅ Отключаем цвета для чистого JSON
+            "-jc",          # Always enable JavaScript crawling
+            "-fx",          # Form extraction
+            "-aff",         # Automatic form fill for deeper discovery
+            "-kf", "all",   # Known files (robots.txt, sitemap.xml, etc.)
+            "-rl", "100",   # Rate limit (requests/second)
+            "-timeout", "15",  # Per-request timeout
+            "-retry", "1",
         ]
         
         # Добавляем заголовки аутентификации
@@ -62,10 +67,6 @@ class KatanaWorker(BaseWorker):
             cmd.extend(["-H", f"@{cookies_file}"])
         
         # Дополнительные параметры из payload
-        if task_payload.get("js_crawl"):
-            cmd.append("-jc")  # JavaScript crawl
-        if task_payload.get("form_extraction"):
-            cmd.append("-fx")  # Form extraction
         if task_payload.get("headless"):
             cmd.append("-headless")
             cmd.append("-no-sandbox")

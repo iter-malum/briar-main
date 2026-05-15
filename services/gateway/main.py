@@ -38,22 +38,31 @@ def _route(path: str, method: str) -> str:
     Determine the upstream URL base for a given path + method.
 
     Routing table:
-      POST /api/v1/scans            → orchestrator  (create scan)
-      *    /api/v1/scans/*          → ui-service    (read / sync)
-      GET  /api/v1/scans            → ui-service    (list)
-      GET  /api/v1/vulnerabilities* → ui-service
-      *    /api/v1/integrations/*   → integration-service
-      everything else               → orchestrator
+      POST   /api/v1/scans               → orchestrator  (create scan)
+      POST   /api/v1/scans/{id}/cancel   → orchestrator  (cancel scan)
+      POST   /api/v1/scans/{id}/sync     → ui-service    (neo4j sync)
+      GET    /api/v1/scans*              → ui-service    (list / detail / graph)
+      GET    /api/v1/vulnerabilities*    → ui-service
+      *      /api/v1/integrations/*      → integration-service
+      everything else                    → orchestrator
     """
     # GitLab integration
     if path.startswith("/api/v1/integrations/"):
-        return INTEGRATION_SERVICE_URL  # keep full path
+        return INTEGRATION_SERVICE_URL
 
-    # Scan creation → orchestrator (will strip /api/v1 prefix below)
+    # Scan creation (POST /api/v1/scans exactly) → orchestrator
     if method == "POST" and path.rstrip("/") == "/api/v1/scans":
-        return settings.ORCHESTRATOR_URL  # strip prefix
+        return settings.ORCHESTRATOR_URL
 
-    # Read-only scan endpoints + sync → ui-service (keep full path)
+    # Cancel scan (POST /api/v1/scans/{id}/cancel) → orchestrator
+    if method == "POST" and path.endswith("/cancel"):
+        return settings.ORCHESTRATOR_URL
+
+    # Neo4j sync (POST /api/v1/scans/{id}/sync) → ui-service (keep full path)
+    if method == "POST" and path.endswith("/sync"):
+        return UI_SERVICE_URL
+
+    # All other scan reads (GET list / detail / graph) → ui-service
     if path.startswith("/api/v1/scans"):
         return UI_SERVICE_URL
 

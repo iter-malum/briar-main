@@ -272,71 +272,127 @@ async def get_scan(scan_id: str):
     }
 
 
+def _parent_id(url: str, all_urls: set, root_id: str) -> str:
+    """Find closest ancestor URL in the known set, or fall back to root."""
+    from urllib.parse import urlparse
+    try:
+        p = urlparse(url)
+        parts = [x for x in p.path.split("/") if x]
+        for depth in range(len(parts) - 1, 0, -1):
+            candidate = f"{p.scheme}://{p.netloc}/" + "/".join(parts[:depth])
+            if candidate in all_urls or candidate + "/" in all_urls:
+                return candidate
+    except Exception:
+        pass
+    return root_id
+
+
 @app.get("/api/v1/scans/{scan_id}/graph")
 async def get_scan_graph(scan_id: str):
-    """Returns graph data for React-Force-Graph: { nodes, links }"""
-    await sync_scan_to_neo4j(scan_id)
+    """
+    Returns tree graph data for React-Force-Graph.
+    Only includes httpx-confirmed endpoints (not raw katana crawl results).
+    Builds a URL path-hierarchy tree rooted at the scan's target_url.
+    Vulnerability info is overlaid as node attributes (vuln_count, severity).
+    """
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan_id")
 
-    driver = await get_neo4j()
-    if not driver:
-        return await _graph_from_postgres(scan_id)
+    async with session_factory() as db:
+        # Load scan for target URL
+        scan_res = await db.execute(select(ScanORM).where(ScanORM.id == scan_uuid))
+        scan = scan_res.scalars().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        # httpx-confirmed endpoints only
+        httpx_res = await db.execute(
+            select(ScanResultORM).where(
+                ScanResultORM.scan_id == scan_uuid,
+                ScanResultORM.tool == "httpx",
+                ScanResultORM.url.isnot(None),
+            )
+        )
+        httpx_rows = httpx_res.scalars().all()
+
+        # Vulnerability findings (not recon tools)
+        vuln_res = await db.execute(
+            select(ScanResultORM).where(
+                ScanResultORM.scan_id == scan_uuid,
+                ScanResultORM.tool.notin_(["katana", "httpx", "whatweb", "ffuf"]),
+                ScanResultORM.url.isnot(None),
+            )
+        )
+        vuln_rows = vuln_res.scalars().all()
+
+    root_id = "__root__"
+    root_url = scan.target_url.rstrip("/")
+
+    # Deduplicate httpx endpoints
+    seen: dict = {}
+    for row in httpx_rows:
+        url = (row.url or "").rstrip("/")
+        if url and url not in seen:
+            seen[url] = row
+
+    all_urls = set(seen.keys())
+
+    # Vuln index: url → list of severity values
+    sev_order = ["info", "low", "medium", "high", "critical"]
+    vuln_index: dict = {}
+    for v in vuln_rows:
+        url = (v.url or "").rstrip("/")
+        sev = v.severity.value if hasattr(v.severity, "value") else str(v.severity)
+        entry = vuln_index.setdefault(url, {"count": 0, "max_sev": "info", "types": set()})
+        entry["count"] += 1
+        entry["types"].add(v.vulnerability_type or "unknown")
+        if sev_order.index(sev) > sev_order.index(entry["max_sev"]):
+            entry["max_sev"] = sev
 
     nodes: list = []
     links: list = []
 
-    try:
-        async with driver.session() as neo:
-            # Endpoint nodes with aggregated vuln info
-            endpoint_res = await neo.run(
-                """
-                MATCH (e:Endpoint {scan_id: $scan_id})
-                OPTIONAL MATCH (e)-[:HAS_VULN]->(v:Vulnerability)
-                RETURN e.url AS url, e.method AS method, e.discovered_by AS discovered_by,
-                       count(v) AS vuln_count,
-                       collect(DISTINCT v.severity) AS severities
-                """,
-                scan_id=scan_id,
-            )
-            async for rec in endpoint_res:
-                sevs = [s for s in rec["severities"] if s]
-                nodes.append({
-                    "id": rec["url"],
-                    "label": rec["url"].split("/")[-1] or "/",
-                    "url": rec["url"],
-                    "type": "endpoint",
-                    "method": rec["method"] or "GET",
-                    "discovered_by": rec["discovered_by"] or "unknown",
-                    "vuln_count": rec["vuln_count"] or 0,
-                    "has_critical": "critical" in sevs,
-                    "has_high": "high" in sevs,
-                })
+    # Root node
+    root_vuln = vuln_index.get(root_url, {})
+    nodes.append({
+        "id": root_id,
+        "label": root_url,
+        "url": root_url,
+        "type": "root",
+        "vuln_count": root_vuln.get("count", 0),
+        "max_severity": root_vuln.get("max_sev", "info"),
+        "status_code": 200,
+    })
 
-            # Vulnerability nodes + edges
-            vuln_res = await neo.run(
-                """
-                MATCH (e:Endpoint {scan_id: $scan_id})-[:HAS_VULN]->(v:Vulnerability)
-                RETURN v.id AS id, v.type AS type, v.severity AS severity,
-                       v.tool AS tool, v.description AS description, e.url AS endpoint_url
-                """,
-                scan_id=scan_id,
-            )
-            async for rec in vuln_res:
-                vuln_id = f"vuln-{rec['id']}"
-                nodes.append({
-                    "id": vuln_id,
-                    "label": rec["type"] or "Unknown",
-                    "type": "vulnerability",
-                    "severity": rec["severity"],
-                    "tool": rec["tool"],
-                    "description": rec["description"] or "",
-                })
-                links.append({"source": rec["endpoint_url"], "target": vuln_id})
+    for url, row in seen.items():
+        vuln_info = vuln_index.get(url, {})
+        raw = row.raw_output or {}
+        status = raw.get("status_code", 0)
 
-        return {"nodes": nodes, "links": links}
+        nodes.append({
+            "id": url,
+            "label": url.split("/")[-1] or url.split("/")[-2] or "/",
+            "url": url,
+            "type": "endpoint",
+            "status_code": status,
+            "vuln_count": vuln_info.get("count", 0),
+            "max_severity": vuln_info.get("max_sev", "info"),
+            "has_critical": vuln_info.get("max_sev") == "critical",
+            "has_high": vuln_info.get("max_sev") in ("high", "critical"),
+            "vuln_types": list(vuln_info.get("types", set()))[:5],
+            "discovered_by": "httpx",
+            "title": raw.get("title", ""),
+            "content_type": raw.get("content_type", ""),
+        })
 
-    except Exception as exc:
-        logger.error(f"Neo4j graph query failed: {exc}", exc_info=True)
-        return await _graph_from_postgres(scan_id)
+        parent = _parent_id(url, all_urls, root_id)
+        # Avoid self-loops (root URL in endpoints)
+        if parent != url:
+            links.append({"source": parent, "target": url})
+
+    return {"nodes": nodes, "links": links}
 
 
 @app.get("/api/v1/vulnerabilities")
@@ -344,12 +400,16 @@ async def list_vulnerabilities(
     scan_id: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     tool: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=1000),
+    limit: int = Query(200, ge=1, le=2000),
+    deduplicate: bool = Query(True, description="Group identical vulnerability types, aggregate affected URLs"),
 ):
     async with session_factory() as db:
-        stmt = select(ScanResultORM).where(ScanResultORM.tool.notin_(["katana", "httpx"]))
+        stmt = select(ScanResultORM).where(ScanResultORM.tool.notin_(["katana", "httpx", "whatweb"]))
         if scan_id:
-            stmt = stmt.where(ScanResultORM.scan_id == UUID(scan_id))
+            try:
+                stmt = stmt.where(ScanResultORM.scan_id == UUID(scan_id))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid scan_id")
         if severity:
             stmt = stmt.where(ScanResultORM.severity == severity)
         if tool:
@@ -357,6 +417,34 @@ async def list_vulnerabilities(
         stmt = stmt.order_by(ScanResultORM.created_at.desc()).limit(limit)
         res = await db.execute(stmt)
         vulns = res.scalars().all()
+
+    sev_order = ["info", "low", "medium", "high", "critical"]
+
+    if deduplicate:
+        groups: dict = {}
+        for v in vulns:
+            sev = v.severity.value if hasattr(v.severity, "value") else str(v.severity)
+            key = (v.vulnerability_type or "unknown", v.tool)
+            if key not in groups:
+                groups[key] = {
+                    "id": str(v.id),
+                    "scan_id": str(v.scan_id),
+                    "tool": v.tool,
+                    "severity": sev,
+                    "vulnerability_type": v.vulnerability_type,
+                    "description": v.description,
+                    "created_at": v.created_at.isoformat(),
+                    "count": 0,
+                    "affected_urls": [],
+                }
+            g = groups[key]
+            g["count"] += 1
+            if v.url and v.url not in g["affected_urls"]:
+                g["affected_urls"].append(v.url)
+            # Keep worst severity
+            if sev_order.index(sev) > sev_order.index(g["severity"]):
+                g["severity"] = sev
+        return list(groups.values())
 
     return [
         {
@@ -368,6 +456,8 @@ async def list_vulnerabilities(
             "vulnerability_type": v.vulnerability_type,
             "description": v.description,
             "created_at": v.created_at.isoformat(),
+            "count": 1,
+            "affected_urls": [v.url] if v.url else [],
         }
         for v in vulns
     ]

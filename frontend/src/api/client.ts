@@ -29,6 +29,11 @@ export const fetchScanGraph = (id: string): Promise<GraphData> =>
 export const triggerSync = (id: string): Promise<void> =>
   fetch(`/api/v1/scans/${id}/sync`, { method: 'POST' }).then(() => undefined)
 
+export const cancelScan = async (id: string): Promise<void> => {
+  const res = await fetch(`/api/v1/scans/${id}/cancel`, { method: 'POST' })
+  if (!res.ok) throw new Error(`Cancel failed: ${res.statusText}`)
+}
+
 // ── Vulnerabilities ───────────────────────────────────────────────────────────
 
 export interface VulnParams {
@@ -36,6 +41,7 @@ export interface VulnParams {
   severity?: string
   tool?: string
   limit?: number
+  deduplicate?: boolean
 }
 
 export const fetchVulnerabilities = (params: VulnParams = {}): Promise<Vulnerability[]> => {
@@ -44,6 +50,7 @@ export const fetchVulnerabilities = (params: VulnParams = {}): Promise<Vulnerabi
   if (params.severity) qs.set('severity', params.severity)
   if (params.tool) qs.set('tool', params.tool)
   if (params.limit) qs.set('limit', String(params.limit))
+  qs.set('deduplicate', String(params.deduplicate ?? true))
   return get(`/api/v1/vulnerabilities?${qs}`)
 }
 

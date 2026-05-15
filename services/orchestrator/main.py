@@ -378,6 +378,47 @@ async def get_scan(scan_id: str, session: AsyncSession = Depends(get_db)):
     return scan
 
 
+@app.post("/scans/{scan_id}/cancel")
+async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_db)):
+    """Cancel a running or pending scan — marks it and all in-flight steps as failed."""
+    try:
+        stmt = (
+            select(ScanORM)
+            .options(selectinload(ScanORM.steps))
+            .where(ScanORM.id == UUID(scan_id))
+        )
+        result = await session.execute(stmt)
+        scan = result.scalars().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        if scan.status in (ScanStatus.completed, ScanStatus.failed):
+            raise HTTPException(status_code=400, detail=f"Scan already in terminal state: {scan.status.value}")
+
+        scan.status = ScanStatus.failed
+        scan.updated_at = datetime.utcnow()
+        now = datetime.utcnow()
+        for step in scan.steps:
+            if step.status in (ScanStatus.pending, ScanStatus.running):
+                step.status = ScanStatus.failed
+                step.finished_at = now
+        await session.commit()
+
+        # Decrement active_scans gauge safely
+        try:
+            active_scans.dec()
+        except Exception:
+            pass
+
+        logger.info(f"Scan {scan_id} cancelled by user request")
+        return {"scan_id": scan_id, "status": "cancelled"}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await session.rollback()
+        logger.error(f"Cancel failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.get("/metrics")
 async def metrics():
     """Prometheus metrics endpoint."""
