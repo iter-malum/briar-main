@@ -22,6 +22,14 @@ RUN ARCH=$(if [ "$TARGETARCH" = "amd64" ]; then echo "amd64"; elif [ "$TARGETARC
     rm /tmp/katana.zip && \
     /usr/local/bin/katana -version
 
+# Install gau (GetAllUrls) for passive URL discovery from public archives
+RUN ARCH=$(if [ "$TARGETARCH" = "amd64" ]; then echo "amd64"; elif [ "$TARGETARCH" = "arm64" ]; then echo "arm64"; else echo "$TARGETARCH"; fi) && \
+    curl -sL -o /tmp/gau.tar.gz \
+      "https://github.com/lc/gau/releases/download/v2.2.4/gau_2.2.4_linux_${ARCH}.tar.gz" && \
+    tar -xzf /tmp/gau.tar.gz -C /usr/local/bin/ gau && \
+    chmod +x /usr/local/bin/gau && \
+    rm /tmp/gau.tar.gz || true
+
 WORKDIR /app
 
 COPY services/worker-katana/requirements.txt ./

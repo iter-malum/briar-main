@@ -78,7 +78,8 @@ class KatanaWorker(BaseWorker):
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd="/tmp/katana"
+                limit=10 * 1024 * 1024,  # 10 MB line buffer — katana can output huge JSON lines
+                cwd="/tmp/katana",
             )
             
             results = []
@@ -93,8 +94,19 @@ class KatanaWorker(BaseWorker):
             
             if process.returncode not in [0, None]:
                 logger.warning(f"Katana exited with code {process.returncode}")
-            
+
             logger.info(f"Katana found {len(results)} endpoints")
+
+            # Passive URL discovery from public archives
+            gau_results = await self._run_gau(target)
+            # Deduplicate against katana results
+            existing_urls = {r["url"] for r in results}
+            for r in gau_results:
+                if r["url"] not in existing_urls:
+                    results.append(r)
+                    existing_urls.add(r["url"])
+            logger.info(f"[katana+gau] Total unique endpoints: {len(results)}")
+
             return results
             
         except asyncio.TimeoutError:
@@ -105,6 +117,46 @@ class KatanaWorker(BaseWorker):
             return []
         except Exception as e:
             logger.error(f"Katana execution failed: {e}", exc_info=True)
+            return []
+
+    async def _run_gau(self, target: str) -> list:
+        """Run gau (GetAllUrls) for passive URL discovery from public archives."""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(target).netloc
+            if not host:
+                return []
+
+            process = await asyncio.create_subprocess_exec(
+                "gau", "--threads", "5", "--timeout", "30",
+                "--blacklist", "png,jpg,gif,svg,ico,css,woff,woff2,ttf,eot",
+                host,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_data, _ = await asyncio.wait_for(
+                process.communicate(), timeout=60
+            )
+            urls = [
+                u.strip() for u in stdout_data.decode("utf-8", errors="ignore").splitlines()
+                if u.strip().startswith("http")
+            ]
+            logger.info(f"[gau] Found {len(urls)} historical URLs for {host}")
+            return [
+                {
+                    "url": u,
+                    "type": "endpoint",
+                    "description": "Discovered via gau (public archives)",
+                    "severity": SeverityLevel.info,
+                    "raw_output": {"source": "gau"},
+                }
+                for u in urls[:500]  # cap at 500
+            ]
+        except FileNotFoundError:
+            logger.debug("[gau] gau not installed, skipping passive discovery")
+            return []
+        except Exception as exc:
+            logger.warning(f"[gau] Failed: {exc}")
             return []
 
     async def _read_stream(self, stream, results_list, is_stderr=False):

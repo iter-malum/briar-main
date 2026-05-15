@@ -36,9 +36,10 @@ function nodeColor(node: GraphNode): string {
 }
 
 function nodeRadius(node: GraphNode): number {
-  if (node.type === 'root') return 14
+  if (node.type === 'root') return 8
   const vc = (node as any).vuln_count as number ?? 0
-  return Math.max(5, 5 + vc * 1.2)
+  // Logarithmic scaling: 0 vulns=4px, 5=6px, 23=8px (max 10px)
+  return 4 + Math.min(Math.log1p(vc) * 2, 6)
 }
 
 // ── Tool status panel ─────────────────────────────────────────────────────────
@@ -138,6 +139,7 @@ export default function ScanGraph() {
   const qc = useQueryClient()
   const graphRef = useRef<ForceGraphMethods<GraphNode, GraphLink>>(null)
   const containerRef = useRef<HTMLDivElement>(null)
+  const engineStoppedRef = useRef(false)
   const [dims, setDims] = useState({ w: 800, h: 600 })
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
 
@@ -176,6 +178,10 @@ export default function ScanGraph() {
   }, [lastEvent, refetchGraph, refetchScan])
 
   useEffect(() => {
+    engineStoppedRef.current = false
+  }, [graphData])
+
+  useEffect(() => {
     if (!containerRef.current) return
     const ro = new ResizeObserver((entries) => {
       const e = entries[0]
@@ -202,13 +208,21 @@ export default function ScanGraph() {
         ctx.stroke()
       }
 
-      // Label
-      const fontSize = Math.max(4, Math.min(r * 0.8, 9))
-      ctx.font = `${fontSize}px sans-serif`
-      ctx.fillStyle = 'rgba(255,255,255,0.8)'
-      ctx.textAlign = 'center'
-      const label = (node.label ?? '').slice(0, 22)
-      ctx.fillText(label, x, y + r + fontSize + 1)
+      // Labels: always show for root and selected; show for high/critical severity
+      const sev = (node as any).max_severity as string | undefined
+      const isSelected = selectedNode?.id === node.id
+      const showLabel = node.type === 'root' || isSelected ||
+        sev === 'critical' || sev === 'high'
+      if (showLabel) {
+        const fontSize = node.type === 'root' ? 9 : 7
+        ctx.font = `${fontSize}px sans-serif`
+        ctx.fillStyle = node.type === 'root'
+          ? 'rgba(255,255,255,0.95)'
+          : 'rgba(255,255,255,0.75)'
+        ctx.textAlign = 'center'
+        const label = (node.label ?? '').slice(0, 28)
+        ctx.fillText(label, x, y + r + fontSize + 2)
+      }
     },
     [selectedNode],
   )
@@ -248,7 +262,7 @@ export default function ScanGraph() {
           <button onClick={() => graphRef.current?.zoom(1.3, 300)} className="btn-ghost p-1"><ZoomIn size={14} /></button>
           <button onClick={() => graphRef.current?.zoom(0.77, 300)} className="btn-ghost p-1"><ZoomOut size={14} /></button>
           <button onClick={() => graphRef.current?.zoomToFit(400)} className="btn-ghost p-1"><Maximize2 size={14} /></button>
-          {scan?.status === 'running' && (
+          {(scan?.status === 'running' || scan?.status === 'pending') && (
             <button
               onClick={() => {
                 if (confirm('Cancel this scan?')) cancelMut.mutate()
@@ -285,8 +299,13 @@ export default function ScanGraph() {
               backgroundColor="#0f1117"
               dagMode="radial"
               dagLevelDistance={80}
-              cooldownTicks={120}
-              onEngineStop={() => graphRef.current?.zoomToFit(500, 60)}
+              cooldownTicks={100}
+              onEngineStop={() => {
+                if (!engineStoppedRef.current) {
+                  engineStoppedRef.current = true
+                  graphRef.current?.zoomToFit(400, 80)
+                }
+              }}
             />
           )}
 

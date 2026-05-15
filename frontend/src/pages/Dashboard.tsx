@@ -155,7 +155,7 @@ function ScanRow({ scan }: { scan: Scan }) {
           <Link to={`/scan/${scan.id}/vulns`} className="btn-ghost py-1 px-2 flex items-center gap-1">
             <ShieldAlert size={14} /> Vulns
           </Link>
-          {scan.status === 'running' && (
+          {(scan.status === 'running' || scan.status === 'pending') && (
             <button
               onClick={() => {
                 if (confirm('Cancel this scan?')) cancelMut.mutate()
