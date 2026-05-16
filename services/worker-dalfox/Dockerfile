@@ -13,9 +13,11 @@ RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sou
         ca-certificates \
     && curl -sL -o /tmp/dalfox.tar.gz \
         "https://github.com/hahwul/dalfox/releases/download/v${DALFOX_VERSION}/dalfox-linux-amd64.tar.gz" \
-    && tar -xzf /tmp/dalfox.tar.gz -C /usr/local/bin dalfox \
+    && mkdir -p /tmp/dalfox-extract \
+    && tar -xzf /tmp/dalfox.tar.gz -C /tmp/dalfox-extract \
+    && find /tmp/dalfox-extract -type f -executable | head -1 | xargs -I{} mv {} /usr/local/bin/dalfox \
     && chmod +x /usr/local/bin/dalfox \
-    && rm /tmp/dalfox.tar.gz \
+    && rm -rf /tmp/dalfox.tar.gz /tmp/dalfox-extract \
     && rm -rf /var/lib/apt/lists/* \
     && dalfox version
 
