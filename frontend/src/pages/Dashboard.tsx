@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink, StopCircle } from 'lucide-react'
-import { fetchScans, createScan, cancelScan, fetchAuthSessions } from '../api/client'
+import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink, StopCircle, Trash2 } from 'lucide-react'
+import { fetchScans, createScan, cancelScan, deleteScan, fetchAuthSessions } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import type { Scan, AuthSession } from '../types'
 
@@ -165,9 +165,13 @@ function ScanRow({ scan }: { scan: Scan }) {
 
   const cancelMut = useMutation({
     mutationFn: () => cancelScan(scan.id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['scans'] })
-    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scans'] }),
+  })
+
+  const deleteMut = useMutation({
+    mutationFn: () => deleteScan(scan.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['scans'] }),
+    onError: (e: Error) => alert(e.message),
   })
 
   return (
@@ -216,15 +220,24 @@ function ScanRow({ scan }: { scan: Scan }) {
           </Link>
           {(scan.status === 'running' || scan.status === 'pending') && (
             <button
-              onClick={() => {
-                if (confirm('Cancel this scan?')) cancelMut.mutate()
-              }}
+              onClick={() => { if (confirm('Cancel this scan?')) cancelMut.mutate() }}
               disabled={cancelMut.isPending}
               className="flex items-center gap-1 px-2 py-1 rounded text-red-400 border border-red-500/30 hover:bg-red-500/10 text-xs transition-colors"
               title="Stop scan"
             >
               <StopCircle size={12} />
               {cancelMut.isPending ? '…' : 'Stop'}
+            </button>
+          )}
+          {(scan.status === 'completed' || scan.status === 'failed') && (
+            <button
+              onClick={() => { if (confirm('Delete this scan and all its data?')) deleteMut.mutate() }}
+              disabled={deleteMut.isPending}
+              className="flex items-center gap-1 px-2 py-1 rounded text-slate-500 border border-slate-700 hover:text-red-400 hover:border-red-500/30 hover:bg-red-500/10 text-xs transition-colors"
+              title="Delete scan"
+            >
+              <Trash2 size={12} />
+              {deleteMut.isPending ? '…' : 'Delete'}
             </button>
           )}
         </div>

@@ -90,8 +90,8 @@ class GobusterWorker(BaseWorker):
         auth_context: Dict[str, Any],
         task_payload: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        # Use the first endpoint (or fall back to target)
-        url = endpoints[0] if endpoints else target
+        # Always brute-force against the base URL (scheme+host), never a specific file path
+        url = _extract_base_url(target, endpoints)
         if not url:
             logger.warning("[gobuster] No URL available for dir mode")
             return []
@@ -169,7 +169,7 @@ class GobusterWorker(BaseWorker):
         auth_context: Dict[str, Any],
         task_payload: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
-        url = endpoints[0] if endpoints else target
+        url = _extract_base_url(target, endpoints)
         if not url:
             logger.warning("[gobuster] No URL available for vhost mode")
             return []
@@ -334,6 +334,18 @@ def _parse_vhost_output(output_file: str, base_url: str) -> List[Dict[str, Any]]
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
+
+def _extract_base_url(target: str, endpoints: List[str]) -> str:
+    """Extract base URL (scheme://host) for gobuster — never use a deep file path."""
+    for candidate in ([target] if target else []) + (endpoints or []):
+        try:
+            p = urlparse(candidate)
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+    return target
+
 
 def _extract_domain(endpoints: List[str], fallback: str) -> str:
     """Extract bare hostname from the first available endpoint."""

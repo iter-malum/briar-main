@@ -34,6 +34,57 @@ export const cancelScan = async (id: string): Promise<void> => {
   if (!res.ok) throw new Error(`Cancel failed: ${res.statusText}`)
 }
 
+export const deleteScan = async (id: string): Promise<void> => {
+  const res = await fetch(`/api/v1/scans/${id}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`Delete failed: ${text}`)
+  }
+}
+
+export interface EndpointItem {
+  url: string
+  method: string
+  status_code: number
+  content_type: string
+  title: string
+  tool: string
+  has_params: boolean
+  param_names: string[]
+}
+
+export interface EndpointsResponse {
+  total: number
+  endpoints: EndpointItem[]
+}
+
+export const fetchScanEndpoints = (
+  id: string,
+  opts: { include_static?: boolean; source?: string } = {},
+): Promise<EndpointsResponse> => {
+  const qs = new URLSearchParams()
+  qs.set('include_static', String(opts.include_static ?? false))
+  if (opts.source) qs.set('source', opts.source)
+  return get(`/api/v1/scans/${id}/endpoints?${qs}`)
+}
+
+export const runTool = async (
+  scanId: string,
+  tool: string,
+  params: Record<string, any> = {},
+): Promise<{ scan_id: string; tool: string; status: string }> => {
+  const res = await fetch(`/api/v1/scans/${scanId}/run-tool`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tool, params }),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`Run tool failed: ${text}`)
+  }
+  return res.json()
+}
+
 // ── Vulnerabilities ───────────────────────────────────────────────────────────
 
 export interface VulnParams {

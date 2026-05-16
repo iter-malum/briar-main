@@ -15,13 +15,14 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Optional
 from uuid import UUID, uuid4
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 import aio_pika
 from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
 from fastapi.responses import Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -293,6 +294,9 @@ async def startup():
     logger.info("Creating PostgreSQL tables…")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Run migrations in a separate clean transaction
+    async with engine.begin() as conn:
         await _run_migrations(conn)
 
     await publisher.connect()
@@ -441,6 +445,78 @@ async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_db)):
     except Exception as exc:
         await session.rollback()
         logger.error(f"Cancel failed: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class RunToolRequest(BaseModel):
+    tool: str
+    params: Dict[str, Any] = {}
+
+
+@app.post("/scans/{scan_id}/run-tool")
+async def run_tool(
+    scan_id: str,
+    payload: RunToolRequest,
+    session: AsyncSession = Depends(get_db),
+):
+    """Launch a single tool against an existing scan, bypassing the normal pipeline."""
+    try:
+        stmt = (
+            select(ScanORM)
+            .options(selectinload(ScanORM.steps))
+            .where(ScanORM.id == UUID(scan_id))
+        )
+        result = await session.execute(stmt)
+        scan = result.scalars().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        tool = payload.tool
+        queue_name = TOOL_QUEUES.get(tool)
+        if not queue_name:
+            raise HTTPException(status_code=400, detail=f"Unknown tool: {tool}")
+
+        # Find or create the step for this tool
+        existing_step = next((s for s in scan.steps if s.tool == tool), None)
+        if existing_step:
+            existing_step.status = ScanStatus.pending
+            existing_step.started_at = None
+            existing_step.finished_at = None
+        else:
+            session.add(ScanStepORM(scan_id=scan.id, tool=tool, status=ScanStatus.pending))
+            tools = scan.config.get("tools", [])
+            if tool not in tools:
+                scan.config = {**scan.config, "tools": tools + [tool]}
+
+        # Re-open scan if it was already closed
+        if scan.status in (ScanStatus.completed, ScanStatus.failed):
+            scan.status = ScanStatus.running
+            active_scans.inc()
+
+        scan.updated_at = datetime.utcnow()
+        await session.commit()
+
+        # Publish directly to the tool's queue
+        msg = {
+            "event": "scan.task.created",
+            "scan_id": str(scan.id),
+            "target": scan.target_url,
+            "auth_session_id": scan.config.get("auth_session_id"),
+            "payload": {
+                "source_tools": [],
+                "phase": "manual",
+                "tool_params": payload.params,
+            },
+        }
+        await publisher.publish(queue_name, msg)
+        logger.info(f"[run-tool] Queued {tool} for scan {scan_id}")
+        return {"scan_id": scan_id, "tool": tool, "status": "queued"}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await session.rollback()
+        logger.error(f"Run-tool failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 

@@ -12,6 +12,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from neo4j import AsyncGraphDatabase, AsyncDriver
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import select
@@ -330,11 +331,11 @@ async def get_scan_graph(scan_id: str):
     root_id = "__root__"
     root_url = scan.target_url.rstrip("/")
 
-    # Deduplicate httpx endpoints
+    # Deduplicate httpx endpoints, skip static files
     seen: dict = {}
     for row in httpx_rows:
         url = (row.url or "").rstrip("/")
-        if url and url not in seen:
+        if url and url not in seen and not _is_static_url(url):
             seen[url] = row
 
     all_urls = set(seen.keys())
@@ -467,6 +468,110 @@ async def list_vulnerabilities(
 async def trigger_sync(scan_id: str):
     asyncio.create_task(sync_scan_to_neo4j(scan_id))
     return {"message": "Sync triggered", "scan_id": scan_id}
+
+
+# ── Static-file filter ────────────────────────────────────────────────────────
+
+_STATIC_EXTS = frozenset({
+    ".css", ".scss", ".less",
+    ".js", ".jsx", ".ts", ".tsx", ".mjs",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".avif",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".webm", ".ogg", ".wav",
+    ".pdf", ".zip", ".gz", ".tar", ".rar",
+    ".map", ".min",
+})
+
+
+def _is_static_url(url: str) -> bool:
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path.lower()
+        _, ext = os.path.splitext(path)
+        return ext in _STATIC_EXTS
+    except Exception:
+        return False
+
+
+# ── Delete scan ───────────────────────────────────────────────────────────────
+
+@app.delete("/api/v1/scans/{scan_id}", status_code=204)
+async def delete_scan(scan_id: str):
+    """Delete a completed/failed scan and all its data."""
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan_id")
+
+    async with session_factory() as db:
+        scan_res = await db.execute(
+            select(ScanORM).where(ScanORM.id == scan_uuid)
+        )
+        scan = scan_res.scalars().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+        if scan.status == ScanStatus.running:
+            raise HTTPException(status_code=409, detail="Stop the scan before deleting")
+        await db.delete(scan)
+        await db.commit()
+    return Response(status_code=204)
+
+
+# ── Endpoint list ─────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/scans/{scan_id}/endpoints")
+async def get_scan_endpoints(
+    scan_id: str,
+    include_static: bool = Query(False, description="Include static files (.js, .css, images…)"),
+    source: str = Query("katana,httpx", description="Comma-separated source tools"),
+):
+    """Return deduplicated endpoint list with optional static-file filtering."""
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan_id")
+
+    source_tools = [t.strip() for t in source.split(",") if t.strip()]
+
+    async with session_factory() as db:
+        stmt = select(ScanResultORM).where(
+            ScanResultORM.scan_id == scan_uuid,
+            ScanResultORM.tool.in_(source_tools),
+            ScanResultORM.url.isnot(None),
+        )
+        res = await db.execute(stmt)
+        rows = res.scalars().all()
+
+    seen: dict = {}
+    for row in rows:
+        url = (row.url or "").rstrip("/")
+        if not url:
+            continue
+        if not include_static and _is_static_url(url):
+            continue
+        raw = row.raw_output or {}
+        if url not in seen:
+            seen[url] = {
+                "url": url,
+                "method": row.request_method or raw.get("method", "GET"),
+                "status_code": raw.get("status_code", 0),
+                "content_type": raw.get("content_type", ""),
+                "title": raw.get("title", ""),
+                "tool": row.tool,
+                "has_params": bool(row.request_params),
+                "param_names": (row.request_params or {}).get("all", [])[:10],
+            }
+        elif row.tool == "httpx":
+            # Upgrade to httpx info if richer
+            seen[url].update({
+                "status_code": raw.get("status_code", seen[url]["status_code"]) or seen[url]["status_code"],
+                "content_type": raw.get("content_type", seen[url]["content_type"]),
+                "title": raw.get("title", seen[url]["title"]),
+                "tool": "httpx",
+            })
+
+    endpoints = sorted(seen.values(), key=lambda x: x["url"])
+    return {"total": len(endpoints), "endpoints": endpoints}
 
 
 # ── WebSocket real-time updates ───────────────────────────────────────────────
