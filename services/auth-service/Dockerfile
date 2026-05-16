@@ -18,7 +18,7 @@ RUN DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && \
 
 # noVNC web client + websockify (Python-based, no apt needed)
 RUN pip install --no-cache-dir websockify==0.11.0 && \
-    wget -qO /tmp/novnc.tar.gz \
+    curl -sL -o /tmp/novnc.tar.gz \
       https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.tar.gz && \
     tar -xzf /tmp/novnc.tar.gz -C /opt && \
     mv /opt/noVNC-1.4.0 /opt/novnc && \
