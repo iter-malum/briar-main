@@ -14,7 +14,7 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Install gobuster binary ────────────────────────────────────────────────────
-ENV GOBUSTER_VERSION=3.6.0
+ENV GOBUSTER_VERSION=3.8.2
 RUN curl -sL -o /tmp/gobuster.tar.gz \
       "https://github.com/OJ/gobuster/releases/download/v${GOBUSTER_VERSION}/gobuster_Linux_x86_64.tar.gz" && \
     tar -xzf /tmp/gobuster.tar.gz -C /usr/local/bin gobuster && \
