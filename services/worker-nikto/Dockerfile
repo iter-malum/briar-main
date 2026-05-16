@@ -14,6 +14,8 @@ RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sou
         libnet-ssleay-perl \
         libio-socket-ssl-perl \
         libwww-perl \
+        libjson-perl \
+        libxml-writer-perl \
     && rm -rf /var/lib/apt/lists/* \
     && git clone --depth 1 https://github.com/sullo/nikto.git /opt/nikto \
     && ln -s /opt/nikto/program/nikto.pl /usr/local/bin/nikto \
