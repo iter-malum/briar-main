@@ -32,7 +32,7 @@ from prometheus_client import (
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from pathlib import Path
 from shared.config import settings
@@ -282,7 +282,8 @@ async def _run_migrations(conn):
         await conn.execute(text(migration_sql))
         logger.info("Schema migrations applied (or already up-to-date).")
     except Exception as exc:
-        logger.warning(f"Migration step failed (non-fatal): {exc}")
+        logger.error(f"Migration failed: {exc}", exc_info=True)
+        raise  # re-raise so startup fails loudly instead of silently broken DB
 
 
 @app.on_event("startup")
