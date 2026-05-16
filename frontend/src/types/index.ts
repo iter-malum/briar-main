@@ -64,6 +64,15 @@ export interface GraphData {
   links: GraphLink[]
 }
 
+export interface AuthSession {
+  session_id: string
+  target_url: string
+  auth_type: 'form' | 'oauth2' | 'custom_script' | 'manual' | 'curl'
+  created_at: string
+  expires_at: string
+  status: string
+}
+
 export interface WsEvent {
   event: 'initial_state' | 'step_update' | 'stats_update' | 'scan_complete'
   scan?: Scan
@@ -73,4 +82,33 @@ export interface WsEvent {
   scan_status?: ScanStatus
   endpoint_count?: number
   vuln_count?: number
+}
+
+export interface ToolParam {
+  key: string
+  label: string
+  description: string
+  type: 'string' | 'number' | 'boolean' | 'select' | 'textarea'
+  default: any
+  value: any
+  options?: string[]
+  min?: number
+  max?: number
+}
+
+export interface ToolDefinition {
+  id: string
+  name: string
+  group: 'recon' | 'dast' | 'smart'
+  emoji: string
+  color: string
+  available: boolean
+  description: string
+  params: ToolParam[]
+}
+
+export interface ToolGroup {
+  label: string
+  description: string
+  color: string
 }

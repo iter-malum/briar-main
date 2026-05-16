@@ -34,7 +34,9 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sess
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select
 
+from pathlib import Path
 from shared.config import settings
+from shared.tool_definitions import TOOL_DEFINITIONS, TOOLS_BY_ID
 from shared.models import (
     Base, ScanORM, ScanStepORM, ScanStatus,
     ScanCreateRequest, ScanResponse,
@@ -262,6 +264,27 @@ pipeline_manager: Optional[PipelineManager] = None
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────────
 
+async def _run_migrations(conn):
+    """
+    Idempotent schema migrations.
+    Uses IF NOT EXISTS so it is safe to run on every startup — on a fresh DB
+    create_all already creates columns correctly; on an existing DB this adds
+    any missing columns introduced in later versions.
+    """
+    migration_sql = """
+        -- M8: request context columns for deep parameter-aware DAST
+        ALTER TABLE scan_results
+            ADD COLUMN IF NOT EXISTS request_method    VARCHAR(10),
+            ADD COLUMN IF NOT EXISTS request_body      VARCHAR(8192),
+            ADD COLUMN IF NOT EXISTS request_params    JSONB;
+    """
+    try:
+        await conn.execute(text(migration_sql))
+        logger.info("Schema migrations applied (or already up-to-date).")
+    except Exception as exc:
+        logger.warning(f"Migration step failed (non-fatal): {exc}")
+
+
 @app.on_event("startup")
 async def startup():
     global pipeline_manager
@@ -269,6 +292,7 @@ async def startup():
     logger.info("Creating PostgreSQL tables…")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _run_migrations(conn)
 
     await publisher.connect()
 
@@ -417,6 +441,56 @@ async def cancel_scan(scan_id: str, session: AsyncSession = Depends(get_db)):
         await session.rollback()
         logger.error(f"Cancel failed: {exc}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+TOOL_CONFIG_FILE = Path("/tmp/briar_tool_configs.json")
+
+
+def _load_tool_configs() -> dict:
+    try:
+        if TOOL_CONFIG_FILE.exists():
+            return json.loads(TOOL_CONFIG_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_tool_configs(configs: dict):
+    try:
+        TOOL_CONFIG_FILE.write_text(json.dumps(configs, indent=2))
+    except Exception as e:
+        logger.error(f"Failed to save tool configs: {e}")
+
+
+@app.get("/tools")
+async def list_tools():
+    """Return all tool definitions merged with saved config overrides."""
+    saved = _load_tool_configs()
+    result = []
+    for td in TOOL_DEFINITIONS:
+        tool = dict(td)
+        if td["id"] in saved:
+            saved_params = saved[td["id"]].get("params", {})
+            tool["params"] = [
+                {**p, "value": saved_params.get(p["key"], p["default"])}
+                for p in td["params"]
+            ]
+        result.append(tool)
+    return result
+
+
+@app.put("/tools/{tool_id}")
+async def update_tool_config(tool_id: str, body: dict):
+    """
+    Save tool configuration.
+    Body: { "params": { "param_key": value, ... } }
+    """
+    if tool_id not in TOOLS_BY_ID:
+        raise HTTPException(status_code=404, detail=f"Tool '{tool_id}' not found")
+    configs = _load_tool_configs()
+    configs[tool_id] = {"params": body.get("params", {})}
+    _save_tool_configs(configs)
+    return {"saved": True, "tool_id": tool_id}
 
 
 @app.get("/metrics")

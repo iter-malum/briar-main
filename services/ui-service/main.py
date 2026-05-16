@@ -321,7 +321,7 @@ async def get_scan_graph(scan_id: str):
         vuln_res = await db.execute(
             select(ScanResultORM).where(
                 ScanResultORM.scan_id == scan_uuid,
-                ScanResultORM.tool.notin_(["katana", "httpx", "whatweb", "ffuf"]),
+                ScanResultORM.tool.notin_(["katana", "httpx", "whatweb", "ffuf", "gobuster", "arjun"]),
                 ScanResultORM.url.isnot(None),
             )
         )
@@ -404,7 +404,7 @@ async def list_vulnerabilities(
     deduplicate: bool = Query(True, description="Group identical vulnerability types, aggregate affected URLs"),
 ):
     async with session_factory() as db:
-        stmt = select(ScanResultORM).where(ScanResultORM.tool.notin_(["katana", "httpx", "whatweb"]))
+        stmt = select(ScanResultORM).where(ScanResultORM.tool.notin_(["katana", "httpx", "whatweb", "ffuf", "gobuster", "arjun"]))
         if scan_id:
             try:
                 stmt = stmt.where(ScanResultORM.scan_id == UUID(scan_id))

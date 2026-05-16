@@ -1,4 +1,4 @@
-import type { GraphData, Scan, Vulnerability } from '../types'
+import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition } from '../types'
 
 // All requests use relative URLs — the browser always calls back to
 // the same host that served the page (the Vite dev server), which then
@@ -85,6 +85,92 @@ export async function createScan(
   }
   return res.json()
 }
+
+// ── Auth sessions ─────────────────────────────────────────────────────────────
+
+export const fetchAuthSessions = (): Promise<AuthSession[]> =>
+  get('/api/v1/auth/sessions')
+
+export const deleteAuthSession = (id: string): Promise<void> =>
+  fetch(`/api/v1/auth/sessions/${id}`, { method: 'DELETE' }).then(() => undefined)
+
+export const testAuthSession = (id: string): Promise<{ alive: boolean; status_code: number }> =>
+  fetch(`/api/v1/auth/sessions/${id}/test`, { method: 'POST' })
+    .then(r => r.json())
+
+export interface CreateSessionPayload {
+  target_url: string
+  auth_type: string
+  credentials?: { username: string; password: string; extra_fields?: Record<string, string> }
+  script?: string
+  timeout?: number
+}
+
+export const createAuthSession = (payload: CreateSessionPayload): Promise<{ session_id: string; expires_at: string; status: string }> => {
+  return fetch('/api/v1/auth/sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+}
+
+export const createSessionFromCurl = (curlCommand: string, targetUrl: string): Promise<{ session_id: string; expires_at: string; status: string }> => {
+  return fetch('/api/v1/auth/sessions/from-curl', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ curl_command: curlCommand, target_url: targetUrl }),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+}
+
+export interface RecordStartResponse {
+  recording_id: string
+  vnc_url: string
+  status: string
+}
+
+export const startRecording = (targetUrl: string): Promise<RecordStartResponse> =>
+  fetch('/api/v1/auth/sessions/record/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target_url: targetUrl }),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+
+export const saveRecording = (recordingId: string): Promise<{ session_id: string; expires_at: string; status: string; recorded_script?: string }> =>
+  fetch(`/api/v1/auth/sessions/record/${recordingId}/save`, { method: 'POST' })
+    .then(async r => {
+      if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+      return r.json()
+    })
+
+export const cancelRecording = (recordingId: string): Promise<void> =>
+  fetch(`/api/v1/auth/sessions/record/${recordingId}`, { method: 'DELETE' }).then(() => undefined)
+
+export const getSessionScript = (sessionId: string): Promise<{ script: string }> =>
+  get(`/api/v1/auth/sessions/${sessionId}/script`)
+
+// ── Tool configuration ────────────────────────────────────────────────────────
+
+export const fetchTools = (): Promise<ToolDefinition[]> =>
+  get('/api/v1/tools')
+
+export const updateToolConfig = (toolId: string, params: Record<string, any>): Promise<{ saved: boolean }> =>
+  fetch(`/api/v1/tools/${toolId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ params }),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
 
 // ── WebSocket URL (relative → same host as the page) ─────────────────────────
 

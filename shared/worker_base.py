@@ -248,7 +248,7 @@ class BaseWorker(ABC):
     # ── DB helpers ─────────────────────────────────────────────────────────────
 
     async def _get_endpoints_from_db(self, scan_id: str, source_tools: List[str]) -> List[str]:
-        """Load unique URLs saved by the specified source tools."""
+        """Load unique URLs (with query strings) saved by the specified source tools."""
         try:
             async with self.session_factory() as session:
                 stmt = (
@@ -266,6 +266,71 @@ class BaseWorker(ABC):
         except Exception as exc:
             logger.error(f"[{self.tool_name}] _get_endpoints_from_db failed: {exc}")
             return []
+
+    async def _get_endpoints_with_params(
+        self, scan_id: str, source_tools: List[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Load endpoints with full request context (method, body, params).
+
+        Returns a list of dicts:
+          { url, method, body, params: {get, post, all} }
+
+        Used by Dalfox, SQLmap, and other tools that need to know HTTP method
+        and body parameters — not just the URL.
+        """
+        try:
+            async with self.session_factory() as session:
+                stmt = select(
+                    ScanResultORM.url,
+                    ScanResultORM.request_method,
+                    ScanResultORM.request_body,
+                    ScanResultORM.request_params,
+                ).where(
+                    ScanResultORM.scan_id == UUID(scan_id),
+                    ScanResultORM.tool.in_(source_tools),
+                    ScanResultORM.url.isnot(None),
+                    ScanResultORM.url != "",
+                )
+                result = await session.execute(stmt)
+                seen: set = set()
+                endpoints = []
+                for url, method, body, params in result.all():
+                    if not url or not url.startswith("http"):
+                        continue
+                    # Deduplicate on (url, method)
+                    key = (url, method or "GET")
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    endpoints.append({
+                        "url":    url,
+                        "method": (method or "GET").upper(),
+                        "body":   body or "",
+                        "params": params or {"get": {}, "post": {}, "all": []},
+                    })
+                return endpoints
+        except Exception as exc:
+            logger.error(f"[{self.tool_name}] _get_endpoints_with_params failed: {exc}")
+            return []
+
+    async def _get_parameterised_urls(
+        self, scan_id: str, source_tools: List[str]
+    ) -> List[str]:
+        """
+        Return only URLs that have GET query parameters — most valuable for
+        injection testing (SQLi, XSS, SSRF).
+        """
+        all_eps = await self._get_endpoints_with_params(scan_id, source_tools)
+        from urllib.parse import urlparse
+        result = []
+        for ep in all_eps:
+            url = ep["url"]
+            has_query = bool(urlparse(url).query)
+            has_post  = bool(ep.get("body"))
+            if has_query or has_post:
+                result.append(url)
+        return result
 
     async def _get_sqli_endpoints_from_db(self, scan_id: str, source_tools: List[str]) -> List[str]:
         """Return only endpoints from source tools that have associated SQLi findings."""
@@ -358,6 +423,10 @@ class BaseWorker(ABC):
                     url=res.get("url"),
                     vulnerability_type=res.get("type"),
                     description=res.get("description", ""),
+                    # Request context fields (populated by katana / arjun)
+                    request_method=res.get("method"),
+                    request_body=res.get("body") or None,
+                    request_params=res.get("raw_output", {}).get("params") or None,
                     raw_output=res.get("raw_output", {}),
                 )
                 for res in results

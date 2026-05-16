@@ -1,11 +1,13 @@
 import { Suspense, lazy } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { LayoutDashboard, ShieldAlert, GitGraph } from 'lucide-react'
+import { LayoutDashboard, ShieldAlert, GitGraph, Key, Wrench } from 'lucide-react'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const ScanGraph = lazy(() => import('./pages/ScanGraph'))
 const Vulnerabilities = lazy(() => import('./pages/Vulnerabilities'))
+const AuthSessions = lazy(() => import('./pages/AuthSessions'))
+const Tools = lazy(() => import('./pages/Tools'))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -41,10 +43,22 @@ function Sidebar() {
           <LayoutDashboard size={15} /> Dashboard
         </NavLink>
         <NavLink
+          to="/auth"
+          className={({ isActive }) => `${base} ${isActive ? active : inactive}`}
+        >
+          <Key size={15} /> Auth Sessions
+        </NavLink>
+        <NavLink
           to="/vulns"
           className={({ isActive }) => `${base} ${isActive ? active : inactive}`}
         >
           <ShieldAlert size={15} /> All Vulnerabilities
+        </NavLink>
+        <NavLink
+          to="/tools"
+          className={({ isActive }) => `${base} ${isActive ? active : inactive}`}
+        >
+          <Wrench size={15} /> Tools
         </NavLink>
       </nav>
 
@@ -80,8 +94,10 @@ export default function App() {
                 <Layout>
                   <Routes>
                     <Route path="/dashboard" element={<Dashboard />} />
+                    <Route path="/auth" element={<AuthSessions />} />
                     <Route path="/vulns" element={<Vulnerabilities />} />
                     <Route path="/scan/:id/vulns" element={<Vulnerabilities />} />
+                    <Route path="/tools" element={<Tools />} />
                     <Route path="*" element={<Navigate to="/dashboard" replace />} />
                   </Routes>
                 </Layout>

@@ -2,11 +2,11 @@ import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink, StopCircle } from 'lucide-react'
-import { fetchScans, createScan, cancelScan } from '../api/client'
+import { fetchScans, createScan, cancelScan, fetchAuthSessions } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
-import type { Scan } from '../types'
+import type { Scan, AuthSession } from '../types'
 
-const AVAILABLE_TOOLS = ['katana', 'httpx', 'nuclei', 'ffuf', 'zap']
+const AVAILABLE_TOOLS = ['katana', 'httpx', 'nuclei', 'ffuf', 'zap', 'whatweb', 'gobuster', 'arjun', 'nikto', 'dalfox']
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleString()
@@ -15,12 +15,38 @@ function formatDate(iso: string) {
 function NewScanModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient()
   const [url, setUrl] = useState('')
-  const [tools, setTools] = useState<string[]>(['katana', 'nuclei'])
-  const [token, setToken] = useState('')
+  const [tools, setTools] = useState<string[]>(['katana', 'httpx', 'nuclei'])
+  const [preset, setPreset] = useState<'quick' | 'full' | 'custom'>('quick')
+  const [selectedSession, setSelectedSession] = useState<string>('')
   const [error, setError] = useState('')
 
+  const { data: sessions } = useQuery({
+    queryKey: ['auth-sessions'],
+    queryFn: fetchAuthSessions,
+  })
+
+  const PRESETS = {
+    quick: ['katana', 'httpx', 'nuclei'],
+    full:  ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun', 'nuclei', 'zap', 'nikto', 'dalfox'],
+    custom: tools,
+  }
+
+  const applyPreset = (p: 'quick' | 'full' | 'custom') => {
+    setPreset(p)
+    if (p !== 'custom') setTools(PRESETS[p])
+  }
+
+  const toggleTool = (t: string) => {
+    setPreset('custom')
+    setTools((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
+  }
+
   const mut = useMutation({
-    mutationFn: () => createScan({ target_url: url, tools }, token),
+    mutationFn: () => createScan({
+      target_url: url,
+      tools,
+      auth_session_id: selectedSession || null,
+    }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['scans'] })
       onClose()
@@ -28,8 +54,7 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
     onError: (e: Error) => setError(e.message),
   })
 
-  const toggleTool = (t: string) =>
-    setTools((prev) => (prev.includes(t) ? prev.filter((x) => x !== t) : [...prev, t]))
+  const inputCls = 'w-full bg-briar-bg border border-briar-border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-briar-accent'
 
   return (
     <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
@@ -37,6 +62,7 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
         <h2 className="text-lg font-semibold">New Scan</h2>
 
         <div className="space-y-3">
+          {/* Target URL */}
           <div>
             <label className="text-xs text-slate-400 mb-1 block">Target URL</label>
             <input
@@ -44,22 +70,55 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
               placeholder="https://example.com"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              className="w-full bg-briar-bg border border-briar-border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-briar-accent"
+              className={inputCls}
             />
           </div>
 
+          {/* Auth session */}
           <div>
-            <label className="text-xs text-slate-400 mb-1 block">JWT Token (for gateway auth)</label>
-            <input
-              type="text"
-              placeholder="eyJhbG..."
-              value={token}
-              onChange={(e) => setToken(e.target.value)}
-              className="w-full bg-briar-bg border border-briar-border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-briar-accent font-mono"
-            />
+            <label className="text-xs text-slate-400 mb-1 block">Auth Session (optional)</label>
+            <select
+              value={selectedSession}
+              onChange={e => setSelectedSession(e.target.value)}
+              className={`${inputCls} bg-briar-bg`}
+            >
+              <option value="">— No authentication —</option>
+              {sessions?.map((s: AuthSession) => (
+                <option key={s.session_id} value={s.session_id}>
+                  [{s.auth_type}] {s.target_url} ({s.session_id.slice(0, 8)})
+                </option>
+              ))}
+            </select>
+            {!sessions?.length && (
+              <p className="text-xs text-slate-600 mt-1">
+                No sessions. <a href="/auth" className="text-briar-accent hover:underline">Create one</a> for authenticated scanning.
+              </p>
+            )}
           </div>
 
+          {/* Presets */}
           <div>
+            <label className="text-xs text-slate-400 mb-2 block">Scan Preset</label>
+            <div className="flex gap-2 mb-3">
+              {(['quick', 'full', 'custom'] as const).map(p => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => applyPreset(p)}
+                  className={`px-3 py-1 rounded-lg text-xs border transition-colors capitalize ${
+                    preset === p
+                      ? 'bg-briar-accent border-briar-accent text-white'
+                      : 'border-briar-border text-slate-400 hover:border-slate-500'
+                  }`}
+                >
+                  {p}
+                  {p === 'quick' && <span className="ml-1 text-slate-500">~5min</span>}
+                  {p === 'full' && <span className="ml-1 text-slate-500">~30min</span>}
+                </button>
+              ))}
+            </div>
+
+            {/* Tools */}
             <label className="text-xs text-slate-400 mb-2 block">Tools</label>
             <div className="flex flex-wrap gap-2">
               {AVAILABLE_TOOLS.map((t) => (

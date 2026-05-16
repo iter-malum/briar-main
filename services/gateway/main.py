@@ -18,6 +18,7 @@ app = FastAPI(title="Briar API Gateway", version="0.1.0")
 
 INTEGRATION_SERVICE_URL = os.getenv("INTEGRATION_SERVICE_URL", "http://integration-service:8000")
 UI_SERVICE_URL          = os.getenv("UI_SERVICE_URL",          "http://ui-service:8000")
+AUTH_SERVICE_URL        = os.getenv("AUTH_SERVICE_URL",        "http://auth-service:8000")
 
 # Simple in-memory rate limiter
 RATE_LIMIT_PER_MIN = 120
@@ -38,6 +39,7 @@ def _route(path: str, method: str) -> str:
     Determine the upstream URL base for a given path + method.
 
     Routing table:
+      *      /api/v1/tools*              → orchestrator   (tool config)
       POST   /api/v1/scans               → orchestrator  (create scan)
       POST   /api/v1/scans/{id}/cancel   → orchestrator  (cancel scan)
       POST   /api/v1/scans/{id}/sync     → ui-service    (neo4j sync)
@@ -46,6 +48,14 @@ def _route(path: str, method: str) -> str:
       *      /api/v1/integrations/*      → integration-service
       everything else                    → orchestrator
     """
+    # Tool configuration
+    if path.startswith("/api/v1/tools"):
+        return settings.ORCHESTRATOR_URL
+
+    # Auth service
+    if path.startswith("/api/v1/auth/"):
+        return AUTH_SERVICE_URL
+
     # GitLab integration
     if path.startswith("/api/v1/integrations/"):
         return INTEGRATION_SERVICE_URL

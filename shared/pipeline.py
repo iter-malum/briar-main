@@ -5,14 +5,15 @@ Defines the 4-phase pentesting pipeline and helpers for the orchestrator's
 event-driven state machine.
 
 Pipeline flow:
-  Phase 1 – RECON:   whatweb + katana   (start immediately, parallel)
-  Phase 2 – PROBE:   httpx  + ffuf      (after katana, parallel)
-  Phase 3 – DAST:    nuclei + zap       (after httpx & ffuf, parallel)
-  Phase 4 – EXPLOIT: sqlmap             (after nuclei/zap, only if SQLi found
-                                         AND scan.config.exploit_enabled=true)
+  Phase 1 – RECON:   whatweb + katana                       (start immediately, parallel)
+  Phase 2 – PROBE:   httpx + ffuf + gobuster + arjun        (after katana, parallel)
+  Phase 3 – DAST:    nuclei + zap + nikto + dalfox          (after all probe tools, parallel)
+  Phase 4 – EXPLOIT: sqlmap                                 (after nuclei/zap, only if SQLi found
+                                                             AND scan.config.exploit_enabled=true)
 
 Phases whose trigger tools are not in the scan's selected set are skipped
 automatically, so e.g. selecting ["katana","nuclei"] works correctly.
+The trigger_after check only counts tools that were actually selected for the scan.
 """
 
 from typing import Dict, List, Optional, Set
@@ -20,13 +21,17 @@ from typing import Dict, List, Optional, Set
 # ── Queue routing table ────────────────────────────────────────────────────────
 
 TOOL_QUEUES: Dict[str, str] = {
-    "whatweb": "scan.recon.whatweb",
-    "katana":  "scan.crawl.katana",
-    "httpx":   "scan.probe.httpx",
-    "ffuf":    "scan.fuzz.ffuf",
-    "nuclei":  "scan.dast.nuclei",
-    "zap":     "scan.dast.zap",
-    "sqlmap":  "scan.exploit.sqlmap",
+    "whatweb":  "scan.recon.whatweb",
+    "katana":   "scan.crawl.katana",
+    "httpx":    "scan.probe.httpx",
+    "ffuf":     "scan.fuzz.ffuf",
+    "gobuster": "scan.probe.gobuster",
+    "arjun":    "scan.probe.arjun",
+    "nuclei":   "scan.dast.nuclei",
+    "zap":      "scan.dast.zap",
+    "nikto":    "scan.dast.nikto",
+    "dalfox":   "scan.dast.dalfox",
+    "sqlmap":   "scan.exploit.sqlmap",
 }
 
 # ── Technology → Nuclei template tags ─────────────────────────────────────────
@@ -82,23 +87,27 @@ PHASES: List[Dict] = [
     },
     {
         "id": "probe",
-        "tools": {"httpx", "ffuf"},
+        "tools": {"httpx", "ffuf", "gobuster", "arjun"},
         "trigger_after": {"katana"},     # Unlock when katana done
         "source_tools": {
-            "httpx": ["katana"],
-            "ffuf":  ["katana"],
+            "httpx":    ["katana"],
+            "ffuf":     ["katana"],
+            "gobuster": ["katana"],
+            "arjun":    ["katana"],  # Uses crawled endpoints; httpx/ffuf run in parallel
         },
         "requires_explicit": False,
         "requires_sqli": False,
     },
     {
         "id": "dast",
-        "tools": {"nuclei", "zap"},
-        "trigger_after": {"httpx", "ffuf"},  # Unlock when probe done
+        "tools": {"nuclei", "zap", "nikto", "dalfox"},
+        "trigger_after": {"httpx", "ffuf", "gobuster", "arjun"},  # Unlock when all probe tools done
         "source_tools": {
-            # Use ALL discovered endpoints: katana + ffuf + httpx
-            "nuclei": ["katana", "ffuf", "httpx"],
-            "zap":    ["katana", "ffuf", "httpx"],
+            # Use ALL discovered endpoints: katana + ffuf + gobuster + httpx
+            "nuclei":  ["katana", "ffuf", "gobuster", "httpx"],
+            "zap":     ["katana", "ffuf", "gobuster", "httpx"],
+            "nikto":   ["katana", "httpx"],  # Nikto works per-host
+            "dalfox":  ["katana", "ffuf", "gobuster", "httpx", "arjun"],  # Needs params
         },
         "requires_explicit": False,
         "requires_sqli": False,

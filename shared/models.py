@@ -61,6 +61,10 @@ class ScanResultResponse(BaseModel):
     url: Optional[str] = None
     vulnerability_type: Optional[str] = None
     description: Optional[str] = None
+    # Request context (populated for endpoint/parameter results)
+    request_method: Optional[str] = None
+    request_body: Optional[str] = None
+    request_params: Optional[Dict[str, Any]] = None
     raw_output: Dict[str, Any] = {}
     created_at: datetime
 
@@ -92,7 +96,7 @@ class ScanStepORM(Base):
 
 class ScanResultORM(Base):
     __tablename__ = "scan_results"
-    
+
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     scan_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("scans.id"), nullable=False)
     tool: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -100,7 +104,11 @@ class ScanResultORM(Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=True)
     vulnerability_type: Mapped[str] = mapped_column(String(100), nullable=True)
     description: Mapped[str] = mapped_column(String(4096), nullable=True)
+    # Request context — populated by katana/arjun to give DAST tools full endpoint data
+    request_method: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)   # GET / POST / PUT …
+    request_body: Mapped[Optional[str]] = mapped_column(String(8192), nullable=True)   # POST body (form-encoded or JSON)
+    request_params: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)  # {get: {…}, post: {…}, all: […]}
     raw_output: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
-    
+
     scan: Mapped["ScanORM"] = relationship("ScanORM", back_populates="results")

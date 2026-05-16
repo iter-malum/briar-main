@@ -63,12 +63,17 @@ class SqlmapWorker(BaseWorker):
         scan_id: str = task_payload.get("scan_id", "")
         source_tools: List[str] = task_payload.get("source_tools", ["nuclei", "zap"])
 
-        # Load SQLi-positive endpoints from DB
+        # Load SQLi-positive endpoints (URLs only) from DB
         sqli_endpoints = await self._get_sqli_endpoints_from_db(scan_id, source_tools)
 
         if not sqli_endpoints:
             logger.info("[sqlmap] No SQLi-positive endpoints found — skipping")
             return []
+
+        # Also load full context (method + POST body) for those same endpoints
+        all_eps = await self._get_endpoints_with_params(scan_id, source_tools)
+        # Build lookup: url → endpoint context
+        ep_context: Dict[str, Dict] = {ep["url"]: ep for ep in all_eps}
 
         logger.info(f"[sqlmap] Will test {len(sqli_endpoints)} SQLi-positive endpoints")
 
@@ -85,7 +90,8 @@ class SqlmapWorker(BaseWorker):
                 logger.warning(f"[sqlmap] Skipping blocked host: {url}")
                 continue
 
-            partial = await self._run_sqlmap(url, auth_context)
+            ctx = ep_context.get(url, {})
+            partial = await self._run_sqlmap(url, auth_context, post_data=ctx.get("body", ""))
             results.extend(partial)
 
         logger.info(f"[sqlmap] Confirmed {len(results)} injection points")
@@ -95,6 +101,7 @@ class SqlmapWorker(BaseWorker):
         self,
         url: str,
         auth_context: Dict[str, Any],
+        post_data: str = "",
     ) -> List[Dict[str, Any]]:
 
         work_dir = "/tmp/sqlmap"
@@ -116,6 +123,11 @@ class SqlmapWorker(BaseWorker):
                 "--technique", "BEUST",  # all common techniques
                 "-v", "0",               # minimal verbosity
             ]
+
+            # POST body injection testing
+            if post_data:
+                cmd.extend(["--data", post_data])
+                logger.info(f"[sqlmap] POST body: {post_data[:100]}")
 
             if SQLMAP_DUMP:
                 cmd.append("--dump")

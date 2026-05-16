@@ -107,6 +107,7 @@ services:
       PLAYWRIGHT_TIMEOUT: "30000"
     ports:
       - "8002:8000"
+      - "6080:6080"    # noVNC interactive browser
     deploy:
       resources:
         limits:
@@ -163,6 +164,11 @@ services:
       KATANA_TIMEOUT: "600"
       KATANA_DEPTH: "3"
       KATANA_CONCURRENCY: "10"
+      KATANA_HEADLESS: "true"    # Headless Chromium for SPA (React/Vue/Angular)
+    deploy:
+      resources:
+        limits:
+          memory: 1G             # Chromium needs extra memory
     networks:
       - briar-net
     restart: unless-stopped
@@ -269,6 +275,112 @@ services:
       HTTPX_TIMEOUT: "600"
       HTTPX_THREADS: "50"
       HTTPX_RATE_LIMIT: "200"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-gobuster:
+    build:
+      context: .
+      dockerfile: services/worker-gobuster/Dockerfile
+    container_name: briar-worker-gobuster
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      GOBUSTER_MODE: "dir"
+      GOBUSTER_THREADS: "20"
+      GOBUSTER_TIMEOUT: "10"
+      GOBUSTER_WORDLIST: "/usr/share/seclists/Discovery/Web-Content/common.txt"
+      GOBUSTER_EXTENSIONS: "php,html,js,txt,bak,old,zip"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-arjun:
+    build:
+      context: .
+      dockerfile: services/worker-arjun/Dockerfile
+    container_name: briar-worker-arjun
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      ARJUN_RATE: "9999"
+      ARJUN_TIMEOUT: "15"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-nikto:
+    build:
+      context: .
+      dockerfile: services/worker-nikto/Dockerfile
+    container_name: briar-worker-nikto
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      NIKTO_TIMEOUT: "30"
+      NIKTO_MAX_TIME: "600"
+      NIKTO_TUNING: "1,2,3,4,5,7,8,9"
+      NIKTO_NO_SSL: "true"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-dalfox:
+    build:
+      context: .
+      dockerfile: services/worker-dalfox/Dockerfile
+    container_name: briar-worker-dalfox
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      DALFOX_WORKER: "10"
+      DALFOX_TIMEOUT: "10"
+      DALFOX_BLIND_URL: ""
     networks:
       - briar-net
     restart: unless-stopped
@@ -384,7 +496,7 @@ services:
       DB_NAME: briar_db
       ORCHESTRATOR_URL: http://orchestrator:8000
       GITLAB_WEBHOOK_TOKEN: "change_me_gitlab_token"
-      DEFAULT_SCAN_TOOLS: "whatweb,katana,httpx,ffuf,nuclei,zap"
+      DEFAULT_SCAN_TOOLS: "whatweb,katana,httpx,ffuf,gobuster,arjun,nuclei,zap,nikto,dalfox"
     ports:
       - "8004:8000"
     networks:
