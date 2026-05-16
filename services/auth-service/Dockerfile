@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Base image is Ubuntu Jammy — apt works on standard HTTP mirrors.
 # Add only what Playwright image doesn't already have: Xvfb + VNC stack.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get update && \
+    DEBIAN_FRONTEND=noninteractive TZ=UTC apt-get install -y --no-install-recommends \
         xvfb \
         x11vnc \
         fonts-liberation \
