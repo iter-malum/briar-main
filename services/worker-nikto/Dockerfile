@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 
-# Nikto is a Perl script — install Perl + SSL libs, then clone from GitHub.
-# The official nikto package was removed from Debian trixie.
-RUN apt-get update \
+# Switch apt to HTTPS, then install Perl + nikto from GitHub
+RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \

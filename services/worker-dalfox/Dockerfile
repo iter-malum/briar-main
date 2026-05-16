@@ -5,7 +5,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
     DALFOX_VERSION=2.13.0
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Switch apt to HTTPS (port 80 may be blocked in some environments)
+RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
     && curl -sL -o /tmp/dalfox.tar.gz \
