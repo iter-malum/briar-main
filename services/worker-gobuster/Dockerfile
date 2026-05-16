@@ -22,7 +22,7 @@ RUN curl -sL -o /tmp/gobuster.tar.gz \
     && find /tmp/gobuster-extract -type f -executable | head -1 | xargs -I{} mv {} /usr/local/bin/gobuster \
     && chmod +x /usr/local/bin/gobuster \
     && rm -rf /tmp/gobuster.tar.gz /tmp/gobuster-extract \
-    && gobuster version
+    && gobuster --version
 
 # Download common.txt wordlist from SecLists
 RUN mkdir -p /usr/share/seclists/Discovery/Web-Content && \
