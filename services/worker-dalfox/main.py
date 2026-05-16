@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -53,6 +54,28 @@ class DalfoxWorker(BaseWorker):
         endpoints: List[str] = task_payload.get("endpoints", [])
         if not endpoints:
             logger.info("[dalfox] No endpoints provided — skipping")
+            return []
+
+        # XSS scanning only makes sense on URLs with query parameters or POST
+        # bodies. Filter out parameter-less URLs and static assets up front.
+        _STATIC_EXTS = frozenset({
+            ".css", ".js", ".mjs", ".map",
+            ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
+            ".woff", ".woff2", ".ttf", ".eot", ".otf",
+            ".mp3", ".mp4", ".webm", ".pdf", ".zip", ".gz",
+        })
+
+        def _has_params(url: str) -> bool:
+            try:
+                p = urlparse(url)
+                ext = os.path.splitext(p.path.lower())[1]
+                return bool(p.query) and ext not in _STATIC_EXTS
+            except Exception:
+                return False
+
+        endpoints = [ep for ep in endpoints if _has_params(ep)]
+        if not endpoints:
+            logger.info("[dalfox] No parameterized endpoints found — XSS scan skipped")
             return []
 
         waf_bypass   = task_payload.get("waf_bypass", False)

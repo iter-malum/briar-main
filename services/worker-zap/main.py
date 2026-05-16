@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -31,6 +32,37 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("zap-worker")
+
+# Extensions that are pointless to scan with ZAP active scanner
+_STATIC_EXTS = frozenset({
+    ".css", ".js", ".mjs", ".ts", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".avif",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".webm", ".ogg", ".wav",
+    ".pdf", ".zip", ".gz", ".tar", ".rar",
+})
+
+
+def _is_dynamic_url(url: str) -> bool:
+    """Return True for URLs ZAP should actively scan (HTML pages, API endpoints)."""
+    try:
+        path = urlparse(url).path.lower()
+        ext = os.path.splitext(path)[1]
+        return ext not in _STATIC_EXTS
+    except Exception:
+        return True
+
+
+def _extract_base_url(target: str) -> str:
+    """Return scheme://host from target URL."""
+    try:
+        p = urlparse(target)
+        if p.scheme and p.netloc:
+            return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        pass
+    return target
+
 
 RISK_MAP = {
     "High":          SeverityLevel.high,
@@ -77,6 +109,17 @@ class ZAPWorker(BaseWorker):
         if not endpoints:
             endpoints = [target]
 
+        # Derive the base URL (scheme://host) for spidering and alert collection
+        base_url = _extract_base_url(target)
+
+        # Only feed dynamic (non-static) URLs to ZAP — static assets slow it down
+        # massively and produce zero useful findings.
+        dynamic_endpoints = [ep for ep in endpoints if _is_dynamic_url(ep)]
+        logger.info(
+            f"[zap] {len(dynamic_endpoints)}/{len(endpoints)} dynamic endpoints "
+            f"will be seeded into ZAP (static files excluded)"
+        )
+
         zap_process: Optional[asyncio.subprocess.Process] = None
         try:
             zap_process = await self._start_zap_daemon()
@@ -86,22 +129,23 @@ class ZAPWorker(BaseWorker):
                 # Load auth into ZAP
                 await self._load_auth(client, auth_context)
 
-                # Feed all discovered endpoints into ZAP's tree so ascan covers them
-                for ep in endpoints[:500]:  # cap to avoid memory issues
+                # Seed dynamic endpoints into ZAP's site tree so ascan covers them.
+                # Cap at 200 to avoid memory pressure; ZAP spider will find the rest.
+                for ep in dynamic_endpoints[:200]:
                     try:
                         await self._zap(client, "core/action/accessUrl/", url=ep)
                     except Exception:
                         pass
 
-                # Spider the primary target
-                spider_id = await self._start_spider(client, target)
+                # Spider the base target (ZAP follows links from here)
+                spider_id = await self._start_spider(client, base_url)
                 await self._wait_scan(client, "spider", spider_id)
 
-                # Active scan the primary target (ZAP will include discovered URLs)
-                ascan_id = await self._start_ascan(client, target)
+                # Active scan the base target (ZAP will include all discovered URLs)
+                ascan_id = await self._start_ascan(client, base_url)
                 await self._wait_scan(client, "ascan", ascan_id)
 
-                return await self._collect_alerts(client, target)
+                return await self._collect_alerts(client, base_url)
 
         except Exception as exc:
             logger.error(f"[zap] Execution failed: {exc}", exc_info=True)

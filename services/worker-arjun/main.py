@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from typing import Dict, Any, List
+from urllib.parse import urlparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -18,6 +19,24 @@ logger = logging.getLogger("arjun-worker")
 
 ARJUN_RATE = int(os.environ.get("ARJUN_RATE", 9999))
 ARJUN_TIMEOUT = int(os.environ.get("ARJUN_TIMEOUT", 15))
+
+_STATIC_EXTS = frozenset({
+    ".css", ".js", ".mjs", ".ts", ".map",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp", ".avif",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf",
+    ".mp3", ".mp4", ".webm", ".ogg", ".wav",
+    ".pdf", ".zip", ".gz", ".tar", ".rar",
+})
+
+
+def _is_scannable(url: str) -> bool:
+    """Return True if the URL is worth scanning for hidden parameters."""
+    try:
+        path = urlparse(url).path.lower()
+        ext = os.path.splitext(path)[1]
+        return ext not in _STATIC_EXTS
+    except Exception:
+        return True
 
 
 class ArjunWorker(BaseWorker):
@@ -41,9 +60,9 @@ class ArjunWorker(BaseWorker):
                 ep = f"https://{ep}"
             normalized.append(ep)
 
-        unique_endpoints = list(set(normalized))
+        unique_endpoints = list({ep for ep in normalized if _is_scannable(ep)})
         if not unique_endpoints:
-            logger.warning("No valid endpoints")
+            logger.warning("No scannable endpoints (all static files or empty)")
             return []
 
         logger.info(f"Running Arjun against {len(unique_endpoints)} endpoints")
@@ -111,7 +130,7 @@ class ArjunWorker(BaseWorker):
         cmd = [
             "python3", "-m", "arjun",
             "-i", targets_file,
-            "-oJ", output_file,
+            "-o", output_file,
             "-q",
             "--rate-limit", str(self.rate),
             "--timeout", str(self.arjun_timeout),

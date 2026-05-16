@@ -42,6 +42,7 @@ def _route(path: str, method: str) -> str:
       *      /api/v1/tools*              → orchestrator   (tool config)
       POST   /api/v1/scans               → orchestrator  (create scan)
       POST   /api/v1/scans/{id}/cancel   → orchestrator  (cancel scan)
+      POST   /api/v1/scans/{id}/run-tool → orchestrator  (on-demand tool run)
       POST   /api/v1/scans/{id}/sync     → ui-service    (neo4j sync)
       GET    /api/v1/scans*              → ui-service    (list / detail / graph)
       GET    /api/v1/vulnerabilities*    → ui-service
@@ -66,6 +67,10 @@ def _route(path: str, method: str) -> str:
 
     # Cancel scan (POST /api/v1/scans/{id}/cancel) → orchestrator
     if method == "POST" and path.endswith("/cancel"):
+        return settings.ORCHESTRATOR_URL
+
+    # Run tool on-demand (POST /api/v1/scans/{id}/run-tool) → orchestrator
+    if method == "POST" and path.endswith("/run-tool"):
         return settings.ORCHESTRATOR_URL
 
     # Neo4j sync (POST /api/v1/scans/{id}/sync) → ui-service (keep full path)

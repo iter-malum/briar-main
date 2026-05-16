@@ -16,6 +16,7 @@ import os
 import sys
 import tempfile
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -28,6 +29,18 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("nikto-worker")
+
+
+def _extract_base_url(target: str, endpoints: List[str]) -> str:
+    """Return scheme://host from the target URL, falling back through endpoints."""
+    for candidate in ([target] if target else []) + (endpoints or []):
+        try:
+            p = urlparse(candidate)
+            if p.scheme in ("http", "https") and p.netloc:
+                return f"{p.scheme}://{p.netloc}"
+        except Exception:
+            continue
+    return target
 
 
 def _map_severity(vuln: Dict[str, Any]) -> SeverityLevel:
@@ -65,11 +78,9 @@ class NiktoWorker(BaseWorker):
     ) -> List[Dict[str, Any]]:
 
         endpoints: List[str] = task_payload.get("endpoints", [])
-        # Nikto is a per-host scanner; use the first available HTTP endpoint.
-        scan_target = next(
-            (ep for ep in endpoints if ep.startswith("http")),
-            target,
-        )
+        # Nikto is a per-host scanner — extract scheme://host only.
+        # Never pass a deep URL or static-file URL as the scan target.
+        scan_target = _extract_base_url(target, endpoints)
 
         if not scan_target:
             logger.warning("[nikto] No valid target URL — skipping")
