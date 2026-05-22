@@ -1,4 +1,4 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:latest AS builder
 RUN go install github.com/hahwul/dalfox/v2@v2.13.0
 
 FROM python:3.11-slim
