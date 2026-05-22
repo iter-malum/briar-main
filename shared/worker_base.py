@@ -414,23 +414,62 @@ class BaseWorker(ABC):
     async def _save_results(self, scan_id: str, results: List[Dict[str, Any]]):
         if not results:
             return
+
         async with self.session_factory() as session:
-            items = [
-                ScanResultORM(
+            # ── Deduplication ──────────────────────────────────────────────────
+            # Load keys already saved for this scan+tool so we never write the
+            # same (vulnerability_type, url, severity) tuple twice, regardless
+            # of how many times a tool emits the same finding.
+            existing_stmt = select(
+                ScanResultORM.vulnerability_type,
+                ScanResultORM.url,
+                ScanResultORM.severity,
+            ).where(
+                ScanResultORM.scan_id == UUID(scan_id),
+                ScanResultORM.tool == self.tool_name,
+            )
+            existing_rows = await session.execute(existing_stmt)
+            existing_keys: set = {
+                (vtype, url, sev)
+                for vtype, url, sev in existing_rows.all()
+            }
+
+            items = []
+            batch_keys: set = set()
+            for res in results:
+                vtype = res.get("type")
+                url   = res.get("url")
+                sev   = res.get("severity", SeverityLevel.info)
+                # Normalise SeverityLevel enum → string for key comparison
+                sev_val = sev.value if hasattr(sev, "value") else str(sev)
+                key = (vtype, url, sev_val)
+
+                if key in existing_keys or key in batch_keys:
+                    continue  # exact duplicate — skip
+                batch_keys.add(key)
+
+                items.append(ScanResultORM(
                     scan_id=UUID(scan_id),
                     tool=self.tool_name,
-                    severity=res.get("severity", SeverityLevel.info),
-                    url=res.get("url"),
-                    vulnerability_type=res.get("type"),
+                    severity=sev,
+                    url=url,
+                    vulnerability_type=vtype,
                     description=res.get("description", ""),
                     # Request context fields (populated by katana / arjun)
                     request_method=res.get("method"),
                     request_body=res.get("body") or None,
                     request_params=res.get("raw_output", {}).get("params") or None,
                     raw_output=res.get("raw_output", {}),
-                )
-                for res in results
-            ]
+                ))
+
+            skipped = len(results) - len(items)
+            if skipped:
+                logger.info(f"[{self.tool_name}] Deduplication: skipped {skipped} duplicate(s), saving {len(items)} new")
+
+            if not items:
+                logger.info(f"[{self.tool_name}] All {len(results)} results were duplicates — nothing to save")
+                return
+
             session.add_all(items)
             await session.commit()
             logger.info(f"[{self.tool_name}] Saved {len(items)} results for scan {scan_id}")

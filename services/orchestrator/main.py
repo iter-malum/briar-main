@@ -278,6 +278,34 @@ async def _run_migrations(conn):
             ADD COLUMN IF NOT EXISTS request_method    VARCHAR(10),
             ADD COLUMN IF NOT EXISTS request_body      VARCHAR(8192),
             ADD COLUMN IF NOT EXISTS request_params    JSONB;
+
+        -- M6a: vulnerability management — status tracking + analyst notes
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vulnstatus') THEN
+                CREATE TYPE vulnstatus AS ENUM ('open', 'false_positive', 'accepted', 'fixed');
+            END IF;
+        END$$;
+
+        ALTER TABLE scan_results
+            ADD COLUMN IF NOT EXISTS vuln_status   vulnstatus   NOT NULL DEFAULT 'open',
+            ADD COLUMN IF NOT EXISTS analyst_note  TEXT,
+            ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now();
+
+        CREATE TABLE IF NOT EXISTS vuln_status_history (
+            id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+            result_id   UUID         NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
+            old_status  VARCHAR(30),
+            new_status  VARCHAR(30)  NOT NULL,
+            note        TEXT,
+            changed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_vuln_history_result_id
+            ON vuln_status_history (result_id);
+
+        CREATE INDEX IF NOT EXISTS idx_scan_results_vuln_status
+            ON scan_results (vuln_status);
     """
     try:
         await conn.execute(text(migration_sql))

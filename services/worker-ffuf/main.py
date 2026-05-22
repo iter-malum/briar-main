@@ -54,7 +54,7 @@ class FFUFWorker(BaseWorker):
 
         results: List[Dict[str, Any]] = []
 
-        for base_url in base_urls[:20]:  # cap at 20 bases per scan to avoid explosion
+        for base_url in base_urls:
             partial = await self._fuzz_one(base_url, auth_context)
             results.extend(partial)
 

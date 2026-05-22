@@ -351,9 +351,8 @@ class KatanaWorker(BaseWorker):
                 for u in stdout_data.decode("utf-8", errors="ignore").splitlines()
                 if u.strip().startswith("http")
             ]
-            # Cap at 1000; also detect which ones have parameters
             results = []
-            for u in raw_urls[:1000]:
+            for u in raw_urls:
                 params = _extract_params_from_url(u)
                 results.append({
                     "url": u,

@@ -45,7 +45,7 @@ def _route(path: str, method: str) -> str:
       POST   /api/v1/scans/{id}/run-tool → orchestrator  (on-demand tool run)
       POST   /api/v1/scans/{id}/sync     → ui-service    (neo4j sync)
       GET    /api/v1/scans*              → ui-service    (list / detail / graph)
-      GET    /api/v1/vulnerabilities*    → ui-service
+      *      /api/v1/vulnerabilities*    → ui-service
       *      /api/v1/integrations/*      → integration-service
       everything else                    → orchestrator
     """

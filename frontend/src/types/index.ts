@@ -1,5 +1,6 @@
 export type ScanStatus = 'pending' | 'running' | 'completed' | 'failed'
 export type Severity = 'info' | 'low' | 'medium' | 'high' | 'critical'
+export type VulnStatus = 'open' | 'false_positive' | 'accepted' | 'fixed'
 
 export interface ScanStep {
   tool: string
@@ -27,8 +28,12 @@ export interface Vulnerability {
   vulnerability_type: string | null
   description: string | null
   created_at: string
+  updated_at?: string
   count?: number
   affected_urls?: string[]
+  // Vulnerability management
+  vuln_status?: VulnStatus
+  analyst_note?: string | null
 }
 
 export interface GraphNode {

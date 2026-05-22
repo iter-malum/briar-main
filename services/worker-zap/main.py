@@ -78,7 +78,7 @@ class ZAPWorker(BaseWorker):
         self.timeout      = int(os.getenv("ZAP_TIMEOUT", "3600"))
         self.zap_port     = int(os.getenv("ZAP_PORT", "8090"))
         self.api_key      = os.getenv("ZAP_API_KEY", "briar-zap-api-key-2024")
-        self.max_duration = int(os.getenv("ZAP_MAX_DURATION", "30"))  # minutes
+        self.max_duration = int(os.getenv("ZAP_MAX_DURATION", "120"))  # minutes
 
     # ── ZAP base URL ───────────────────────────────────────────────────────────
 
@@ -129,9 +129,8 @@ class ZAPWorker(BaseWorker):
                 # Load auth into ZAP
                 await self._load_auth(client, auth_context)
 
-                # Seed dynamic endpoints into ZAP's site tree so ascan covers them.
-                # Cap at 200 to avoid memory pressure; ZAP spider will find the rest.
-                for ep in dynamic_endpoints[:200]:
+                # Seed all dynamic endpoints into ZAP's site tree
+                for ep in dynamic_endpoints:
                     try:
                         await self._zap(client, "core/action/accessUrl/", url=ep)
                     except Exception:
@@ -285,7 +284,7 @@ class ZAPWorker(BaseWorker):
     ) -> List[Dict[str, Any]]:
         try:
             data = await self._zap(
-                client, "core/view/alerts/", baseurl=target, start="0", count="5000"
+                client, "core/view/alerts/", baseurl=target, start="0", count="0"
             )
         except Exception as exc:
             logger.error(f"[zap] Failed to collect alerts: {exc}")

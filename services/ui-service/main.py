@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from shared.config import settings
-from shared.models import ScanORM, ScanResultORM, ScanStepORM, ScanStatus
+from shared.models import ScanORM, ScanResultORM, ScanStepORM, ScanStatus, VulnStatus, VulnStatusHistoryORM
 
 logging.basicConfig(
     level=logging.INFO,
@@ -212,7 +212,7 @@ async def _graph_from_postgres(scan_id: str) -> dict:
 # ── REST API ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/scans")
-async def list_scans(limit: int = Query(50, ge=1, le=200)):
+async def list_scans(limit: int = Query(500, ge=1, le=10000)):
     async with session_factory() as db:
         stmt = (
             select(ScanORM)
@@ -401,7 +401,8 @@ async def list_vulnerabilities(
     scan_id: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     tool: Optional[str] = Query(None),
-    limit: int = Query(200, ge=1, le=2000),
+    vuln_status: Optional[str] = Query(None, description="Filter by status: open, false_positive, accepted, fixed"),
+    limit: int = Query(10000, ge=1, le=100000),
     deduplicate: bool = Query(True, description="Group identical vulnerability types, aggregate affected URLs"),
 ):
     async with session_factory() as db:
@@ -415,40 +416,20 @@ async def list_vulnerabilities(
             stmt = stmt.where(ScanResultORM.severity == severity)
         if tool:
             stmt = stmt.where(ScanResultORM.tool == tool)
+        if vuln_status:
+            try:
+                stmt = stmt.where(ScanResultORM.vuln_status == VulnStatus(vuln_status))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid vuln_status: {vuln_status}")
         stmt = stmt.order_by(ScanResultORM.created_at.desc()).limit(limit)
         res = await db.execute(stmt)
         vulns = res.scalars().all()
 
     sev_order = ["info", "low", "medium", "high", "critical"]
 
-    if deduplicate:
-        groups: dict = {}
-        for v in vulns:
-            sev = v.severity.value if hasattr(v.severity, "value") else str(v.severity)
-            key = (v.vulnerability_type or "unknown", v.tool)
-            if key not in groups:
-                groups[key] = {
-                    "id": str(v.id),
-                    "scan_id": str(v.scan_id),
-                    "tool": v.tool,
-                    "severity": sev,
-                    "vulnerability_type": v.vulnerability_type,
-                    "description": v.description,
-                    "created_at": v.created_at.isoformat(),
-                    "count": 0,
-                    "affected_urls": [],
-                }
-            g = groups[key]
-            g["count"] += 1
-            if v.url and v.url not in g["affected_urls"]:
-                g["affected_urls"].append(v.url)
-            # Keep worst severity
-            if sev_order.index(sev) > sev_order.index(g["severity"]):
-                g["severity"] = sev
-        return list(groups.values())
-
-    return [
-        {
+    def _vuln_row(v: ScanResultORM) -> dict:
+        vs = v.vuln_status.value if hasattr(v.vuln_status, "value") else (v.vuln_status or "open")
+        return {
             "id": str(v.id),
             "scan_id": str(v.scan_id),
             "tool": v.tool,
@@ -457,10 +438,131 @@ async def list_vulnerabilities(
             "vulnerability_type": v.vulnerability_type,
             "description": v.description,
             "created_at": v.created_at.isoformat(),
-            "count": 1,
-            "affected_urls": [v.url] if v.url else [],
+            "updated_at": v.updated_at.isoformat() if v.updated_at else v.created_at.isoformat(),
+            "vuln_status": vs,
+            "analyst_note": v.analyst_note,
         }
-        for v in vulns
+
+    if deduplicate:
+        groups: dict = {}
+        for v in vulns:
+            sev = v.severity.value if hasattr(v.severity, "value") else str(v.severity)
+            vs = v.vuln_status.value if hasattr(v.vuln_status, "value") else (v.vuln_status or "open")
+            key = (v.vulnerability_type or "unknown", v.tool)
+            if key not in groups:
+                groups[key] = {
+                    **_vuln_row(v),
+                    "count": 0,
+                    "affected_urls": [],
+                    # For deduplicated groups: show "open" if any item is open, else worst status
+                    "vuln_status": vs,
+                }
+            g = groups[key]
+            g["count"] += 1
+            if v.url and v.url not in g["affected_urls"]:
+                g["affected_urls"].append(v.url)
+            # Keep worst severity
+            if sev_order.index(sev) > sev_order.index(g["severity"]):
+                g["severity"] = sev
+            # Prefer "open" status (shows unresolved items at top)
+            if vs == "open":
+                g["vuln_status"] = "open"
+        return list(groups.values())
+
+    return [{**_vuln_row(v), "count": 1, "affected_urls": [v.url] if v.url else []} for v in vulns]
+
+
+@app.patch("/api/v1/vulnerabilities/{vuln_id}")
+async def update_vulnerability_status(
+    vuln_id: str,
+    body: dict,
+):
+    """
+    Update the status and/or analyst note for a vulnerability finding.
+
+    Body (all fields optional):
+      { "vuln_status": "open|false_positive|accepted|fixed", "analyst_note": "..." }
+
+    Records a history entry for every status change.
+    """
+    try:
+        vuln_uuid = UUID(vuln_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid vuln_id")
+
+    new_status_raw = body.get("vuln_status")
+    new_note = body.get("analyst_note")
+
+    if new_status_raw is not None:
+        try:
+            new_status = VulnStatus(new_status_raw)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid vuln_status '{new_status_raw}'. Allowed: open, false_positive, accepted, fixed",
+            )
+    else:
+        new_status = None
+
+    async with session_factory() as db:
+        res = await db.execute(select(ScanResultORM).where(ScanResultORM.id == vuln_uuid))
+        vuln = res.scalars().first()
+        if not vuln:
+            raise HTTPException(status_code=404, detail="Vulnerability not found")
+
+        old_status = vuln.vuln_status
+
+        if new_status is not None and new_status != old_status:
+            # Write history entry
+            history = VulnStatusHistoryORM(
+                result_id=vuln.id,
+                old_status=old_status.value if hasattr(old_status, "value") else str(old_status),
+                new_status=new_status.value,
+                note=new_note,
+            )
+            db.add(history)
+            vuln.vuln_status = new_status
+
+        if new_note is not None:
+            vuln.analyst_note = new_note
+
+        await db.commit()
+        await db.refresh(vuln)
+
+    vs = vuln.vuln_status.value if hasattr(vuln.vuln_status, "value") else str(vuln.vuln_status)
+    return {
+        "id": str(vuln.id),
+        "vuln_status": vs,
+        "analyst_note": vuln.analyst_note,
+        "updated_at": vuln.updated_at.isoformat() if vuln.updated_at else None,
+    }
+
+
+@app.get("/api/v1/vulnerabilities/{vuln_id}/history")
+async def get_vulnerability_history(vuln_id: str):
+    """Return the full status change log for a vulnerability."""
+    try:
+        vuln_uuid = UUID(vuln_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid vuln_id")
+
+    async with session_factory() as db:
+        res = await db.execute(
+            select(VulnStatusHistoryORM)
+            .where(VulnStatusHistoryORM.result_id == vuln_uuid)
+            .order_by(VulnStatusHistoryORM.changed_at.asc())
+        )
+        history = res.scalars().all()
+
+    return [
+        {
+            "id": str(h.id),
+            "old_status": h.old_status,
+            "new_status": h.new_status,
+            "note": h.note,
+            "changed_at": h.changed_at.isoformat(),
+        }
+        for h in history
     ]
 
 
@@ -572,6 +674,105 @@ async def get_scan_endpoints(
 
     endpoints = sorted(seen.values(), key=lambda x: x["url"])
     return {"total": len(endpoints), "endpoints": endpoints}
+
+
+# ── Scan diff ────────────────────────────────────────────────────────────────
+
+_RECON_TOOLS = {"katana", "httpx", "whatweb", "ffuf", "gobuster", "arjun"}
+
+
+def _vuln_fingerprint(r: ScanResultORM) -> tuple:
+    """Stable key identifying a unique finding regardless of which scan it's in."""
+    return (r.tool, r.vulnerability_type or "", r.url or "")
+
+
+@app.get("/api/v1/scans/{scan_id}/diff")
+async def get_scan_diff(
+    scan_id: str,
+    compare_to: str = Query(..., description="ID of the baseline scan to compare against"),
+):
+    """
+    Compare two scans on the same target and return three categories:
+
+    - **new**       — findings in `scan_id` that were NOT in `compare_to`
+    - **fixed**     — findings in `compare_to` that are NOT in `scan_id`
+    - **persisted** — findings present in both scans
+
+    Only vulnerability findings are compared (recon tools excluded).
+    """
+    try:
+        scan_uuid    = UUID(scan_id)
+        compare_uuid = UUID(compare_to)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan ID format")
+
+    async with session_factory() as db:
+        # Load both scans to verify they exist and share the same target
+        scans_res = await db.execute(
+            select(ScanORM).where(ScanORM.id.in_([scan_uuid, compare_uuid]))
+        )
+        scans = {str(s.id): s for s in scans_res.scalars().all()}
+
+        if scan_id not in scans:
+            raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found")
+        if compare_to not in scans:
+            raise HTTPException(status_code=404, detail=f"Baseline scan {compare_to} not found")
+
+        # Fetch vulnerability findings for both scans
+        results_res = await db.execute(
+            select(ScanResultORM).where(
+                ScanResultORM.scan_id.in_([scan_uuid, compare_uuid]),
+                ScanResultORM.tool.notin_(_RECON_TOOLS),
+            )
+        )
+        all_results = results_res.scalars().all()
+
+    current_map:  dict = {}  # fingerprint → ScanResultORM
+    baseline_map: dict = {}
+
+    for r in all_results:
+        fp = _vuln_fingerprint(r)
+        if str(r.scan_id) == scan_id:
+            current_map[fp] = r
+        else:
+            baseline_map[fp] = r
+
+    current_fps  = set(current_map.keys())
+    baseline_fps = set(baseline_map.keys())
+
+    def _serialize(r: ScanResultORM) -> dict:
+        vs = r.vuln_status.value if hasattr(r.vuln_status, "value") else (r.vuln_status or "open")
+        return {
+            "id":               str(r.id),
+            "scan_id":          str(r.scan_id),
+            "tool":             r.tool,
+            "severity":         r.severity.value if hasattr(r.severity, "value") else str(r.severity),
+            "url":              r.url,
+            "vulnerability_type": r.vulnerability_type,
+            "description":      r.description,
+            "vuln_status":      vs,
+            "analyst_note":     r.analyst_note,
+            "created_at":       r.created_at.isoformat(),
+        }
+
+    new_fps       = current_fps - baseline_fps
+    fixed_fps     = baseline_fps - current_fps
+    persisted_fps = current_fps & baseline_fps
+
+    return {
+        "scan_id":    scan_id,
+        "compare_to": compare_to,
+        "scan_target":     scans[scan_id].target_url,
+        "baseline_target": scans[compare_to].target_url,
+        "summary": {
+            "new":       len(new_fps),
+            "fixed":     len(fixed_fps),
+            "persisted": len(persisted_fps),
+        },
+        "new":       [_serialize(current_map[fp])  for fp in sorted(new_fps)],
+        "fixed":     [_serialize(baseline_map[fp]) for fp in sorted(fixed_fps)],
+        "persisted": [_serialize(current_map[fp])  for fp in sorted(persisted_fps)],
+    }
 
 
 # ── WebSocket real-time updates ───────────────────────────────────────────────

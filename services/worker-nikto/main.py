@@ -67,7 +67,7 @@ class NiktoWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="nikto", queue_name="scan.dast.nikto")
         self.timeout  = int(os.getenv("NIKTO_TIMEOUT",   "30"))
-        self.max_time = int(os.getenv("NIKTO_MAX_TIME",  "600"))
+        self.max_time = int(os.getenv("NIKTO_MAX_TIME",  "1200"))
         self.tuning   = os.getenv("NIKTO_TUNING",        "1,2,3,4,5,7,8,9")
 
     async def execute_tool(

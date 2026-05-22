@@ -80,7 +80,7 @@ class SqlmapWorker(BaseWorker):
         results: List[Dict[str, Any]] = []
         total_start = asyncio.get_event_loop().time()
 
-        for url in sqli_endpoints[:10]:  # safety cap
+        for url in sqli_endpoints:
             if asyncio.get_event_loop().time() - total_start > TOTAL_TIMEOUT:
                 logger.warning("[sqlmap] Total timeout reached")
                 break

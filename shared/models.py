@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID, uuid4
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
-from sqlalchemy import Column, String, DateTime, JSON, Enum as SAEnum, ForeignKey, text
+from sqlalchemy import Column, String, DateTime, JSON, Enum as SAEnum, ForeignKey, text, Text
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 import enum
 
@@ -22,6 +22,12 @@ class SeverityLevel(str, enum.Enum):
     high = "high"
     critical = "critical"
     info = "info"
+
+class VulnStatus(str, enum.Enum):
+    open            = "open"             # новая / не обработана
+    false_positive  = "false_positive"   # ложное срабатывание
+    accepted        = "accepted"         # принятый риск
+    fixed           = "fixed"            # исправлена
 
 # Pydantic Models
 class ScanStepResponse(BaseModel):
@@ -67,6 +73,10 @@ class ScanResultResponse(BaseModel):
     request_params: Optional[Dict[str, Any]] = None
     raw_output: Dict[str, Any] = {}
     created_at: datetime
+    # Vulnerability management
+    vuln_status: str = "open"
+    analyst_note: Optional[str] = None
+    updated_at: Optional[datetime] = None
 
 # ORM Models
 class ScanORM(Base):
@@ -110,5 +120,36 @@ class ScanResultORM(Base):
     request_params: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)  # {get: {…}, post: {…}, all: […]}
     raw_output: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()"))
+
+    # Vulnerability management fields
+    vuln_status: Mapped[VulnStatus] = mapped_column(
+        SAEnum(VulnStatus, name="vulnstatus"),
+        default=VulnStatus.open,
+        server_default="open",
+        nullable=False,
+    )
+    analyst_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     scan: Mapped["ScanORM"] = relationship("ScanORM", back_populates="results")
+    status_history: Mapped[List["VulnStatusHistoryORM"]] = relationship(
+        "VulnStatusHistoryORM", back_populates="result", cascade="all, delete-orphan"
+    )
+
+
+class VulnStatusHistoryORM(Base):
+    """Audit log: every time a vulnerability's status is changed."""
+    __tablename__ = "vuln_status_history"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    result_id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True), ForeignKey("scan_results.id", ondelete="CASCADE"), nullable=False
+    )
+    old_status: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    new_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    changed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+
+    result: Mapped["ScanResultORM"] = relationship("ScanResultORM", back_populates="status_history")

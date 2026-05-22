@@ -208,6 +208,48 @@ export const cancelRecording = (recordingId: string): Promise<void> =>
 export const getSessionScript = (sessionId: string): Promise<{ script: string }> =>
   get(`/api/v1/auth/sessions/${sessionId}/script`)
 
+// ── Vulnerability management ──────────────────────────────────────────────────
+
+export interface VulnStatusUpdate {
+  vuln_status?: 'open' | 'false_positive' | 'accepted' | 'fixed'
+  analyst_note?: string
+}
+
+export const updateVulnStatus = async (
+  id: string,
+  update: VulnStatusUpdate,
+): Promise<{ id: string; vuln_status: string; analyst_note: string | null; updated_at: string }> => {
+  const res = await fetch(`/api/v1/vulnerabilities/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => res.statusText)
+    throw new Error(`Update failed: ${text}`)
+  }
+  return res.json()
+}
+
+export const fetchVulnHistory = (id: string) =>
+  get<Array<{ id: string; old_status: string | null; new_status: string; note: string | null; changed_at: string }>>(
+    `/api/v1/vulnerabilities/${id}/history`,
+  )
+
+export interface ScanDiff {
+  scan_id: string
+  compare_to: string
+  scan_target: string
+  baseline_target: string
+  summary: { new: number; fixed: number; persisted: number }
+  new: import('../types').Vulnerability[]
+  fixed: import('../types').Vulnerability[]
+  persisted: import('../types').Vulnerability[]
+}
+
+export const fetchScanDiff = (scanId: string, compareToId: string): Promise<ScanDiff> =>
+  get(`/api/v1/scans/${scanId}/diff?compare_to=${compareToId}`)
+
 // ── Tool configuration ────────────────────────────────────────────────────────
 
 export const fetchTools = (): Promise<ToolDefinition[]> =>
