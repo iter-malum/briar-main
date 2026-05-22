@@ -1,9 +1,10 @@
-FROM hahwul/dalfox:2.13.0 AS dalfox-bin
+FROM golang:1.22-alpine AS builder
+RUN go install github.com/hahwul/dalfox/v2@v2.13.0
 
 FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 
-COPY --from=dalfox-bin /usr/local/bin/dalfox /usr/local/bin/dalfox
+COPY --from=builder /go/bin/dalfox /usr/local/bin/dalfox
 
 WORKDIR /app
 
