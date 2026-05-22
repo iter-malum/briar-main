@@ -19,6 +19,7 @@ app = FastAPI(title="Briar API Gateway", version="0.1.0")
 INTEGRATION_SERVICE_URL = os.getenv("INTEGRATION_SERVICE_URL", "http://integration-service:8000")
 UI_SERVICE_URL          = os.getenv("UI_SERVICE_URL",          "http://ui-service:8000")
 AUTH_SERVICE_URL        = os.getenv("AUTH_SERVICE_URL",        "http://auth-service:8000")
+SCHEDULER_URL           = os.getenv("SCHEDULER_URL",           "http://scheduler:8005")
 
 # Simple in-memory rate limiter
 RATE_LIMIT_PER_MIN = 120
@@ -40,6 +41,7 @@ def _route(path: str, method: str) -> str:
 
     Routing table:
       *      /api/v1/tools*              → orchestrator   (tool config)
+      *      /api/v1/schedules*          → scheduler      (recurring scans)
       POST   /api/v1/scans               → orchestrator  (create scan)
       POST   /api/v1/scans/{id}/cancel   → orchestrator  (cancel scan)
       POST   /api/v1/scans/{id}/run-tool → orchestrator  (on-demand tool run)
@@ -52,6 +54,10 @@ def _route(path: str, method: str) -> str:
     # Tool configuration
     if path.startswith("/api/v1/tools"):
         return settings.ORCHESTRATOR_URL
+
+    # Schedules → scheduler service (strips /api/v1 prefix like orchestrator)
+    if path.startswith("/api/v1/schedules"):
+        return SCHEDULER_URL
 
     # Auth service
     if path.startswith("/api/v1/auth/"):
@@ -130,8 +136,8 @@ async def _gateway_dispatch(request: Request, call_next):
     # ── Routing ───────────────────────────────────────────────────────────────
     base = _route(path, request.method)
 
-    if base == settings.ORCHESTRATOR_URL:
-        # Strip /api/v1 prefix before forwarding to orchestrator
+    if base in (settings.ORCHESTRATOR_URL, SCHEDULER_URL):
+        # Strip /api/v1 prefix before forwarding
         target_path = path.replace("/api/v1", "", 1) if path.startswith("/api/v1") else path
         target_url = f"{base}{target_path or '/'}"
     else:

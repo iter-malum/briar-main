@@ -1,13 +1,14 @@
 import { Suspense, lazy } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { LayoutDashboard, ShieldAlert, GitGraph, Key, Wrench } from 'lucide-react'
+import { LayoutDashboard, ShieldAlert, GitGraph, Key, Wrench, CalendarClock } from 'lucide-react'
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const ScanGraph = lazy(() => import('./pages/ScanGraph'))
 const Vulnerabilities = lazy(() => import('./pages/Vulnerabilities'))
 const AuthSessions = lazy(() => import('./pages/AuthSessions'))
 const Tools = lazy(() => import('./pages/Tools'))
+const Schedules = lazy(() => import('./pages/Schedules'))
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -60,6 +61,12 @@ function Sidebar() {
         >
           <Wrench size={15} /> Tools
         </NavLink>
+        <NavLink
+          to="/schedules"
+          className={({ isActive }) => `${base} ${isActive ? active : inactive}`}
+        >
+          <CalendarClock size={15} /> Schedules
+        </NavLink>
       </nav>
 
       <div className="p-3 border-t border-briar-border">
@@ -98,6 +105,7 @@ export default function App() {
                     <Route path="/vulns" element={<Vulnerabilities />} />
                     <Route path="/scan/:id/vulns" element={<Vulnerabilities />} />
                     <Route path="/tools" element={<Tools />} />
+                    <Route path="/schedules" element={<Schedules />} />
                     <Route path="*" element={<Navigate to="/dashboard" replace />} />
                   </Routes>
                 </Layout>

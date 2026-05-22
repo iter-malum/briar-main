@@ -117,3 +117,19 @@ export interface ToolGroup {
   description: string
   color: string
 }
+
+export interface Schedule {
+  id: string
+  label: string | null
+  target_url: string
+  tools: string[]
+  auth_session_id: string | null
+  cron_expression: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+  last_run_at: string | null
+  next_run_at: string | null
+  last_scan_id: string | null
+  run_count: number
+}

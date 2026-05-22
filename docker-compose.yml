@@ -87,6 +87,7 @@ services:
       AUTH_SERVICE_URL: http://auth-service:8000
       INTEGRATION_SERVICE_URL: http://integration-service:8000
       UI_SERVICE_URL: http://ui-service:8000
+      SCHEDULER_URL: http://scheduler:8005
       JWT_SECRET: super_secret_key_for_development_only
       JWT_ALGORITHM: HS256
     ports:
@@ -478,6 +479,27 @@ services:
       - "3000:3000"
     networks:
       - briar-net
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: services/scheduler/Dockerfile
+    container_name: briar-scheduler
+    depends_on:
+      postgres: { condition: service_healthy }
+      orchestrator: { condition: service_started }
+    environment:
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      ORCHESTRATOR_URL: http://orchestrator:8000
+    ports:
+      - "8005:8005"
+    networks:
+      - briar-net
+    restart: unless-stopped
 
   # === INTEGRATIONS & MONITORING ===
 

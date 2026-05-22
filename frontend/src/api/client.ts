@@ -1,4 +1,4 @@
-import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition } from '../types'
+import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition, Schedule } from '../types'
 
 // All requests use relative URLs — the browser always calls back to
 // the same host that served the page (the Vite dev server), which then
@@ -261,6 +261,58 @@ export const updateToolConfig = (toolId: string, params: Record<string, any>): P
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ params }),
   }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+
+// ── Schedules ─────────────────────────────────────────────────────────────────
+
+export interface ScheduleCreatePayload {
+  label?: string
+  target_url: string
+  tools: string[]
+  auth_session_id?: string | null
+  cron_expression: string
+}
+
+export interface ScheduleUpdatePayload {
+  label?: string
+  tools?: string[]
+  auth_session_id?: string | null
+  cron_expression?: string
+  enabled?: boolean
+}
+
+export const fetchSchedules = (): Promise<Schedule[]> =>
+  get('/api/v1/schedules')
+
+export const createSchedule = (payload: ScheduleCreatePayload): Promise<Schedule> =>
+  fetch('/api/v1/schedules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+
+export const updateSchedule = (id: string, payload: ScheduleUpdatePayload): Promise<Schedule> =>
+  fetch(`/api/v1/schedules/${id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(async r => {
+    if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+    return r.json()
+  })
+
+export const deleteSchedule = async (id: string): Promise<void> => {
+  const r = await fetch(`/api/v1/schedules/${id}`, { method: 'DELETE' })
+  if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
+}
+
+export const runScheduleNow = (id: string): Promise<{ scan_id: string; status: string }> =>
+  fetch(`/api/v1/schedules/${id}/run-now`, { method: 'POST' }).then(async r => {
     if (!r.ok) { const t = await r.text(); throw new Error(`${r.status}: ${t}`) }
     return r.json()
   })

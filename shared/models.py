@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 from uuid import UUID, uuid4
 from sqlalchemy.orm import DeclarativeBase, relationship, Mapped, mapped_column
-from sqlalchemy import Column, String, DateTime, JSON, Enum as SAEnum, ForeignKey, text, Text
+from sqlalchemy import Column, String, DateTime, JSON, Enum as SAEnum, ForeignKey, text, Text, Boolean, Integer
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 import enum
 
@@ -153,3 +153,53 @@ class VulnStatusHistoryORM(Base):
     )
 
     result: Mapped["ScanResultORM"] = relationship("ScanResultORM", back_populates="status_history")
+
+
+class ScanScheduleORM(Base):
+    """Recurring scan schedule — runs on a cron expression and triggers a new scan each time."""
+    __tablename__ = "scan_schedules"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    tools: Mapped[List[str]] = mapped_column(JSON, nullable=False)
+    auth_session_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    cron_expression: Mapped[str] = mapped_column(String(100), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()"))
+    last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_scan_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    run_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+
+# Pydantic schemas for scheduler API
+class ScheduleCreate(BaseModel):
+    label: Optional[str] = None
+    target_url: str
+    tools: List[str]
+    auth_session_id: Optional[UUID] = None
+    cron_expression: str
+
+class ScheduleUpdate(BaseModel):
+    label: Optional[str] = None
+    tools: Optional[List[str]] = None
+    auth_session_id: Optional[UUID] = None
+    cron_expression: Optional[str] = None
+    enabled: Optional[bool] = None
+
+class ScheduleResponse(BaseModel):
+    id: UUID
+    label: Optional[str] = None
+    target_url: str
+    tools: List[str]
+    auth_session_id: Optional[UUID] = None
+    cron_expression: str
+    enabled: bool
+    created_at: datetime
+    updated_at: datetime
+    last_run_at: Optional[datetime] = None
+    next_run_at: Optional[datetime] = None
+    last_scan_id: Optional[UUID] = None
+    run_count: int
