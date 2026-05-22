@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     DB_PORT: str = Field(default="5432")
     DB_NAME: str = Field(default="briar_db")
     ORCHESTRATOR_URL: str = Field(default="http://orchestrator:8000")
+    UI_SERVICE_URL: str = Field(default="http://ui-service:8000")
 
     @property
     def db_url(self) -> str:
@@ -55,21 +56,26 @@ async def _run_migrations() -> None:
     async with engine.begin() as conn:
         await conn.execute(text("""
             CREATE TABLE IF NOT EXISTS scan_schedules (
-                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                label       VARCHAR(255),
-                target_url  VARCHAR(2048) NOT NULL,
-                tools       JSON NOT NULL,
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                label           VARCHAR(255),
+                target_url      VARCHAR(2048) NOT NULL,
+                tools           JSON NOT NULL,
                 auth_session_id UUID,
                 cron_expression VARCHAR(100) NOT NULL,
-                enabled     BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-                last_run_at TIMESTAMPTZ,
-                next_run_at TIMESTAMPTZ,
-                last_scan_id UUID,
-                run_count   INTEGER NOT NULL DEFAULT 0
+                enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_run_at     TIMESTAMPTZ,
+                next_run_at     TIMESTAMPTZ,
+                last_scan_id    UUID,
+                prev_scan_id    UUID,
+                run_count       INTEGER NOT NULL DEFAULT 0
             )
         """))
+        # Idempotent column add for existing deployments
+        await conn.execute(text(
+            "ALTER TABLE scan_schedules ADD COLUMN IF NOT EXISTS prev_scan_id UUID"
+        ))
         await conn.execute(text(
             "CREATE INDEX IF NOT EXISTS idx_scan_schedules_enabled ON scan_schedules (enabled)"
         ))
@@ -129,12 +135,14 @@ async def _fire_scan(schedule_id: str) -> None:
         job = scheduler.get_job(schedule_id)
         next_run = job.next_run_time if job else None
 
+        # Shift last → prev before storing the new scan_id
         await session.execute(
             update(ScanScheduleORM)
             .where(ScanScheduleORM.id == UUID(schedule_id))
             .values(
                 last_run_at=now,
                 next_run_at=next_run,
+                prev_scan_id=ScanScheduleORM.last_scan_id,
                 last_scan_id=UUID(scan_id) if scan_id else None,
                 run_count=ScanScheduleORM.run_count + 1,
                 updated_at=now,
@@ -208,6 +216,7 @@ def _to_response(row: ScanScheduleORM) -> ScheduleResponse:
         last_run_at=row.last_run_at,
         next_run_at=row.next_run_at,
         last_scan_id=row.last_scan_id,
+        prev_scan_id=row.prev_scan_id,
         run_count=row.run_count,
     )
 
@@ -366,6 +375,7 @@ async def run_now(schedule_id: UUID):
             .where(ScanScheduleORM.id == schedule_id)
             .values(
                 last_run_at=now,
+                prev_scan_id=ScanScheduleORM.last_scan_id,
                 last_scan_id=UUID(data["scan_id"]),
                 run_count=ScanScheduleORM.run_count + 1,
                 updated_at=now,
@@ -374,6 +384,38 @@ async def run_now(schedule_id: UUID):
         await session.commit()
 
     return {"scan_id": data["scan_id"], "status": data.get("status", "pending")}
+
+
+@app.get("/schedules/{schedule_id}/diff")
+async def get_schedule_diff(schedule_id: UUID):
+    """
+    Return the vulnerability diff between the last two scheduled runs.
+    Proxies to the UI service diff endpoint so the caller doesn't need
+    to know the scan IDs up-front.
+    """
+    async with SessionLocal() as session:
+        row = await session.get(ScanScheduleORM, schedule_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    if not row.last_scan_id or not row.prev_scan_id:
+        raise HTTPException(
+            status_code=404,
+            detail="Diff not available yet — need at least two completed runs",
+        )
+
+    url = (
+        f"{settings.UI_SERVICE_URL}/api/v1/scans/{row.last_scan_id}"
+        f"/diff?compare_to={row.prev_scan_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return resp.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"UI service error: {exc}")
 
 
 @app.get("/health")

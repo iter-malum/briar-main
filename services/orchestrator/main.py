@@ -267,52 +267,46 @@ pipeline_manager: Optional[PipelineManager] = None
 
 async def _run_migrations(conn):
     """
-    Idempotent schema migrations.
-    Uses IF NOT EXISTS so it is safe to run on every startup — on a fresh DB
-    create_all already creates columns correctly; on an existing DB this adds
-    any missing columns introduced in later versions.
+    Idempotent schema migrations — each statement executed separately because
+    asyncpg does not allow multiple commands in a single prepared statement.
     """
-    migration_sql = """
-        -- M8: request context columns for deep parameter-aware DAST
-        ALTER TABLE scan_results
-            ADD COLUMN IF NOT EXISTS request_method    VARCHAR(10),
-            ADD COLUMN IF NOT EXISTS request_body      VARCHAR(8192),
-            ADD COLUMN IF NOT EXISTS request_params    JSONB;
-
-        -- M6a: vulnerability management — status tracking + analyst notes
-        DO $$
-        BEGIN
-            IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vulnstatus') THEN
-                CREATE TYPE vulnstatus AS ENUM ('open', 'false_positive', 'accepted', 'fixed');
-            END IF;
-        END$$;
-
-        ALTER TABLE scan_results
-            ADD COLUMN IF NOT EXISTS vuln_status   vulnstatus   NOT NULL DEFAULT 'open',
-            ADD COLUMN IF NOT EXISTS analyst_note  TEXT,
-            ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now();
-
-        CREATE TABLE IF NOT EXISTS vuln_status_history (
-            id          UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-            result_id   UUID         NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
-            old_status  VARCHAR(30),
-            new_status  VARCHAR(30)  NOT NULL,
-            note        TEXT,
-            changed_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_vuln_history_result_id
-            ON vuln_status_history (result_id);
-
-        CREATE INDEX IF NOT EXISTS idx_scan_results_vuln_status
-            ON scan_results (vuln_status);
-    """
+    statements = [
+        # M8: request context columns
+        """ALTER TABLE scan_results
+               ADD COLUMN IF NOT EXISTS request_method  VARCHAR(10),
+               ADD COLUMN IF NOT EXISTS request_body    VARCHAR(8192),
+               ADD COLUMN IF NOT EXISTS request_params  JSONB""",
+        # M6a: create vulnstatus enum type if it doesn't exist yet
+        """DO $$
+           BEGIN
+               IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'vulnstatus') THEN
+                   CREATE TYPE vulnstatus AS ENUM ('open', 'false_positive', 'accepted', 'fixed');
+               END IF;
+           END$$""",
+        # M6a: vulnerability management columns
+        """ALTER TABLE scan_results
+               ADD COLUMN IF NOT EXISTS vuln_status   vulnstatus  NOT NULL DEFAULT 'open',
+               ADD COLUMN IF NOT EXISTS analyst_note  TEXT,
+               ADD COLUMN IF NOT EXISTS updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()""",
+        # M6a: history table
+        """CREATE TABLE IF NOT EXISTS vuln_status_history (
+               id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+               result_id   UUID        NOT NULL REFERENCES scan_results(id) ON DELETE CASCADE,
+               old_status  VARCHAR(30),
+               new_status  VARCHAR(30) NOT NULL,
+               note        TEXT,
+               changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+           )""",
+        "CREATE INDEX IF NOT EXISTS idx_vuln_history_result_id  ON vuln_status_history (result_id)",
+        "CREATE INDEX IF NOT EXISTS idx_scan_results_vuln_status ON scan_results (vuln_status)",
+    ]
     try:
-        await conn.execute(text(migration_sql))
+        for stmt in statements:
+            await conn.execute(text(stmt))
         logger.info("Schema migrations applied (or already up-to-date).")
     except Exception as exc:
         logger.error(f"Migration failed: {exc}", exc_info=True)
-        raise  # re-raise so startup fails loudly instead of silently broken DB
+        raise
 
 
 @app.on_event("startup")

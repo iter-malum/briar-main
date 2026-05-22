@@ -495,6 +495,7 @@ services:
       DB_PORT: "5432"
       DB_NAME: briar_db
       ORCHESTRATOR_URL: http://orchestrator:8000
+      UI_SERVICE_URL: http://ui-service:8000
     ports:
       - "8005:8005"
     networks:

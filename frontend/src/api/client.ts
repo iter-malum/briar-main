@@ -317,6 +317,9 @@ export const runScheduleNow = (id: string): Promise<{ scan_id: string; status: s
     return r.json()
   })
 
+export const fetchScheduleDiff = (id: string): Promise<ScanDiff> =>
+  get(`/api/v1/schedules/${id}/diff`)
+
 // ── WebSocket URL (relative → same host as the page) ─────────────────────────
 
 export function getWsUrl(scanId: string): string {

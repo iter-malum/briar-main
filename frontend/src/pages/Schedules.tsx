@@ -1,16 +1,18 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Plus, Trash2, Play, Pencil, Check, X, Clock, ToggleLeft, ToggleRight } from 'lucide-react'
+import { Plus, Trash2, Play, Pencil, Check, Clock, ToggleLeft, ToggleRight, ChevronDown, ChevronUp, TrendingUp, TrendingDown, Minus } from 'lucide-react'
 import {
   fetchSchedules,
   createSchedule,
   updateSchedule,
   deleteSchedule,
   runScheduleNow,
+  fetchScheduleDiff,
   fetchAuthSessions,
   fetchTools,
 } from '../api/client'
 import type { Schedule } from '../types'
+import type { ScanDiff } from '../api/client'
 
 const CRON_PRESETS = [
   { label: 'Every hour',    value: '@hourly' },
@@ -177,6 +179,109 @@ function ScheduleForm({
   )
 }
 
+function DiffPanel({ scheduleId }: { scheduleId: string }) {
+  const { data: diff, isLoading, isError, error } = useQuery<ScanDiff, Error>({
+    queryKey: ['schedule-diff', scheduleId],
+    queryFn: () => fetchScheduleDiff(scheduleId),
+    staleTime: 60_000,
+  })
+
+  if (isLoading) return <p className="text-xs text-slate-500 py-2">Loading diff…</p>
+  if (isError) return <p className="text-xs text-red-400 py-2">{(error as Error).message}</p>
+  if (!diff) return null
+
+  const SEV_ORDER = ['critical', 'high', 'medium', 'low', 'info']
+
+  function countBySev(vulns: ScanDiff['new']) {
+    const m: Record<string, number> = {}
+    for (const v of vulns) m[v.severity] = (m[v.severity] ?? 0) + 1
+    return m
+  }
+
+  function SevPills({ vulns }: { vulns: ScanDiff['new'] }) {
+    const counts = countBySev(vulns)
+    const SEV_COLOR: Record<string, string> = {
+      critical: 'text-red-400 bg-red-900/20',
+      high:     'text-orange-400 bg-orange-900/20',
+      medium:   'text-yellow-400 bg-yellow-900/20',
+      low:      'text-blue-400 bg-blue-900/20',
+      info:     'text-slate-400 bg-slate-700/30',
+    }
+    return (
+      <div className="flex flex-wrap gap-1 mt-1">
+        {SEV_ORDER.filter(s => counts[s]).map(s => (
+          <span key={s} className={`px-1.5 py-0.5 text-xs rounded font-medium ${SEV_COLOR[s]}`}>
+            {s[0].toUpperCase()} ×{counts[s]}
+          </span>
+        ))}
+      </div>
+    )
+  }
+
+  return (
+    <div className="mt-3 pt-3 border-t border-briar-border space-y-3">
+      <p className="text-xs text-slate-500">
+        Diff: <span className="font-mono text-slate-400">{diff.scan_id.slice(0, 8)}</span>
+        {' '}vs <span className="font-mono text-slate-400">{diff.compare_to.slice(0, 8)}</span>
+        {' '}· {diff.scan_target}
+      </p>
+
+      <div className="grid grid-cols-3 gap-3">
+        {/* New */}
+        <div className="bg-red-950/20 border border-red-900/30 rounded-lg p-3">
+          <div className="flex items-center gap-1.5 mb-1">
+            <TrendingUp size={13} className="text-red-400" />
+            <span className="text-xs font-medium text-red-400">New vulnerabilities</span>
+            <span className="ml-auto text-sm font-bold text-red-300">{diff.summary.new}</span>
+          </div>
+          {diff.new.length > 0 && <SevPills vulns={diff.new} />}
+        </div>
+
+        {/* Fixed */}
+        <div className="bg-emerald-950/20 border border-emerald-900/30 rounded-lg p-3">
+          <div className="flex items-center gap-1.5 mb-1">
+            <TrendingDown size={13} className="text-emerald-400" />
+            <span className="text-xs font-medium text-emerald-400">Fixed</span>
+            <span className="ml-auto text-sm font-bold text-emerald-300">{diff.summary.fixed}</span>
+          </div>
+          {diff.fixed.length > 0 && <SevPills vulns={diff.fixed} />}
+        </div>
+
+        {/* Persisted */}
+        <div className="bg-slate-800/40 border border-slate-700/50 rounded-lg p-3">
+          <div className="flex items-center gap-1.5 mb-1">
+            <Minus size={13} className="text-slate-400" />
+            <span className="text-xs font-medium text-slate-400">Persisted</span>
+            <span className="ml-auto text-sm font-bold text-slate-300">{diff.summary.persisted}</span>
+          </div>
+          {diff.persisted.length > 0 && <SevPills vulns={diff.persisted} />}
+        </div>
+      </div>
+
+      {diff.new.length > 0 && (
+        <div className="space-y-1">
+          <p className="text-xs text-slate-500 font-medium">New findings:</p>
+          {diff.new.slice(0, 5).map(v => (
+            <div key={v.id} className="flex items-start gap-2 text-xs">
+              <span className={`mt-0.5 shrink-0 px-1 rounded text-[10px] font-medium ${
+                v.severity === 'critical' ? 'bg-red-900/40 text-red-400' :
+                v.severity === 'high'     ? 'bg-orange-900/40 text-orange-400' :
+                v.severity === 'medium'   ? 'bg-yellow-900/40 text-yellow-400' :
+                                            'bg-slate-700 text-slate-400'
+              }`}>{v.severity[0].toUpperCase()}</span>
+              <span className="text-slate-300 truncate">{v.vulnerability_type ?? v.tool}</span>
+              {v.url && <span className="text-slate-600 truncate max-w-[200px]">{v.url}</span>}
+            </div>
+          ))}
+          {diff.new.length > 5 && (
+            <p className="text-xs text-slate-600">…and {diff.new.length - 5} more</p>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ScheduleRow({
   schedule,
   allTools,
@@ -194,6 +299,9 @@ function ScheduleRow({
   onRunNow: () => void
   onEdit: () => void
 }) {
+  const [showDiff, setShowDiff] = useState(false)
+  const hasDiff = !!(schedule.last_scan_id && schedule.prev_scan_id)
+
   return (
     <div className={`bg-briar-surface border rounded-xl p-4 transition-opacity ${schedule.enabled ? 'border-briar-border' : 'border-briar-border opacity-60'}`}>
       <div className="flex items-start justify-between gap-4">
@@ -216,6 +324,20 @@ function ScheduleRow({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          {hasDiff && (
+            <button
+              onClick={() => setShowDiff(v => !v)}
+              title="Show diff vs previous run"
+              className={`p-1.5 rounded-lg transition-colors text-xs flex items-center gap-1 px-2 ${
+                showDiff
+                  ? 'bg-briar-accent/20 text-briar-accent border border-briar-accent/30'
+                  : 'text-slate-400 hover:text-briar-accent hover:bg-briar-accent/10'
+              }`}
+            >
+              {showDiff ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+              Diff
+            </button>
+          )}
           <button
             onClick={onRunNow}
             title="Run now"
@@ -262,6 +384,8 @@ function ScheduleRow({
           )}
         </div>
       </div>
+
+      {showDiff && hasDiff && <DiffPanel scheduleId={schedule.id} />}
     </div>
   )
 }

@@ -171,6 +171,7 @@ class ScanScheduleORM(Base):
     last_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     next_run_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     last_scan_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
+    prev_scan_id: Mapped[Optional[UUID]] = mapped_column(PG_UUID(as_uuid=True), nullable=True)
     run_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 
@@ -202,4 +203,5 @@ class ScheduleResponse(BaseModel):
     last_run_at: Optional[datetime] = None
     next_run_at: Optional[datetime] = None
     last_scan_id: Optional[UUID] = None
+    prev_scan_id: Optional[UUID] = None
     run_count: int

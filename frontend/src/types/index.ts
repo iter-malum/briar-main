@@ -131,5 +131,6 @@ export interface Schedule {
   last_run_at: string | null
   next_run_at: string | null
   last_scan_id: string | null
+  prev_scan_id: string | null
   run_count: number
 }
