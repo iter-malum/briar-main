@@ -3,7 +3,7 @@ Katana Crawler Worker
 =====================
 Phase: RECON — endpoint discovery and parameter extraction.
 
-Improvements over the original:
+M8 improvements:
   1. Cookie auth fix — was incorrectly using "-H @file"; now builds a proper
      "Cookie: name=val; ..." header string.
   2. POST body capture — saves request body and method in raw_output so
@@ -13,14 +13,21 @@ Improvements over the original:
   4. OpenAPI / Swagger / GraphQL auto-discovery — probes well-known API schema
      endpoints after the crawl and injects discovered paths.
   5. Headless Chromium enabled by default (configurable via KATANA_HEADLESS=false).
+  6. XHR/Fetch capture (-xhr flag) — intercepts async API calls from JS code.
+  7. Crawl-scope enforcement (-cs regex) — stays on-domain, avoids external drift.
+  8. SPA-aware depth — uses depth 5 when headless mode is active.
+  9. JS endpoint extraction — post-crawl regex pass over collected .js files to
+     surface hidden API paths not reachable by following DOM links.
+  10. gau passive URL discovery integrated inline.
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 
 import httpx as _httpx
@@ -102,12 +109,15 @@ def _base_origin(url: str) -> str:
 class KatanaWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="katana", queue_name="scan.crawl.katana")
-        self.timeout     = int(os.getenv("KATANA_TIMEOUT",     "600"))
-        self.depth       = int(os.getenv("KATANA_DEPTH",       "3"))
-        self.concurrency = int(os.getenv("KATANA_CONCURRENCY", "10"))
+        self.timeout          = int(os.getenv("KATANA_TIMEOUT",           "600"))
+        self.depth            = int(os.getenv("KATANA_DEPTH",             "3"))
+        self.headless_depth   = int(os.getenv("KATANA_HEADLESS_DEPTH",    "5"))   # deeper for SPAs
+        self.concurrency      = int(os.getenv("KATANA_CONCURRENCY",       "10"))
         # Headless Chromium enabled by default for full SPA coverage;
         # set KATANA_HEADLESS=false to disable (faster but misses React/Vue/Angular routes).
         self.headless = os.getenv("KATANA_HEADLESS", "true").lower() not in ("false", "0", "no")
+        # JS endpoint extraction: fetch collected .js files and regex-scan for hidden paths
+        self.js_extract = os.getenv("KATANA_JS_EXTRACT", "true").lower() not in ("false", "0", "no")
 
     # ── Main entry point ───────────────────────────────────────────────────────
 
@@ -121,29 +131,51 @@ class KatanaWorker(BaseWorker):
         work_dir = "/tmp/katana"
         os.makedirs(work_dir, exist_ok=True)
 
+        # M8: pick up app-type context from orchestrator payload
+        app_type = task_payload.get("app_type", "unknown")
+        is_spa   = task_payload.get("is_spa", False)
+
+        # Headless mode: explicit override > env var default > SPA auto-detect
+        headless_override = task_payload.get("headless")
+        if headless_override is not None:
+            use_headless = headless_override
+        elif is_spa:
+            use_headless = True   # Always enable Chromium for detected SPAs
+            logger.info(f"[katana] SPA detected ({app_type}) — forcing headless mode")
+        else:
+            use_headless = self.headless
+
+        # SPA-aware crawl depth: deeper when rendering JS
+        effective_depth = self.headless_depth if use_headless else self.depth
+
+        # Crawl-scope regex: lock katana to the target's origin so we don't
+        # follow external links (e.g. CDNs, third-party analytics scripts).
+        parsed_origin = urlparse(target)
+        scope_regex = re.escape(f"{parsed_origin.scheme}://{parsed_origin.netloc}")
+
         cmd = [
             "/usr/local/bin/katana",
             "-u", target,
             "-jsonl",
-            "-depth",   str(self.depth),
+            "-depth",   str(effective_depth),
             "-c",       str(self.concurrency),
             "-silent",
             "-no-color",
-            "-jc",          # JavaScript crawling — parse JS bundles
+            "-jc",          # JavaScript crawling — parse JS bundles for links
+            "-xhr",         # M8: XHR/Fetch interception — captures async API calls
             "-fx",          # Form extraction
             "-aff",         # Auto-form fill (discovers POST endpoints)
             "-kf", "all",   # robots.txt, sitemap.xml, /.well-known/*
             "-rl", "100",   # Rate limit (req/s)
             "-timeout", "15",
             "-retry", "1",
+            "-cs", scope_regex,   # M8: Crawl-scope — stay on-domain
         ]
 
         # Headless Chromium for SPA applications
-        headless_override = task_payload.get("headless")
-        use_headless = headless_override if headless_override is not None else self.headless
         if use_headless:
             cmd.extend(["-headless", "-no-sandbox"])
-            logger.info("[katana] Headless Chromium enabled (SPA mode)")
+            logger.info(f"[katana] Headless Chromium enabled (SPA mode, depth={effective_depth})")
 
         # ── Auth: headers ──────────────────────────────────────────────────────
         headers: Dict[str, str] = auth_context.get("headers", {})
@@ -209,6 +241,14 @@ class KatanaWorker(BaseWorker):
             if r["url"] not in existing_urls:
                 results.append(r)
                 existing_urls.add(r["url"])
+
+        # ── M8: JS endpoint extraction ─────────────────────────────────────────
+        if self.js_extract:
+            js_results = await self._extract_js_endpoints(results, target, headers, cookies)
+            for r in js_results:
+                if r["url"] not in existing_urls:
+                    results.append(r)
+                    existing_urls.add(r["url"])
 
         logger.info(f"[katana] Total unique endpoints: {len(results)}")
         return results
@@ -375,6 +415,131 @@ class KatanaWorker(BaseWorker):
         except Exception as exc:
             logger.warning(f"[gau] Failed: {exc}")
             return []
+
+    # ── M8: JS Endpoint Extractor ─────────────────────────────────────────────
+
+    # Regex patterns that commonly appear in bundled JS:
+    #   /api/users  |  /v1/auth  |  /graphql  |  relative paths like "../user"
+    # We avoid matching pure static asset paths (.png, .css, etc.)
+    _JS_PATH_RE = re.compile(
+        r"""['"`]"""                         # opening quote
+        r"""("""
+        r"""(?:/(?!/)[\w\-\./\{\}:@%?&=+#]*)"""   # absolute path starting with /
+        r"""|"""
+        r"""(?:\.{0,2}/[\w\-\./\{\}:@%?&=+#]+)""" # relative ./  ../  or plain slug/
+        r""")"""
+        r"""['"`]""",                        # closing quote
+        re.MULTILINE,
+    )
+    # Extensions that are not API paths
+    _STATIC_EXT_RE = re.compile(
+        r"""\.(png|jpg|jpeg|gif|svg|ico|webp|bmp|avif|"""
+        r"""css|woff2?|ttf|eot|otf|map|"""
+        r"""mp3|mp4|webm|ogg|wav|pdf|zip|gz|tar)$""",
+        re.IGNORECASE,
+    )
+    # Must contain at least one "word" character segment to be an endpoint
+    _MIN_PATH_RE = re.compile(r"/\w")
+
+    async def _extract_js_endpoints(
+        self,
+        crawl_results: List[Dict[str, Any]],
+        target: str,
+        headers: Dict[str, str],
+        cookies: List[Dict],
+    ) -> List[Dict[str, Any]]:
+        """
+        Collect every .js URL found during the crawl, fetch each file, and run
+        a regex pass to surface hidden API paths embedded in bundled JS code.
+
+        This catches routes that are never reachable by following DOM links
+        (deep routes defined in React Router, Angular Router, etc.) as well as
+        hard-coded fetch() calls that katana can't follow via headless rendering.
+        """
+        origin = _base_origin(target)
+
+        # Collect unique JS URLs from the crawl
+        js_urls: Set[str] = set()
+        for r in crawl_results:
+            u = r.get("url", "")
+            if u.endswith(".js") or ".js?" in u:
+                js_urls.add(u.split("?")[0])  # strip query for dedup
+
+        if not js_urls:
+            return []
+
+        logger.info(f"[katana/js-extract] Scanning {len(js_urls)} JS files for hidden endpoints")
+
+        request_headers = dict(headers)
+        if cookies:
+            request_headers["Cookie"] = _build_cookie_header(cookies)
+
+        results: List[Dict[str, Any]] = []
+        found_paths: Set[str] = set()
+
+        async with _httpx.AsyncClient(
+            headers=request_headers,
+            follow_redirects=True,
+            timeout=15.0,
+            verify=False,
+        ) as client:
+            for js_url in list(js_urls)[:50]:  # cap at 50 JS files per scan
+                try:
+                    resp = await client.get(js_url)
+                    if resp.status_code != 200:
+                        continue
+                    content = resp.text[:500_000]  # cap at 500 KB per file
+
+                    for match in self._JS_PATH_RE.finditer(content):
+                        raw_path = match.group(1)
+
+                        # Filter out obvious non-endpoint paths
+                        if self._STATIC_EXT_RE.search(raw_path):
+                            continue
+                        if not self._MIN_PATH_RE.search(raw_path):
+                            continue
+                        if len(raw_path) > 200:
+                            continue
+
+                        # Resolve to absolute URL
+                        if raw_path.startswith("/"):
+                            abs_url = origin + raw_path
+                        else:
+                            abs_url = urljoin(js_url, raw_path)
+
+                        # Only keep URLs on the same origin
+                        if not abs_url.startswith(origin):
+                            continue
+
+                        # Deduplicate
+                        norm = abs_url.split("?")[0].rstrip("/")
+                        if norm in found_paths:
+                            continue
+                        found_paths.add(norm)
+
+                        params = _extract_params_from_url(abs_url)
+                        results.append({
+                            "url": abs_url,
+                            "type": "js_extracted_endpoint",
+                            "description": f"JS-extracted path from {js_url}",
+                            "severity": SeverityLevel.info,
+                            "method": "GET",
+                            "has_params": bool(params),
+                            "param_names": list(params.keys()),
+                            "raw_output": {
+                                "source": "js_extraction",
+                                "js_file": js_url,
+                                "params": {"get": params, "post": {}, "all": list(params.keys())},
+                            },
+                        })
+
+                except (_httpx.TimeoutException, _httpx.ConnectError):
+                    continue
+                except Exception as exc:
+                    logger.debug(f"[katana/js-extract] Failed to fetch {js_url}: {exc}")
+
+        logger.info(f"[katana/js-extract] Extracted {len(results)} additional endpoints from JS files")
+        return results
 
     # ── API schema discovery ───────────────────────────────────────────────────
 

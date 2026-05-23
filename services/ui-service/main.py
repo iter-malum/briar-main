@@ -676,6 +676,112 @@ async def get_scan_endpoints(
     return {"total": len(endpoints), "endpoints": endpoints}
 
 
+# ── App Info Card ─────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/scans/{scan_id}/app-info")
+async def get_scan_app_info(scan_id: str):
+    """
+    Aggregate all WhatWeb results for a scan into a single structured
+    "Application Card" suitable for display in the UI.
+
+    Response shape:
+      target_url, http_status, title, ip, country,
+      app_type, is_spa, framework,   ← from M8 orchestrator detection
+      server:         [{name, version}]
+      languages:      [{name, version}]
+      frontend_libs:  [{name, version}]
+      cms:            [{name, version}]
+      waf:            [{name}]
+      cdn:            [{name}]
+      interesting_headers: {header: value}
+      all_technologies:    {name: version}   ← complete flat list
+      whatweb_ran: bool
+    """
+    try:
+        scan_uuid = UUID(scan_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan_id")
+
+    async with session_factory() as db:
+        # Load the scan for app_context (M8 detection) and target URL
+        scan_res = await db.execute(
+            select(ScanORM).where(ScanORM.id == scan_uuid)
+        )
+        scan = scan_res.scalars().first()
+        if not scan:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        # Load all WhatWeb results
+        ww_res = await db.execute(
+            select(ScanResultORM).where(
+                ScanResultORM.scan_id == scan_uuid,
+                ScanResultORM.tool == "whatweb",
+            )
+        )
+        ww_rows = ww_res.scalars().all()
+
+    # ── Merge all WhatWeb entries ──────────────────────────────────────────
+    merged: Dict[str, Any] = {
+        "server":              [],
+        "languages":           [],
+        "frontend_libs":       [],
+        "cms":                 [],
+        "waf":                 [],
+        "cdn":                 [],
+        "interesting_headers": {},
+        "ip":                  None,
+        "title":               None,
+        "http_status":         None,
+        "country":             None,
+        "all_technologies":    {},
+    }
+    seen_in_cat: Dict[str, set] = {
+        k: set() for k in ("server", "languages", "frontend_libs", "cms", "waf", "cdn")
+    }
+
+    for row in ww_rows:
+        raw = row.raw_output or {}
+        cat = raw.get("categorized", {})
+
+        # Merge scalars — first non-null wins
+        for field in ("ip", "title", "http_status", "country"):
+            if merged[field] is None and cat.get(field) is not None:
+                merged[field] = cat[field]
+
+        # Merge interesting headers
+        merged["interesting_headers"].update(cat.get("interesting_headers", {}))
+
+        # Merge tech_with_versions
+        merged["all_technologies"].update(raw.get("tech_with_versions", {}))
+
+        # Merge category lists — deduplicate by name
+        for cat_key, merged_key in (
+            ("server",       "server"),
+            ("languages",    "languages"),
+            ("frontend_libs","frontend_libs"),
+            ("cms",          "cms"),
+            ("waf",          "waf"),
+            ("cdn",          "cdn"),
+        ):
+            for item in cat.get(cat_key, []):
+                if item.get("name") and item["name"] not in seen_in_cat[merged_key]:
+                    seen_in_cat[merged_key].add(item["name"])
+                    merged[merged_key].append(item)
+
+    # ── App-type context from M8 orchestrator detection ────────────────────
+    app_ctx = scan.config.get("app_context", {}) or {}
+
+    return {
+        "target_url":    scan.target_url,
+        "app_type":      app_ctx.get("app_type", "unknown"),
+        "is_spa":        app_ctx.get("is_spa", False),
+        "framework":     app_ctx.get("framework"),
+        "tech_stack":    app_ctx.get("tech_stack", []),
+        "whatweb_ran":   len(ww_rows) > 0,
+        **merged,
+    }
+
+
 # ── Scan diff ────────────────────────────────────────────────────────────────
 
 _RECON_TOOLS = {"katana", "httpx", "whatweb", "ffuf", "gobuster", "arjun"}

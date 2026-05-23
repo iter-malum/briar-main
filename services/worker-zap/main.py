@@ -4,11 +4,15 @@ OWASP ZAP Active Scanner Worker
 Phase: DAST (parallel with Nuclei)
 Sources: katana + ffuf + httpx endpoints
 
-Fixes vs original:
+M8 improvements:
+- AJAX Spider runs first (Chromium-based) for full SPA/JS app coverage
+- Community add-ons installed on startup: ascanrulesBeta, pscanrulesBeta,
+  openapi, graphql, soap — maximises detection breadth
+- Active scan policy set to "Default Policy" with all rules enabled,
+  plus override strength/threshold for maximum OWASP Top 10 coverage
+- Passive scan rules include beta rules for additional header/config checks
 - Health-check loop replaces bare sleep(15) for ZAP startup
-- Correct ZAP REST API paths: /JSON/spider/ and /JSON/ascan/ (not "active_scan")
-- Endpoints from previous phases are added to ZAP context before scanning
-- auth cookies/headers properly loaded via ZAP replacer rules
+- Auth cookies/headers properly loaded via ZAP replacer rules
 """
 
 import asyncio
@@ -32,6 +36,19 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("zap-worker")
+
+# Community add-ons that significantly expand detection coverage.
+# These are installed once at ZAP startup via the autoupdate API.
+ZAP_ADDONS = [
+    "ascanrulesBeta",   # Beta active scan rules (SSRF, CSRF bypass, XXE, etc.)
+    "pscanrulesBeta",   # Beta passive scan rules (CSP, CORS, Clickjacking, etc.)
+    "ascanrulesAlpha",  # Alpha active scan rules (additional experimental checks)
+    "pscanrulesAlpha",  # Alpha passive scan rules
+    "openapi",          # OpenAPI/Swagger active scanning support
+    "graphql",          # GraphQL introspection and active scanning
+    "soap",             # WSDL/SOAP service scanning
+    "retire",           # Retire.js integration — JS library CVE matching
+]
 
 # Extensions that are pointless to scan with ZAP active scanner
 _STATIC_EXTS = frozenset({
@@ -75,10 +92,12 @@ RISK_MAP = {
 class ZAPWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="zap", queue_name="scan.dast.zap")
-        self.timeout      = int(os.getenv("ZAP_TIMEOUT", "3600"))
-        self.zap_port     = int(os.getenv("ZAP_PORT", "8090"))
-        self.api_key      = os.getenv("ZAP_API_KEY", "briar-zap-api-key-2024")
-        self.max_duration = int(os.getenv("ZAP_MAX_DURATION", "120"))  # minutes
+        self.timeout         = int(os.getenv("ZAP_TIMEOUT",         "3600"))
+        self.zap_port        = int(os.getenv("ZAP_PORT",            "8090"))
+        self.api_key         = os.getenv("ZAP_API_KEY",             "briar-zap-api-key-2024")
+        self.max_duration    = int(os.getenv("ZAP_MAX_DURATION",    "120"))   # minutes
+        self.ajax_timeout    = int(os.getenv("ZAP_AJAX_TIMEOUT",    "120"))   # seconds
+        self.install_addons  = os.getenv("ZAP_INSTALL_ADDONS", "true").lower() not in ("false", "0", "no")
 
     # ── ZAP base URL ───────────────────────────────────────────────────────────
 
@@ -109,6 +128,14 @@ class ZAPWorker(BaseWorker):
         if not endpoints:
             endpoints = [target]
 
+        # M8: app-type aware strategy
+        app_type = task_payload.get("app_type", "unknown")
+        is_spa   = task_payload.get("is_spa", False)
+        if is_spa:
+            # Give AJAX Spider more time for SPA route discovery
+            self.ajax_timeout = max(self.ajax_timeout, 240)
+            logger.info(f"[zap] SPA detected ({app_type}) — AJAX Spider timeout extended to {self.ajax_timeout}s")
+
         # Derive the base URL (scheme://host) for spidering and alert collection
         base_url = _extract_base_url(target)
 
@@ -126,6 +153,10 @@ class ZAPWorker(BaseWorker):
             await self._wait_for_zap_ready()
 
             async with httpx.AsyncClient() as client:
+                # Install community add-ons for maximum coverage
+                if self.install_addons:
+                    await self._install_addons(client)
+
                 # Load auth into ZAP
                 await self._load_auth(client, auth_context)
 
@@ -136,11 +167,15 @@ class ZAPWorker(BaseWorker):
                     except Exception:
                         pass
 
-                # Spider the base target (ZAP follows links from here)
+                # ── Phase 1: AJAX Spider (Chromium-based, best for SPAs) ───────
+                logger.info("[zap] Starting AJAX Spider (SPA/JS coverage phase)…")
+                await self._run_ajax_spider(client, target)
+
+                # ── Phase 2: Traditional Spider (link following) ───────────────
                 spider_id = await self._start_spider(client, base_url)
                 await self._wait_scan(client, "spider", spider_id)
 
-                # Active scan the base target (ZAP will include all discovered URLs)
+                # ── Phase 3: Active Scan ───────────────────────────────────────
                 ascan_id = await self._start_ascan(client, base_url)
                 await self._wait_scan(client, "ascan", ascan_id)
 
@@ -163,12 +198,14 @@ class ZAPWorker(BaseWorker):
         cmd = [
             "/zap/zap.sh",
             "-daemon",
-            "-port", str(self.zap_port),
-            "-host", "127.0.0.1",
+            "-port",   str(self.zap_port),
+            "-host",   "127.0.0.1",
             "-config", f"api.key={self.api_key}",
             "-config", "api.disablekey=false",
             "-config", f"scanner.maxDuration={self.max_duration}",
             "-config", "spider.maxDuration=5",
+            # Enable all attack strength levels by default
+            "-config", "ascan.attackPolicy=Default Policy",
         ]
         logger.info(f"[zap] Starting ZAP daemon on port {self.zap_port}")
         proc = await asyncio.create_subprocess_exec(
@@ -197,6 +234,28 @@ class ZAPWorker(BaseWorker):
                 pass
             await asyncio.sleep(3)
         raise TimeoutError("[zap] ZAP daemon did not start in time")
+
+    # ── Community add-on installation ─────────────────────────────────────────
+
+    async def _install_addons(self, client: httpx.AsyncClient):
+        """
+        Install community add-ons via ZAP's autoupdate API.
+        Each add-on expands the rule set; failures are non-fatal.
+        """
+        logger.info(f"[zap] Installing {len(ZAP_ADDONS)} community add-ons…")
+        for addon_id in ZAP_ADDONS:
+            try:
+                result = await self._zap(
+                    client,
+                    "autoupdate/action/installAddon/",
+                    id=addon_id,
+                )
+                logger.info(f"[zap] Add-on '{addon_id}': {result.get('Result', result)}")
+            except Exception as exc:
+                logger.warning(f"[zap] Could not install add-on '{addon_id}': {exc}")
+
+        # Brief pause to let ZAP reload after add-on installs
+        await asyncio.sleep(5)
 
     # ── Auth loading ───────────────────────────────────────────────────────────
 
@@ -236,12 +295,59 @@ class ZAPWorker(BaseWorker):
             except Exception as exc:
                 logger.warning(f"[zap] Failed to set header {name}: {exc}")
 
-    # ── Spider ─────────────────────────────────────────────────────────────────
+    # ── AJAX Spider (M8: SPA/JS coverage) ─────────────────────────────────────
+
+    async def _run_ajax_spider(self, client: httpx.AsyncClient, target: str):
+        """
+        Run the AJAX Spider which uses Chromium to render JS and discover routes
+        that the traditional (link-following) spider would miss entirely.
+
+        This is the primary crawling mechanism for React, Angular, Vue, and other
+        SPA frameworks where most routes are defined in JS, not in HTML <a> tags.
+        """
+        try:
+            # Start AJAX Spider
+            result = await self._zap(client, "ajaxSpider/action/scan/", url=target)
+            logger.info(f"[zap] AJAX Spider started: {result}")
+
+            # Poll until stopped (AJAX Spider returns text status, not percentage)
+            deadline = asyncio.get_event_loop().time() + self.ajax_timeout
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(10)
+                try:
+                    status_data = await self._zap(client, "ajaxSpider/view/status/")
+                    status = status_data.get("status", "running")
+                    logger.info(f"[zap] AJAX Spider status: {status}")
+                    if status == "stopped":
+                        # Log what was found
+                        try:
+                            results_data = await self._zap(
+                                client, "ajaxSpider/view/numberOfResults/"
+                            )
+                            count = results_data.get("numberOfResults", "?")
+                            logger.info(f"[zap] AJAX Spider complete — {count} resources discovered")
+                        except Exception:
+                            pass
+                        return
+                except Exception as exc:
+                    logger.warning(f"[zap] AJAX Spider status poll error: {exc}")
+
+            # If timeout reached, stop it manually
+            logger.warning(f"[zap] AJAX Spider timed out after {self.ajax_timeout}s — stopping")
+            try:
+                await self._zap(client, "ajaxSpider/action/stop/")
+            except Exception:
+                pass
+
+        except Exception as exc:
+            logger.warning(f"[zap] AJAX Spider unavailable (add-on not loaded?): {exc}")
+
+    # ── Traditional Spider ─────────────────────────────────────────────────────
 
     async def _start_spider(self, client: httpx.AsyncClient, target: str) -> str:
         data = await self._zap(client, "spider/action/scan/", url=target)
         scan_id = data.get("scan", "0")
-        logger.info(f"[zap] Spider started, id={scan_id}")
+        logger.info(f"[zap] Traditional Spider started, id={scan_id}")
         return scan_id
 
     # ── Active scan ────────────────────────────────────────────────────────────
@@ -309,6 +415,8 @@ class ZAPWorker(BaseWorker):
                     "attack":      alert.get("attack"),
                     "pluginId":    alert.get("pluginId"),
                     "risk":        alert.get("risk"),
+                    "confidence":  alert.get("confidence"),
+                    "tags":        alert.get("tags", {}),
                 },
             })
 

@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import ForceGraph2D, { type ForceGraphMethods } from 'react-force-graph-2d'
 import {
   ArrowLeft, RefreshCw, Wifi, WifiOff, ZoomIn, ZoomOut,
-  Maximize2, StopCircle, Play, List, GitGraph, Search, ExternalLink,
+  Maximize2, StopCircle, Play, List, GitGraph, Search, ExternalLink, Cpu,
 } from 'lucide-react'
 import {
   fetchScan, fetchScanGraph, fetchScanEndpoints, getWsUrl, cancelScan, runTool,
@@ -12,6 +12,7 @@ import {
 } from '../api/client'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { StatusBadge } from '../components/StatusBadge'
+import AppInfoCard from '../components/AppInfoCard'
 import type { GraphNode, GraphLink, WsEvent } from '../types'
 
 // ── Pipeline phase definitions ────────────────────────────────────────────────
@@ -329,7 +330,7 @@ export default function ScanGraph() {
   const engineStoppedRef = useRef(false)
   const [dims, setDims] = useState({ w: 800, h: 600 })
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null)
-  const [activeTab, setActiveTab] = useState<'graph' | 'endpoints'>('graph')
+  const [activeTab, setActiveTab] = useState<'graph' | 'endpoints' | 'app'>('graph')
   const [showRunTool, setShowRunTool] = useState(false)
 
   const { data: scan, refetch: refetchScan } = useQuery({
@@ -459,6 +460,14 @@ export default function ScanGraph() {
           >
             <List size={12} /> Endpoints
           </button>
+          <button
+            onClick={() => setActiveTab('app')}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded text-xs transition-colors ${
+              activeTab === 'app' ? 'bg-briar-accent text-white' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Cpu size={12} /> App Info
+          </button>
         </div>
 
         <div className="ml-auto flex items-center gap-3 text-xs text-slate-400">
@@ -469,6 +478,11 @@ export default function ScanGraph() {
               <span className="text-red-400">{vulnNodes.length} with vulns</span>
               <span className="text-slate-600">|</span>
             </>
+          )}
+          {activeTab === 'app' && scan && (
+            <span className="text-slate-500">
+              {scan.tools?.includes('whatweb') ? 'WhatWeb enabled' : 'Add WhatWeb for full detection'}
+            </span>
           )}
           {connected
             ? <span className="text-emerald-400 flex items-center gap-1"><Wifi size={12} /> live</span>
@@ -568,6 +582,13 @@ export default function ScanGraph() {
         {activeTab === 'endpoints' && (
           <div className="flex-1 overflow-hidden">
             <EndpointList scanId={id!} isRunning={scan?.status === 'running'} />
+          </div>
+        )}
+
+        {/* App Info tab */}
+        {activeTab === 'app' && (
+          <div className="flex-1 overflow-hidden flex">
+            <AppInfoCard scanId={id!} />
           </div>
         )}
       </div>

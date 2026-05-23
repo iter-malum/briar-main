@@ -1,4 +1,4 @@
-import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition, Schedule } from '../types'
+import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition, Schedule, AppInfo } from '../types'
 
 // All requests use relative URLs — the browser always calls back to
 // the same host that served the page (the Vite dev server), which then
@@ -319,6 +319,11 @@ export const runScheduleNow = (id: string): Promise<{ scan_id: string; status: s
 
 export const fetchScheduleDiff = (id: string): Promise<ScanDiff> =>
   get(`/api/v1/schedules/${id}/diff`)
+
+// ── App Info Card ─────────────────────────────────────────────────────────────
+
+export const fetchAppInfo = (scanId: string): Promise<AppInfo> =>
+  get(`/api/v1/scans/${scanId}/app-info`)
 
 // ── WebSocket URL (relative → same host as the page) ─────────────────────────
 

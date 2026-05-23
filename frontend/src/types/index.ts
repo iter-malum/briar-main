@@ -118,6 +118,36 @@ export interface ToolGroup {
   color: string
 }
 
+// ── App Info Card ─────────────────────────────────────────────────────────────
+
+export interface TechEntry {
+  name: string
+  version: string
+}
+
+export interface AppInfo {
+  target_url: string
+  app_type: 'spa' | 'api' | 'cms' | 'traditional' | 'unknown'
+  is_spa: boolean
+  framework: string | null
+  tech_stack: string[]
+  whatweb_ran: boolean
+  // Categorized sections
+  server: TechEntry[]
+  languages: TechEntry[]
+  frontend_libs: TechEntry[]
+  cms: TechEntry[]
+  waf: TechEntry[]
+  cdn: TechEntry[]
+  interesting_headers: Record<string, string>
+  all_technologies: Record<string, string>
+  // Meta
+  ip: string | null
+  title: string | null
+  http_status: number | null
+  country: string | null
+}
+
 export interface Schedule {
   id: string
   label: string | null

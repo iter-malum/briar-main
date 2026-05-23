@@ -92,12 +92,31 @@ class NucleiWorker(BaseWorker):
                 cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
                 cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
-            # Technology-based template selection
-            if scan_id:
-                tech_tags = await self.get_tech_tags(scan_id)
-                if tech_tags:
-                    cmd.extend(["-tags", ",".join(set(tech_tags))])
-                    logger.info(f"[nuclei] Using tech tags: {tech_tags}")
+            # M8: Technology-based template selection.
+            # Merge DB-derived tags with app_type context already in the payload
+            # (from orchestrator's detect_app_type call — no extra DB round-trip needed).
+            tech_tags: set = set()
+
+            # Fast path: tech_stack already resolved by orchestrator
+            payload_tech = task_payload.get("tech_stack", [])
+            if payload_tech:
+                from shared.pipeline import TECH_TO_NUCLEI_TAGS
+                for kw in payload_tech:
+                    for key, tag_list in TECH_TO_NUCLEI_TAGS.items():
+                        if key in kw.lower():
+                            tech_tags.update(tag_list)
+
+            # Slow path: DB lookup (catches cases where whatweb ran before detection)
+            if scan_id and not tech_tags:
+                db_tags = await self.get_tech_tags(scan_id)
+                tech_tags.update(db_tags)
+
+            # Always include OWASP Top 10 critical categories
+            tech_tags.update(["xss", "sqli", "rce", "ssrf", "lfi", "idor", "xxe"])
+
+            if tech_tags:
+                cmd.extend(["-tags", ",".join(tech_tags)])
+                logger.info(f"[nuclei] Template tags: {sorted(tech_tags)}")
 
             # Extra payload overrides
             if task_payload.get("templates"):

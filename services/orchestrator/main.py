@@ -46,6 +46,7 @@ from shared.pipeline import (
     PHASES, TOOL_QUEUES,
     should_trigger_phase, is_scan_complete,
     get_tools_for_initial_publish, SQLI_INDICATORS,
+    detect_app_type,
 )
 from shared.rabbitmq import RabbitMQPublisher
 
@@ -178,6 +179,18 @@ class PipelineManager:
                 if s.status in (ScanStatus.completed, ScanStatus.failed)
             }
 
+            # M8: Detect app type from WhatWeb results (once after RECON completes)
+            app_context = scan.config.get("app_context")
+            if app_context is None and "whatweb" in completed_tools:
+                app_context = await self._detect_app_context(scan_id, session)
+                if app_context:
+                    # Persist into scan config so we don't re-detect each event
+                    scan.config = {**scan.config, "app_context": app_context}
+                    logger.info(
+                        f"[pipeline] App detected: {app_context.get('app_type')} "
+                        f"/ {app_context.get('framework')} for scan {scan_id}"
+                    )
+
             # Evaluate which phases are now unblocked
             for phase in PHASES:
                 if not should_trigger_phase(phase, completed_tools, selected_tools):
@@ -194,7 +207,7 @@ class PipelineManager:
                         logger.info(f"[pipeline] skipping phase '{phase['id']}' — no SQLi findings")
                         continue
 
-                await self._publish_phase(scan_id, scan, phase, selected_tools)
+                await self._publish_phase(scan_id, scan, phase, selected_tools, app_context or {})
 
             # Check overall completion
             if is_scan_complete(selected_tools, completed_tools):
@@ -219,7 +232,14 @@ class PipelineManager:
 
             await session.commit()
 
-    async def _publish_phase(self, scan_id, scan: ScanORM, phase: dict, selected_tools: set):
+    async def _publish_phase(
+        self,
+        scan_id,
+        scan: ScanORM,
+        phase: dict,
+        selected_tools: set,
+        app_context: dict = {},
+    ):
         tools = phase["tools"] & selected_tools
         for tool in tools:
             queue_name = TOOL_QUEUES.get(tool)
@@ -237,10 +257,39 @@ class PipelineManager:
                     "source_tools": source_tools,
                     "phase": phase["id"],
                     "exploit_enabled": scan.config.get("exploit_enabled", False),
+                    # M8: app-type context for adaptive tool strategy
+                    "app_type":  app_context.get("app_type", "unknown"),
+                    "is_spa":    app_context.get("is_spa", False),
+                    "framework": app_context.get("framework"),
+                    "tech_stack": app_context.get("tech_stack", []),
                 },
             }
             await self.publisher.publish(queue_name, payload)
-            logger.info(f"[pipeline] published {tool} (phase={phase['id']}) for scan {scan_id}")
+            logger.info(
+                f"[pipeline] published {tool} (phase={phase['id']}, "
+                f"app_type={app_context.get('app_type', 'unknown')}) for scan {scan_id}"
+            )
+
+    @staticmethod
+    async def _detect_app_context(scan_id: str, session: AsyncSession) -> dict:
+        """
+        Read WhatWeb results for this scan from the DB and run app-type detection.
+        Returns a dict like {app_type, is_spa, framework, tech_stack} or {}.
+        """
+        from shared.models import ScanResultORM
+        try:
+            stmt = select(ScanResultORM.raw_output).where(
+                ScanResultORM.scan_id == UUID(scan_id),
+                ScanResultORM.tool == "whatweb",
+            )
+            result = await session.execute(stmt)
+            raw_outputs = [row[0] for row in result.all() if row[0]]
+            if not raw_outputs:
+                return {}
+            return detect_app_type(raw_outputs)
+        except Exception as exc:
+            logger.warning(f"[pipeline] App-type detection failed: {exc}")
+            return {}
 
     @staticmethod
     async def _has_sqli_findings(scan_id: str, session: AsyncSession) -> bool:

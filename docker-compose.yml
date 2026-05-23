@@ -164,8 +164,10 @@ services:
       AUTH_SERVICE_URL: http://auth-service:8000
       KATANA_TIMEOUT: "600"
       KATANA_DEPTH: "3"
+      KATANA_HEADLESS_DEPTH: "5"   # Deeper crawl when Chromium rendering is active
       KATANA_CONCURRENCY: "10"
-      KATANA_HEADLESS: "true"    # Headless Chromium for SPA (React/Vue/Angular)
+      KATANA_HEADLESS: "true"      # Headless Chromium for SPA (React/Vue/Angular)
+      KATANA_JS_EXTRACT: "true"    # Post-crawl JS regex extraction of hidden paths
     deploy:
       resources:
         limits:
@@ -250,6 +252,8 @@ services:
       ZAP_PORT: "8090"
       ZAP_API_KEY: "briar-zap-api-key-2024"
       ZAP_MAX_DURATION: "30"
+      ZAP_AJAX_TIMEOUT: "120"      # Seconds to run AJAX Spider for SPA route discovery
+      ZAP_INSTALL_ADDONS: "true"   # Install community add-ons on startup
     networks:
       - briar-net
     restart: unless-stopped

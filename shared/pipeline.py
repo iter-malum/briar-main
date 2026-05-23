@@ -14,6 +14,11 @@ Pipeline flow:
 Phases whose trigger tools are not in the scan's selected set are skipped
 automatically, so e.g. selecting ["katana","nuclei"] works correctly.
 The trigger_after check only counts tools that were actually selected for the scan.
+
+M8: App-type auto-detection
+  After RECON, WhatWeb results are inspected.  A detected technology stack
+  (SPA framework, language, CMS, API, etc.) is embedded in every subsequent
+  task payload so workers can tune their strategy accordingly.
 """
 
 from typing import Dict, List, Optional, Set
@@ -173,3 +178,96 @@ def get_tools_for_initial_publish(selected_tools: Set[str]) -> List[str]:
     """Returns the tools from the recon phase that are in selected_tools."""
     phase = PHASES[0]  # recon
     return list(phase["tools"] & selected_tools)
+
+
+# ── M8: App-type auto-detection ───────────────────────────────────────────────
+#
+# Maps technology keyword (lowercased) → detected capabilities.
+# "app_type" can be one of: "spa", "api", "cms", "traditional", "unknown"
+# "is_spa" drives headless depth / AJAX spider decisions in workers.
+
+APP_TYPE_SIGNATURES: Dict[str, Dict] = {
+    # SPA frameworks — must enable headless/AJAX strategies
+    "react":          {"app_type": "spa", "is_spa": True,  "framework": "React"},
+    "vue.js":         {"app_type": "spa", "is_spa": True,  "framework": "Vue.js"},
+    "vuejs":          {"app_type": "spa", "is_spa": True,  "framework": "Vue.js"},
+    "angular":        {"app_type": "spa", "is_spa": True,  "framework": "Angular"},
+    "next.js":        {"app_type": "spa", "is_spa": True,  "framework": "Next.js"},
+    "nuxt.js":        {"app_type": "spa", "is_spa": True,  "framework": "Nuxt.js"},
+    "svelte":         {"app_type": "spa", "is_spa": True,  "framework": "Svelte"},
+    "ember.js":       {"app_type": "spa", "is_spa": True,  "framework": "Ember.js"},
+    "backbone.js":    {"app_type": "spa", "is_spa": True,  "framework": "Backbone.js"},
+    "gatsby":         {"app_type": "spa", "is_spa": True,  "framework": "Gatsby"},
+    # API backends — focus on endpoint fuzzing + auth testing
+    "graphql":        {"app_type": "api", "is_spa": False, "framework": "GraphQL"},
+    "rest":           {"app_type": "api", "is_spa": False, "framework": "REST"},
+    "swagger":        {"app_type": "api", "is_spa": False, "framework": "OpenAPI"},
+    "openapi":        {"app_type": "api", "is_spa": False, "framework": "OpenAPI"},
+    "fastapi":        {"app_type": "api", "is_spa": False, "framework": "FastAPI"},
+    "django rest":    {"app_type": "api", "is_spa": False, "framework": "DRF"},
+    "spring boot":    {"app_type": "api", "is_spa": False, "framework": "Spring Boot"},
+    # CMS — template-driven with known vuln patterns
+    "wordpress":      {"app_type": "cms", "is_spa": False, "framework": "WordPress"},
+    "joomla":         {"app_type": "cms", "is_spa": False, "framework": "Joomla"},
+    "drupal":         {"app_type": "cms", "is_spa": False, "framework": "Drupal"},
+    "magento":        {"app_type": "cms", "is_spa": False, "framework": "Magento"},
+    "shopify":        {"app_type": "cms", "is_spa": False, "framework": "Shopify"},
+    # Traditional MVC — server-rendered, good for standard DAST
+    "php":            {"app_type": "traditional", "is_spa": False, "lang": "PHP"},
+    "laravel":        {"app_type": "traditional", "is_spa": False, "framework": "Laravel"},
+    "symfony":        {"app_type": "traditional", "is_spa": False, "framework": "Symfony"},
+    "codeigniter":    {"app_type": "traditional", "is_spa": False, "framework": "CodeIgniter"},
+    "asp.net":        {"app_type": "traditional", "is_spa": False, "lang": "ASP.NET"},
+    "ruby on rails":  {"app_type": "traditional", "is_spa": False, "framework": "Rails"},
+    "django":         {"app_type": "traditional", "is_spa": False, "framework": "Django"},
+    "flask":          {"app_type": "traditional", "is_spa": False, "framework": "Flask"},
+}
+
+
+def detect_app_type(whatweb_raw_outputs: List[Dict]) -> Dict:
+    """
+    Inspect a list of WhatWeb result dicts (raw_output fields from scan_results)
+    and return a classification dict:
+
+      {
+        "app_type":   "spa" | "api" | "cms" | "traditional" | "unknown",
+        "is_spa":     bool,
+        "framework":  str | None,
+        "tech_stack": [str, ...],   # all detected tech keywords
+      }
+    """
+    tech_stack: List[str] = []
+
+    for result in whatweb_raw_outputs:
+        # WhatWeb raw_output may be a dict with plugin names as keys
+        if isinstance(result, dict):
+            for key in result:
+                tech_stack.append(key.lower())
+                # Also check string values for version hints
+                val = result[key]
+                if isinstance(val, str):
+                    tech_stack.append(val.lower())
+                elif isinstance(val, list):
+                    for v in val:
+                        if isinstance(v, str):
+                            tech_stack.append(v.lower())
+
+    tech_text = " ".join(tech_stack)
+
+    # Highest-priority match wins
+    # Order matters: SPA > API > CMS > Traditional
+    for keyword, classification in APP_TYPE_SIGNATURES.items():
+        if keyword in tech_text:
+            return {
+                "app_type":  classification["app_type"],
+                "is_spa":    classification["is_spa"],
+                "framework": classification.get("framework") or classification.get("lang"),
+                "tech_stack": list(set(tech_stack))[:30],  # cap for payload size
+            }
+
+    return {
+        "app_type":  "unknown",
+        "is_spa":    False,
+        "framework": None,
+        "tech_stack": list(set(tech_stack))[:30],
+    }
