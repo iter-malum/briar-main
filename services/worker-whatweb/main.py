@@ -419,8 +419,17 @@ class WhatWebWorker(BaseWorker):
             cmd = [
                 "whatweb",
                 "--no-errors",
+                "--color=never",
                 f"--aggression={self.aggression}",
                 f"--log-json={out_file}",
+                # Follow HTTP→HTTPS redirects (GitHub Pages, CDNs, etc. all redirect).
+                # Default is NEVER which means WhatWeb scans the redirect response
+                # and gets 0 useful plugins.  HTTPS_ONLY is safe: we follow only
+                # upgrades, not arbitrary cross-origin chains.
+                "--follow-redirect=HTTPS_ONLY",
+                "--max-redirect=3",
+                # Generic browser UA — some CDNs block non-browser UA strings.
+                "--user-agent=Mozilla/5.0 (compatible; Briar-Scanner/1.0)",
                 # NOTE: do NOT add --quiet here — it suppresses --log-json output
                 # in some WhatWeb versions and causes 0 results.
             ]

@@ -162,16 +162,20 @@ services:
       DB_PORT: "5432"
       DB_NAME: briar_db
       AUTH_SERVICE_URL: http://auth-service:8000
-      KATANA_TIMEOUT: "600"
-      KATANA_DEPTH: "3"
-      KATANA_HEADLESS_DEPTH: "5"   # Deeper crawl when Chromium rendering is active
+      # Quality-first crawl settings — time is not a constraint.
+      # katana will self-terminate at KATANA_TIMEOUT-60s (-ct flag) and flush
+      # all results; WORKER_TIMEOUT gives an additional 10-min safety margin.
+      KATANA_TIMEOUT: "3600"           # 1 h crawl budget per target
+      WORKER_TIMEOUT: "7200"           # 2 h worker safety net (> KATANA_TIMEOUT)
+      KATANA_DEPTH: "3"                # Standard crawl depth
+      KATANA_HEADLESS_DEPTH: "5"       # SPA / headless depth (React/Vue/Angular)
       KATANA_CONCURRENCY: "10"
-      KATANA_HEADLESS: "true"      # Headless Chromium for SPA (React/Vue/Angular)
-      KATANA_JS_EXTRACT: "true"    # Post-crawl JS regex extraction of hidden paths
+      KATANA_HEADLESS: "true"          # Headless Chromium for SPAs
+      KATANA_JS_EXTRACT: "true"        # Post-crawl JS regex for hidden API paths
     deploy:
       resources:
         limits:
-          memory: 1G             # Chromium needs extra memory
+          memory: 2G             # Chromium @ concurrency=10 needs ~200 MB/tab
     networks:
       - briar-net
     restart: unless-stopped

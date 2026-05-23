@@ -55,7 +55,7 @@ ENV KATANA_HEADLESS=true \
     KATANA_DEPTH=3 \
     KATANA_HEADLESS_DEPTH=5 \
     KATANA_CONCURRENCY=10 \
-    KATANA_TIMEOUT=600 \
+    KATANA_TIMEOUT=3600 \
     KATANA_JS_EXTRACT=true
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \

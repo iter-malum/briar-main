@@ -185,10 +185,12 @@ class BaseWorker(ABC):
         try:
             await self._update_step_status(scan_id, ScanStatus.running)
 
-            # Load endpoints from previous-phase tools
+            # Load endpoints from previous-phase tools.
+            # _get_live_endpoints_from_db filters to httpx-confirmed 2xx/3xx
+            # URLs when httpx is a source tool, eliminating 404 waste in DAST.
             endpoints: List[str] = []
             if source_tools:
-                endpoints = await self._get_endpoints_from_db(scan_id, source_tools)
+                endpoints = await self._get_live_endpoints_from_db(scan_id, source_tools)
                 logger.info(f"[{self.tool_name}] Loaded {len(endpoints)} endpoints from {source_tools}")
 
             # Fall back to the original target URL
@@ -266,6 +268,67 @@ class BaseWorker(ABC):
         except Exception as exc:
             logger.error(f"[{self.tool_name}] _get_endpoints_from_db failed: {exc}")
             return []
+
+    async def _get_live_endpoints_from_db(
+        self, scan_id: str, source_tools: List[str]
+    ) -> List[str]:
+        """
+        Like _get_endpoints_from_db but filters to confirmed-live URLs.
+
+        When 'httpx' is in source_tools and has results, only URLs that httpx
+        probed and received a 2xx/3xx status code for are returned.  This
+        eliminates 404 / dead endpoints before DAST tools run, which otherwise
+        waste significant time scanning non-existent pages.
+
+        Falls back to the unfiltered list if:
+          - httpx is not in source_tools
+          - httpx has no results yet
+          - the status-code filter raises an error (DB/type mismatch)
+        """
+        if "httpx" not in source_tools:
+            return await self._get_endpoints_from_db(scan_id, source_tools)
+
+        try:
+            from sqlalchemy import text as sa_text
+            async with self.session_factory() as session:
+                # Raw SQL: PostgreSQL JSON ->> operator extracts text from the
+                # json column; we cast to int and keep only 2xx/3xx responses.
+                stmt = sa_text("""
+                    SELECT DISTINCT url
+                    FROM   scan_results
+                    WHERE  scan_id  = :scan_id
+                      AND  tool     = 'httpx'
+                      AND  url      IS NOT NULL
+                      AND  url      != ''
+                      AND  (raw_output->>'status_code')::int BETWEEN 200 AND 399
+                """)
+                result = await session.execute(stmt, {"scan_id": str(scan_id)})
+                live_urls = [
+                    url for (url,) in result.all()
+                    if url and url.startswith("http")
+                ]
+
+            if live_urls:
+                logger.info(
+                    f"[{self.tool_name}] Live-endpoint filter: "
+                    f"{len(live_urls)} confirmed 2xx/3xx URLs for scan {scan_id}"
+                )
+                return live_urls
+
+            # httpx ran but nothing passed the status filter (all 4xx/5xx) —
+            # fall back so the DAST tools still have *something* to work with.
+            logger.debug(
+                f"[{self.tool_name}] No 2xx/3xx httpx results for scan {scan_id} "
+                f"— falling back to unfiltered source-tool endpoints"
+            )
+
+        except Exception as exc:
+            logger.debug(
+                f"[{self.tool_name}] Live-endpoint filter failed ({exc}), "
+                f"using unfiltered endpoints"
+            )
+
+        return await self._get_endpoints_from_db(scan_id, source_tools)
 
     async def _get_endpoints_with_params(
         self, scan_id: str, source_tools: List[str]

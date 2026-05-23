@@ -109,10 +109,14 @@ def _base_origin(url: str) -> str:
 class KatanaWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="katana", queue_name="scan.crawl.katana")
-        self.timeout          = int(os.getenv("KATANA_TIMEOUT",           "600"))
-        self.depth            = int(os.getenv("KATANA_DEPTH",             "3"))
-        self.headless_depth   = int(os.getenv("KATANA_HEADLESS_DEPTH",    "5"))   # deeper for SPAs
-        self.concurrency      = int(os.getenv("KATANA_CONCURRENCY",       "10"))
+        # Default timeout is 1 hour — quality over speed.
+        # Juice Shop / Angular / React SPAs need 10-30 min of headless crawling
+        # to surface all routes. Set KATANA_TIMEOUT=600 in docker-compose to
+        # trade coverage for speed on lightweight targets.
+        self.timeout          = int(os.getenv("KATANA_TIMEOUT",        "3600"))
+        self.depth            = int(os.getenv("KATANA_DEPTH",          "3"))
+        self.headless_depth   = int(os.getenv("KATANA_HEADLESS_DEPTH", "5"))
+        self.concurrency      = int(os.getenv("KATANA_CONCURRENCY",    "10"))
         # Headless Chromium enabled by default for full SPA coverage;
         # set KATANA_HEADLESS=false to disable (faster but misses React/Vue/Angular routes).
         self.headless = os.getenv("KATANA_HEADLESS", "true").lower() not in ("false", "0", "no")
@@ -148,6 +152,13 @@ class KatanaWorker(BaseWorker):
         # SPA-aware crawl depth: deeper when rendering JS
         effective_depth = self.headless_depth if use_headless else self.depth
 
+        # Crawl-duration budget: tell katana to stop itself 60 s before the
+        # Python asyncio.wait_for deadline.  Without this, wait_for sends
+        # SIGKILL at deadline and every buffered result is discarded — the scan
+        # returns 0 endpoints even after an hour of crawling.
+        # With -ct, katana flushes output and exits cleanly before the hard kill.
+        crawl_duration_s = max(120, self.timeout - 60)
+
         # Crawl-scope regex: lock katana to the target's origin so we don't
         # follow external links (e.g. CDNs, third-party analytics scripts).
         parsed_origin = urlparse(target)
@@ -157,25 +168,32 @@ class KatanaWorker(BaseWorker):
             "/usr/local/bin/katana",
             "-u", target,
             "-jsonl",
-            "-depth",   str(effective_depth),
-            "-c",       str(self.concurrency),
+            "-depth",    str(effective_depth),
+            "-c",        str(self.concurrency),
             "-silent",
             "-no-color",
-            "-jc",          # JavaScript crawling — parse JS bundles for links
-            "-xhr",         # M8: XHR/Fetch interception — captures async API calls
-            "-fx",          # Form extraction
-            "-aff",         # Auto-form fill (discovers POST endpoints)
-            "-kf", "all",   # robots.txt, sitemap.xml, /.well-known/*
-            "-rl", "100",   # Rate limit (req/s)
+            "-jc",           # JavaScript crawling — parse JS bundles for links
+            "-xhr",          # M8: XHR/Fetch interception — captures async API calls
+            "-fx",           # Form extraction
+            "-aff",          # Auto-form fill (discovers POST endpoints)
+            "-kf", "all",    # robots.txt, sitemap.xml, /.well-known/*
+            "-rl", "100",    # Rate limit (req/s)
             "-timeout", "15",
             "-retry", "1",
-            "-cs", scope_regex,   # M8: Crawl-scope — stay on-domain
+            "-cs", scope_regex,             # M8: Crawl-scope — stay on-domain
+            "-ct", f"{crawl_duration_s}s",  # Graceful self-termination before worker timeout
+            "-strategy", "breadth-first",   # Wider coverage before going deep (better for time-bounded runs)
         ]
 
         # Headless Chromium for SPA applications
         if use_headless:
             cmd.extend(["-headless", "-no-sandbox"])
-            logger.info(f"[katana] Headless Chromium enabled (SPA mode, depth={effective_depth})")
+            logger.info(
+                f"[katana] Headless Chromium enabled "
+                f"(SPA mode, depth={effective_depth}, "
+                f"concurrency={self.concurrency}, "
+                f"crawl-duration={crawl_duration_s}s)"
+            )
 
         # ── Auth: headers ──────────────────────────────────────────────────────
         headers: Dict[str, str] = auth_context.get("headers", {})
@@ -441,6 +459,27 @@ class KatanaWorker(BaseWorker):
     # Must contain at least one "word" character segment to be an endpoint
     _MIN_PATH_RE = re.compile(r"/\w")
 
+    # ── JS extraction quality filters ─────────────────────────────────────────
+    # Rule 1: Template literal artifacts — unencoded quote/plus/whitespace means
+    #   the "path" is actually a JS string concatenation fragment, not a URL.
+    #   e.g.  /juice-shop/js/'+ url +'  →  rejected
+    _TEMPLATE_ARTIFACT_RE = re.compile(r"""['"+ \t\\]""")
+
+    # Rule 2: Separator strings — segments that are only dashes/underscores/dots
+    #   appear as visual dividers in source maps and minified bundles.
+    #   e.g.  /assets/---...---  →  rejected
+    _SEPARATOR_SEGMENT_RE = re.compile(r"(?:^|/)[-_.=*]{3,}(?:/|$)")
+
+    # Rule 3: Webpack chunk ID pattern — a known static-asset directory
+    #   immediately followed by a 1-3 char alphanumeric chunk ID fragment.
+    #   e.g.  /assets/1  /static/T  /dist/4xi  →  rejected
+    #   Version indicators (v1, v2…) are intentionally excluded from this set
+    #   because /api/v1 and /api/v2 are valid endpoints.
+    _STATIC_ASSET_DIRS = frozenset({
+        "assets", "static", "dist", "build", "public",
+        "chunks", "chunk", "bundles",
+    })
+
     async def _extract_js_endpoints(
         self,
         crawl_results: List[Dict[str, Any]],
@@ -493,12 +532,32 @@ class KatanaWorker(BaseWorker):
                     for match in self._JS_PATH_RE.finditer(content):
                         raw_path = match.group(1)
 
-                        # Filter out obvious non-endpoint paths
+                        # ── Basic filters ──────────────────────────────────────
                         if self._STATIC_EXT_RE.search(raw_path):
                             continue
                         if not self._MIN_PATH_RE.search(raw_path):
                             continue
                         if len(raw_path) > 200:
+                            continue
+
+                        # ── Quality filters (false-positive suppression) ───────
+                        # Rule 1: template literal artifacts
+                        if self._TEMPLATE_ARTIFACT_RE.search(raw_path):
+                            continue
+
+                        # Rule 2: separator segments (---...---, ___, etc.)
+                        if self._SEPARATOR_SEGMENT_RE.search(raw_path):
+                            continue
+
+                        # Rule 3: webpack chunk IDs — /<static-dir>/<1-3char>
+                        _parts = [p for p in raw_path.strip("/").split("/") if p]
+                        if (
+                            len(_parts) >= 2
+                            and _parts[-2].lower() in self._STATIC_ASSET_DIRS
+                            and len(_parts[-1]) <= 3
+                            and _parts[-1].isalnum()
+                            and not re.match(r"^v\d+$", _parts[-1])
+                        ):
                             continue
 
                         # Resolve to absolute URL
