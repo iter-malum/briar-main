@@ -1,30 +1,20 @@
-# ── Stage 1: build WhatWeb gems ───────────────────────────────────────────────
-FROM ruby:3.2-slim AS ruby-builder
+# WhatWeb Technology Detection Worker
+#
+# WhatWeb is available in the Debian Bookworm apt repository (v0.5.5) —
+# the same version as the current GitHub HEAD.  Installing from apt is
+# far more reliable than cloning GitHub during docker build (network may
+# be restricted / TLS-blocked in some environments).
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git curl build-essential ruby-dev \
-    && git clone --depth 1 https://github.com/urbanadventurer/WhatWeb /opt/whatweb \
-    && cd /opt/whatweb \
-    && gem install bundler --no-document \
-    && bundle config set --local without 'development test' \
-    && bundle config set --local path '/opt/whatweb/vendor/bundle' \
-    && bundle install --no-cache \
-    && rm -rf /var/lib/apt/lists/* /tmp/*
-
-# ── Stage 2: Python worker with WhatWeb pre-built ─────────────────────────────
 FROM python:3.11-slim
 
-# Ruby runtime (no compiler needed — gems already built in stage 1)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ruby curl \
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
+
+RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null; \
+    sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list 2>/dev/null; \
+    apt-get update && apt-get install -y --no-install-recommends \
+        whatweb \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-# Copy WhatWeb + pre-built gems from builder
-COPY --from=ruby-builder /opt/whatweb /opt/whatweb
-COPY --from=ruby-builder /usr/local/lib/ruby /usr/local/lib/ruby
-COPY --from=ruby-builder /usr/local/bundle /usr/local/bundle
-
-RUN ln -s /opt/whatweb/whatweb /usr/local/bin/whatweb
 
 WORKDIR /app
 
@@ -33,5 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-whatweb/main.py ./main.py
+
+RUN mkdir -p /tmp/whatweb && chmod 777 /tmp/whatweb
 
 CMD ["python3", "main.py"]
