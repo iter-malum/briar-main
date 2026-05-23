@@ -7,6 +7,13 @@
 # ── Stage 1: compile Go tools ─────────────────────────────────────────────────
 FROM golang:latest AS builder
 
+# Download directly from GitHub VCS instead of going through proxy.golang.org
+# (proxy can be blocked / TLS-timeout in some network environments).
+# GONOSUMDB skips sum.golang.org — same TLS path, same problem.
+ENV GOPROXY=direct \
+    GONOSUMDB=* \
+    GOFLAGS=-mod=mod
+
 # katana (ProjectDiscovery crawler with JS + XHR support)
 RUN go install github.com/projectdiscovery/katana/cmd/katana@v1.1.0
 

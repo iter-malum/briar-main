@@ -1,4 +1,10 @@
 FROM golang:latest AS builder
+
+# Bypass proxy.golang.org — download directly from GitHub VCS.
+ENV GOPROXY=direct \
+    GONOSUMDB=* \
+    GOFLAGS=-mod=mod
+
 RUN go install github.com/hahwul/dalfox/v2@v2.13.0
 
 FROM python:3.11-slim
