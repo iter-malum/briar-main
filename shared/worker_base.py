@@ -176,7 +176,11 @@ class BaseWorker(ABC):
     async def _process_task(self, payload: Dict[str, Any]):
         import time as _time
         scan_id = payload["scan_id"]
-        target = payload.get("target", "")
+        # Strip the URL fragment (#...) — it's client-side SPA routing and
+        # meaningless to any server-side tool (WhatWeb, katana, httpx, etc.).
+        # Also strip a trailing slash so /foo and /foo/ normalise to the same target.
+        raw_target = payload.get("target", "")
+        target = raw_target.split("#")[0].rstrip("/") if raw_target else ""
         auth_session_id = payload.get("auth_session_id")
         task_payload = payload.get("payload", {})
         source_tools: List[str] = task_payload.get("source_tools", [])

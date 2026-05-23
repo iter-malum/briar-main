@@ -306,6 +306,12 @@ class KatanaWorker(BaseWorker):
                 if not endpoint_url:
                     continue
 
+                # Drop URLs that are Angular attributes / CSS values / JS APIs
+                # parsed as paths by the headless crawler
+                if not self._is_quality_crawl_url(endpoint_url):
+                    logger.debug(f"[katana] Filtered garbage URL: {endpoint_url[:120]}")
+                    continue
+
                 method = request.get("method", "GET").upper()
                 body   = request.get("body") or ""
 
@@ -411,6 +417,8 @@ class KatanaWorker(BaseWorker):
             ]
             results = []
             for u in raw_urls:
+                if not self._is_quality_crawl_url(u):
+                    continue
                 params = _extract_params_from_url(u)
                 results.append({
                     "url": u,
@@ -458,6 +466,78 @@ class KatanaWorker(BaseWorker):
     )
     # Must contain at least one "word" character segment to be an endpoint
     _MIN_PATH_RE = re.compile(r"/\w")
+
+    # ── Active-crawl URL quality filters ──────────────────────────────────────
+    # Angular headless crawl extracts HTML attribute values as URL paths.
+    # These regexes catch the most common false-positive classes:
+
+    # CSS numeric values: /0.000000001px  /1.5em  /100vh
+    _CSS_VALUE_PATH_RE = re.compile(
+        r'^/[\d.]+(?:px|em|rem|vh|vw|vmin|vmax|pt|cm|mm|fr|ch|ex|%|s|ms)(?:[/?#]|$)',
+        re.IGNORECASE,
+    )
+    # Angular Flex Layout directives used as HTML attributes:
+    # fxFlex.gt-lg, fxFlexAlign.lt-md, fxHide.gt-xs, fxLayout …
+    _ANGULAR_FLEX_RE = re.compile(
+        r'/fx(?:Flex|Layout|Hide|Show|FlexAlign|FlexFill|FlexOrder|FlexOffset)',
+        re.IGNORECASE,
+    )
+    # Browser / JS API names crawled as paths:
+    # /XMLHttpRequest.send  /Promise.then  /Microsoft.XMLHTTP  /Chrome/66
+    _JS_API_RE = re.compile(
+        r'/(?:XMLHttpRequest|ActiveXObject|Microsoft\.|MozXMLHttp|'
+        r'Promise\.|Object\.|Array\.|Function\.|Error\.|'
+        r'document\.|window\.|navigator\.|console\.|Math\.|'
+        r'Trident|MSIE|WebKit|Gecko|Chrome/\d|Edge/\d|Firefox/\d)',
+        re.IGNORECASE,
+    )
+    # Property-chain path segment: word.word — catches attr.target, fxFlex.gt-lg
+    # Exceptions: socket.io (known valid), v1.0 (version strings)
+    _PROP_CHAIN_SEG_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_$]*\.[A-Za-z_$]')
+    _PROP_CHAIN_ALLOW = frozenset({"socket.io", "engine.io"})
+
+    @classmethod
+    def _is_quality_crawl_url(cls, url: str) -> bool:
+        """
+        Return False for URLs that are clearly not real endpoints:
+          - CSS unit values extracted from style attributes
+          - Angular Flex Layout responsive directives
+          - Browser / JS API name fragments
+          - URL-encoded spaces (sentences parsed as paths)
+          - Property-chain path segments (Promise.then, attr.target)
+        """
+        try:
+            from urllib.parse import urlparse as _up
+            path = _up(url).path
+        except Exception:
+            return True  # if parsing fails, let it through
+
+        # CSS unit values at path root
+        if cls._CSS_VALUE_PATH_RE.match(path):
+            return False
+
+        # Angular Flex Layout responsive directives
+        if cls._ANGULAR_FLEX_RE.search(path):
+            return False
+
+        # Browser / JS API references
+        if cls._JS_API_RE.search(url):
+            return False
+
+        # URL-encoded spaces → a sentence was crawled as a path
+        if "%20" in url or "%09" in url:
+            return False
+
+        # Property-chain segments
+        segs = [s.split("?")[0].split("#")[0] for s in path.split("/") if s]
+        for seg in segs:
+            if (
+                cls._PROP_CHAIN_SEG_RE.match(seg)
+                and seg.lower() not in cls._PROP_CHAIN_ALLOW
+            ):
+                return False
+
+        return True
 
     # ── JS extraction quality filters ─────────────────────────────────────────
     # Rule 1: Template literal artifacts — unencoded quote/plus/whitespace means
@@ -628,10 +708,30 @@ class KatanaWorker(BaseWorker):
             verify=False,
         ) as client:
 
+            # Early-exit counters: if the target is consistently returning 5xx
+            # (overloaded / WAF blocking), stop probing after a few failures to
+            # avoid spending 2+ minutes on 32 sequential 503 responses.
+            consecutive_5xx = 0
+            _5XX_BAIL_THRESHOLD = 4
+
             for path in API_SPEC_PATHS:
+                if consecutive_5xx >= _5XX_BAIL_THRESHOLD:
+                    logger.info(
+                        f"[katana] API schema probing aborted after "
+                        f"{consecutive_5xx} consecutive 5xx responses — target appears overloaded"
+                    )
+                    break
+
                 url = urljoin(origin, path)
                 try:
                     resp = await client.get(url)
+
+                    if resp.status_code >= 500:
+                        consecutive_5xx += 1
+                        continue
+
+                    # Reset counter on any non-5xx response
+                    consecutive_5xx = 0
 
                     if resp.status_code not in (200, 201):
                         continue

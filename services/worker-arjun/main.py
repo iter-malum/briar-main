@@ -132,10 +132,11 @@ class ArjunWorker(BaseWorker):
             "-i", targets_file,
             "-o", output_file,
             "-q",
-            "--rate-limit", str(self.rate),
-            "--timeout", str(self.arjun_timeout),
+            "-T", str(self.arjun_timeout),   # capital -T is the correct flag
+            "-t", "5",                        # parallel threads (default is 1, very slow)
             "-m", method,
         ]
+        # Note: --rate-limit does not exist in arjun; use -d (delay) if needed.
 
         if headers_dict:
             cmd.extend(["--headers", json.dumps(headers_dict)])
