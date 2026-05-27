@@ -453,6 +453,213 @@ services:
       - briar-net
     restart: unless-stopped
 
+  # === M9 EXPLOIT WORKERS ===
+
+  worker-tplmap:
+    build:
+      context: .
+      dockerfile: services/worker-tplmap/Dockerfile
+    container_name: briar-worker-tplmap
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      TPLMAP_TIMEOUT: "120"
+      # TPLMAP_OS_CMD: "id"   # Uncomment to enable OS command proof (exploit_enabled scans only)
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-commix:
+    build:
+      context: .
+      dockerfile: services/worker-commix/Dockerfile
+    container_name: briar-worker-commix
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      COMMIX_TIMEOUT: "120"
+      # COMMIX_OS_CMD: "id"   # Uncomment to enable OS command proof (exploit_enabled scans only)
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  # === M9 DAST WORKERS ===
+
+  worker-jwt_tool:
+    build:
+      context: .
+      dockerfile: services/worker-jwt_tool/Dockerfile
+    container_name: briar-worker-jwt_tool
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      JWT_TOOL_TIMEOUT: "180"
+      JWT_TOOL_WORDLIST: "/usr/share/seclists/Passwords/Leaked-Databases/rockyou-75.txt"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  # === M10 DAST WORKERS ===
+
+  worker-graphql:
+    build:
+      context: .
+      dockerfile: services/worker-graphql/Dockerfile
+    container_name: briar-worker-graphql
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      GRAPHQL_TIMEOUT: "60"
+      GRAPHQL_DEPTH_LIMIT_TEST: "15"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-openapi:
+    build:
+      context: .
+      dockerfile: services/worker-openapi/Dockerfile
+    container_name: briar-worker-openapi
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      OPENAPI_TIMEOUT: "300"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-jsscanner:
+    build:
+      context: .
+      dockerfile: services/worker-jsscanner/Dockerfile
+    container_name: briar-worker-jsscanner
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      JSSCANNER_TIMEOUT: "300"
+      JSSCANNER_MAX_SCRIPTS: "50"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  # === M11 DAST WORKERS ===
+
+  worker-cors:
+    build:
+      context: .
+      dockerfile: services/worker-cors/Dockerfile
+    container_name: briar-worker-cors
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      CORS_TIMEOUT: "120"
+      CORS_CONCURRENCY: "10"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-bola:
+    build:
+      context: .
+      dockerfile: services/worker-bola/Dockerfile
+    container_name: briar-worker-bola
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      BOLA_TIMEOUT: "300"
+      BOLA_SEQ_PROBE_COUNT: "5"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
   neo4j:
     image: neo4j:5-community
     container_name: briar-neo4j
