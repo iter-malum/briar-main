@@ -23,7 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 import aio_pika
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel
-from fastapi.responses import Response
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
@@ -51,6 +51,7 @@ from shared.pipeline import (
 from finding_router import FindingRouter
 from shared.rabbitmq import RabbitMQPublisher
 from result_processor import process_tool_results
+from report_generator import generate_json_report, generate_html_report
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 
@@ -696,6 +697,63 @@ async def update_tool_config(tool_id: str, body: dict):
     configs[tool_id] = {"params": body.get("params", {})}
     _save_tool_configs(configs)
     return {"saved": True, "tool_id": tool_id}
+
+
+@app.get("/scans/{scan_id}/report")
+async def get_scan_report(
+    scan_id: str,
+    format: str = "json",   # noqa: A002  — "format" shadows builtin, intentional
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    M13: Generate a security report for *scan_id*.
+
+    Query params:
+      format=json  (default) — structured JSON report
+      format=html            — self-contained HTML report
+
+    The report includes:
+      • Scan metadata and tool list
+      • Severity summary (critical/high/medium/low/info counts)
+      • OWASP Top 10 2021 coverage matrix
+      • Per-tool findings breakdown
+      • Full findings table with confidence, dedup status, and OWASP category
+    """
+    from shared.models import ScanResultORM
+
+    # Load scan
+    stmt = (
+        select(ScanORM)
+        .options(selectinload(ScanORM.steps))
+        .where(ScanORM.id == UUID(scan_id))
+    )
+    result = await session.execute(stmt)
+    scan = result.scalars().first()
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    # Load all results for this scan
+    res_stmt = select(ScanResultORM).where(ScanResultORM.scan_id == UUID(scan_id))
+    res_result = await session.execute(res_stmt)
+    results = list(res_result.scalars().all())
+
+    fmt = (format or "json").lower().strip()
+
+    if fmt == "html":
+        try:
+            html = generate_html_report(scan, results)
+            return HTMLResponse(content=html, status_code=200)
+        except Exception as exc:
+            logger.error(f"HTML report generation failed for scan {scan_id}: {exc}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Report generation failed: {exc}")
+
+    # Default: JSON
+    try:
+        report = generate_json_report(scan, results)
+        return JSONResponse(content=report, status_code=200)
+    except Exception as exc:
+        logger.error(f"JSON report generation failed for scan {scan_id}: {exc}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {exc}")
 
 
 @app.get("/metrics")
