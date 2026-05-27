@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl \
     && git clone --depth 1 https://github.com/epinna/tplmap /opt/tplmap \
-    && pip install --no-cache-dir -r /opt/tplmap/requirements.txt \
+    && grep -v -E "^wsgiref" /opt/tplmap/requirements.txt \
+       | pip install --no-cache-dir -r /dev/stdin \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
