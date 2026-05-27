@@ -225,10 +225,11 @@ services:
       DB_PORT: "5432"
       DB_NAME: briar_db
       AUTH_SERVICE_URL: http://auth-service:8000
-      FFUF_TIMEOUT: "1200"
-      FFUF_RATE: "1000"
+      FFUF_STRATEGY_TIMEOUT: "600"
+      FFUF_RATE: "300"
       FFUF_THREADS: "40"
-      FFUF_WORDLIST: "/usr/share/seclists/Discovery/Web-Content/common.txt"
+      FFUF_WORDLIST_ROOT: "/usr/share/seclists/Discovery/Web-Content/common.txt"
+      FFUF_WORDLIST_API: "/usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt"
     networks:
       - briar-net
     restart: unless-stopped
@@ -337,6 +338,35 @@ services:
       AUTH_SERVICE_URL: http://auth-service:8000
       ARJUN_RATE: "9999"
       ARJUN_TIMEOUT: "15"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-inspector:
+    build:
+      context: .
+      dockerfile: services/worker-inspector/Dockerfile
+    container_name: briar-worker-inspector
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      INSPECTOR_MAX_ENDPOINTS: "300"
+      INSPECTOR_MAX_PARAMS: "15"
+      INSPECTOR_TIMEOUT: "10"
+      INSPECTOR_TIMING_DELTA: "2.5"
+      INSPECTOR_CONCURRENCY: "20"
+      INSPECTOR_WORKER_TIMEOUT: "3600"
     networks:
       - briar-net
     restart: unless-stopped

@@ -36,6 +36,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from shared.worker_base import BaseWorker
 from shared.models import SeverityLevel
+from shared.app_strategies import get_strategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -136,21 +137,40 @@ class KatanaWorker(BaseWorker):
         os.makedirs(work_dir, exist_ok=True)
 
         # M8: pick up app-type context from orchestrator payload
-        app_type = task_payload.get("app_type", "unknown")
-        is_spa   = task_payload.get("is_spa", False)
+        app_type  = task_payload.get("app_type", "unknown")
+        is_spa    = task_payload.get("is_spa", False)
+        framework = task_payload.get("framework")
 
-        # Headless mode: explicit override > env var default > SPA auto-detect
+        # M8: centralised strategy overrides headless/depth/strategy for each app type
+        strategy = get_strategy(app_type, "katana", framework)
+
+        # Headless mode:
+        #   explicit task_payload flag  >  strategy matrix  >  SPA heuristic  >  env default
         headless_override = task_payload.get("headless")
         if headless_override is not None:
-            use_headless = headless_override
+            use_headless = bool(headless_override)
+        elif "headless" in strategy:
+            use_headless = bool(strategy["headless"])
         elif is_spa:
-            use_headless = True   # Always enable Chromium for detected SPAs
+            use_headless = True
             logger.info(f"[katana] SPA detected ({app_type}) — forcing headless mode")
         else:
             use_headless = self.headless
 
-        # SPA-aware crawl depth: deeper when rendering JS
-        effective_depth = self.headless_depth if use_headless else self.depth
+        # Crawl depth: strategy > worker env default
+        if use_headless:
+            effective_depth = strategy.get("headless_depth", self.headless_depth)
+        else:
+            effective_depth = strategy.get("depth", self.depth)
+
+        # Crawl strategy (breadth-first / depth-first): strategy matrix > default
+        crawl_strategy = strategy.get("strategy", "breadth-first")
+
+        if strategy:
+            logger.info(
+                f"[katana] M8 strategy (app_type={app_type!r}, framework={framework!r}): "
+                f"headless={use_headless}, depth={effective_depth}, strategy={crawl_strategy!r}"
+            )
 
         # Crawl-duration budget: tell katana to stop itself 60 s before the
         # Python asyncio.wait_for deadline.  Without this, wait_for sends
@@ -182,7 +202,7 @@ class KatanaWorker(BaseWorker):
             "-retry", "1",
             "-cs", scope_regex,             # M8: Crawl-scope — stay on-domain
             "-ct", f"{crawl_duration_s}s",  # Graceful self-termination before worker timeout
-            "-strategy", "breadth-first",   # Wider coverage before going deep (better for time-bounded runs)
+            "-strategy", crawl_strategy,    # M8: breadth-first (wide) or depth-first (deep)
         ]
 
         # Headless Chromium for SPA applications
@@ -767,6 +787,28 @@ class KatanaWorker(BaseWorker):
                                 logger.info(f"[katana] OpenAPI spec at {url}: extracted {len(api_paths)} endpoints")
                             # Save the spec endpoint itself
                             results.append(self._make_spec_result(url, "openapi_spec"))
+                            # M10: emit routing finding so finding_router triggers worker-openapi
+                            results.append({
+                                "url":      url,
+                                "type":     "swagger_found",
+                                "severity": SeverityLevel.info,
+                                "description": (
+                                    f"OpenAPI/Swagger spec discovered at {url} — "
+                                    f"{len(api_paths)} endpoint(s) defined. "
+                                    f"Route to worker-openapi for spec-driven testing."
+                                ),
+                                "raw_output": {
+                                    "spec_url":       url,
+                                    "endpoint_count": len(api_paths),
+                                    "finding_type":   "swagger_found",
+                                    "route_to":       "openapi",
+                                    "route_context":  {
+                                        "param":   "spec_url",
+                                        "method":  "GET",
+                                        "payload": url,
+                                    },
+                                },
+                            })
                             continue
                         except Exception:
                             pass
@@ -775,9 +817,32 @@ class KatanaWorker(BaseWorker):
                     if "graphql" in path.lower():
                         gql_endpoints = await self._graphql_introspect(client, url)
                         results.extend(gql_endpoints)
-                        if not gql_endpoints:
-                            # Still record the endpoint exists
-                            results.append(self._make_spec_result(url, "graphql_endpoint"))
+                        # Always record the GraphQL endpoint and emit routing finding
+                        results.append(self._make_spec_result(url, "graphql_endpoint"))
+                        # M10: emit routing finding so finding_router triggers worker-graphql
+                        introspection_enabled = bool(gql_endpoints)
+                        results.append({
+                            "url":      url,
+                            "type":     "graphql_found",
+                            "severity": SeverityLevel.medium if introspection_enabled else SeverityLevel.info,
+                            "description": (
+                                f"GraphQL endpoint discovered at {url}. "
+                                f"Introspection: {'enabled' if introspection_enabled else 'disabled/filtered'}. "
+                                f"Route to worker-graphql for security testing."
+                            ),
+                            "raw_output": {
+                                "graphql_url":            url,
+                                "introspection_enabled":  introspection_enabled,
+                                "field_count":            len(gql_endpoints),
+                                "finding_type":           "graphql_found",
+                                "route_to":               "graphql",
+                                "route_context":          {
+                                    "param":   "graphql_url",
+                                    "method":  "POST",
+                                    "payload": url,
+                                },
+                            },
+                        })
                         continue
 
                     # ── Generic: just record that the endpoint exists ──────────

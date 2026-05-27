@@ -77,6 +77,10 @@ class ScanResultResponse(BaseModel):
     vuln_status: str = "open"
     analyst_note: Optional[str] = None
     updated_at: Optional[datetime] = None
+    # M12: Quality Layer
+    dedup_key: Optional[str] = None
+    confidence: int = 50
+    confirmed_by: Optional[List[str]] = None
 
 # ORM Models
 class ScanORM(Base):
@@ -122,6 +126,10 @@ class ScanResultORM(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()"))
 
+    # M7: Finding Router — set when this finding has been routed to a specialized tool.
+    # NULL = not yet routed; non-NULL = already dispatched (prevents duplicate routing).
+    routed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Vulnerability management fields
     vuln_status: Mapped[VulnStatus] = mapped_column(
         SAEnum(VulnStatus, name="vulnstatus"),
@@ -130,6 +138,17 @@ class ScanResultORM(Base):
         nullable=False,
     )
     analyst_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # M12: Quality Layer — deduplication + confidence scoring
+    # dedup_key: 16-char hex key derived from (normalized_url, vuln_class, param).
+    #   NULL until result_processor runs post-tool.
+    dedup_key: Mapped[Optional[str]] = mapped_column(String(16), nullable=True, index=True)
+    # confidence: 0-100 aggregate score; updated upward when cross-tool confirmation
+    #   is detected by result_processor.
+    confidence: Mapped[int] = mapped_column(Integer, default=50, nullable=False, server_default="50")
+    # confirmed_by: JSON list of tool names that have independently reported the
+    #   same finding (keyed by dedup_key).  Starts as [tool], grows on confirmation.
+    confirmed_by: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
 
     scan: Mapped["ScanORM"] = relationship("ScanORM", back_populates="results")
     status_history: Mapped[List["VulnStatusHistoryORM"]] = relationship(

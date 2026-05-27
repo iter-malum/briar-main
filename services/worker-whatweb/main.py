@@ -419,19 +419,18 @@ class WhatWebWorker(BaseWorker):
             cmd = [
                 "whatweb",
                 "--no-errors",
-                "--color=never",
                 f"--aggression={self.aggression}",
                 f"--log-json={out_file}",
-                # Follow HTTP→HTTPS redirects (GitHub Pages, CDNs, etc. all redirect).
-                # Default is NEVER which means WhatWeb scans the redirect response
-                # and gets 0 useful plugins.  HTTPS_ONLY is safe: we follow only
-                # upgrades, not arbitrary cross-origin chains.
+                # Follow HTTP→HTTPS redirects (GitHub Pages, CDNs, Heroku, etc.).
+                # Default is NEVER — without this WhatWeb scans the 301 response
+                # and gets 0 useful plugins.
                 "--follow-redirect=HTTPS_ONLY",
-                "--max-redirect=3",
-                # Generic browser UA — some CDNs block non-browser UA strings.
+                # Generic browser UA — some CDNs/WAFs block non-browser strings.
                 "--user-agent=Mozilla/5.0 (compatible; Briar-Scanner/1.0)",
-                # NOTE: do NOT add --quiet here — it suppresses --log-json output
-                # in some WhatWeb versions and causes 0 results.
+                # NOTE: do NOT add --quiet — it suppresses --log-json output in
+                # some WhatWeb versions and causes 0 results.
+                # NOTE: --color=never and --max-redirect=N do NOT exist in
+                # WhatWeb 0.5.5 (Debian apt) and cause exit code 1.
             ]
 
             # Auth headers → Cookie flag

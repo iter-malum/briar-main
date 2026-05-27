@@ -17,8 +17,11 @@ from shared.models import SeverityLevel
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s')
 logger = logging.getLogger("arjun-worker")
 
-ARJUN_RATE = int(os.environ.get("ARJUN_RATE", 9999))
-ARJUN_TIMEOUT = int(os.environ.get("ARJUN_TIMEOUT", 15))
+ARJUN_TIMEOUT  = int(os.environ.get("ARJUN_TIMEOUT",   "15"))
+# Max endpoints to send to arjun in one run.
+# Arjun sends ~500 requests per endpoint — 500 endpoints × 500 req = 250 k req.
+# With 5 threads and 15 s timeout that's ~25 min, well within WORKER_TIMEOUT.
+ARJUN_MAX_ENDPOINTS = int(os.environ.get("ARJUN_MAX_ENDPOINTS", "500"))
 
 _STATIC_EXTS = frozenset({
     ".css", ".js", ".mjs", ".ts", ".map",
@@ -42,9 +45,11 @@ def _is_scannable(url: str) -> bool:
 class ArjunWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="arjun", queue_name="scan.probe.arjun")
-        self.timeout = 300
-        self.rate = ARJUN_RATE
+        # Worker-level timeout: enough for ARJUN_MAX_ENDPOINTS endpoints.
+        # 500 endpoints × ~3 s average = ~25 min; 1800 s gives comfortable headroom.
+        self.timeout      = int(os.environ.get("ARJUN_WORKER_TIMEOUT", "1800"))
         self.arjun_timeout = ARJUN_TIMEOUT
+        self.max_endpoints = ARJUN_MAX_ENDPOINTS
 
     async def execute_tool(self, target: str, auth_context: Dict[str, Any], task_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         endpoints = task_payload.get("endpoints", [])
@@ -60,11 +65,24 @@ class ArjunWorker(BaseWorker):
                 ep = f"https://{ep}"
             normalized.append(ep)
 
-        unique_endpoints = list({ep for ep in normalized if _is_scannable(ep)})
-        if not unique_endpoints:
+        # De-duplicate and filter static files
+        scannable = list({ep for ep in normalized if _is_scannable(ep)})
+        if not scannable:
             logger.warning("No scannable endpoints (all static files or empty)")
             return []
 
+        # Prioritise endpoints that already have query parameters — they are the
+        # most likely to have *additional* hidden parameters worth fuzzing.
+        # Everything else is included up to ARJUN_MAX_ENDPOINTS.
+        has_params    = [u for u in scannable if "?" in u]
+        no_params     = [u for u in scannable if "?" not in u]
+        unique_endpoints = (has_params + no_params)[:self.max_endpoints]
+
+        if len(scannable) > self.max_endpoints:
+            logger.info(
+                f"Arjun: capped {len(scannable)} → {len(unique_endpoints)} endpoints "
+                f"({len(has_params)} with existing params prioritised)"
+            )
         logger.info(f"Running Arjun against {len(unique_endpoints)} endpoints")
 
         work_dir = "/tmp/arjun"
@@ -132,11 +150,11 @@ class ArjunWorker(BaseWorker):
             "-i", targets_file,
             "-o", output_file,
             "-q",
-            "-T", str(self.arjun_timeout),   # capital -T is the correct flag
-            "-t", "5",                        # parallel threads (default is 1, very slow)
+            "-T", str(self.arjun_timeout),  # -T (capital) = per-request timeout
+            "-t", "5",                       # parallel threads
+            "--stable",                      # slower but handles unstable/rate-limited targets
             "-m", method,
         ]
-        # Note: --rate-limit does not exist in arjun; use -d (delay) if needed.
 
         if headers_dict:
             cmd.extend(["--headers", json.dumps(headers_dict)])

@@ -1,0 +1,5 @@
+httpx[http2]==0.27.0
+aio-pika==9.4.1
+sqlalchemy==2.0.31
+asyncpg==0.29.0
+pydantic==2.7.4

@@ -6,23 +6,34 @@ FROM secsi/ffuf:latest
 ENTRYPOINT []
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
+
+# ── Tuning (override via docker-compose environment:) ─────────────────────────
+ENV FFUF_RATE=300 \
+    FFUF_THREADS=40 \
+    FFUF_STRATEGY_TIMEOUT=600 \
+    FFUF_WORDLIST_ROOT=/usr/share/seclists/Discovery/Web-Content/common.txt \
+    FFUF_WORDLIST_API=/usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt
+
 WORKDIR /app
 
-# Установите Python и pip (в Alpine Linux используется apk)
+# Python + wget (Alpine base from secsi/ffuf)
 RUN apk add --no-cache python3 py3-pip wget
 
 COPY services/worker-ffuf/requirements.txt ./
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Download only the wordlists we actually use — avoids pulling ~500 MB of SecLists
-RUN mkdir -p /usr/share/seclists/Discovery/Web-Content && \
+# Download wordlists used by ROOT and API PREFIX strategies
+# Avoids pulling ~500 MB of full SecLists
+RUN mkdir -p /usr/share/seclists/Discovery/Web-Content/api && \
     wget -q -O /usr/share/seclists/Discovery/Web-Content/common.txt \
       https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/common.txt && \
-    wget -q -O /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt \
-      https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/raft-medium-directories.txt && \
+    wget -q -O /usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt \
+      https://raw.githubusercontent.com/danielmiessler/SecLists/master/Discovery/Web-Content/api/api-endpoints-res.txt && \
     # Verify downloads succeeded
     test -s /usr/share/seclists/Discovery/Web-Content/common.txt && \
-    echo "Wordlists downloaded: $(wc -l < /usr/share/seclists/Discovery/Web-Content/common.txt) entries in common.txt"
+    test -s /usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt && \
+    echo "Wordlists OK: $(wc -l < /usr/share/seclists/Discovery/Web-Content/common.txt) root entries, \
+$(wc -l < /usr/share/seclists/Discovery/Web-Content/api/api-endpoints-res.txt) API entries"
 
 COPY shared/ ./shared/
 COPY services/worker-ffuf/main.py ./

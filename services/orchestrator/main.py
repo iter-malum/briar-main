@@ -48,7 +48,9 @@ from shared.pipeline import (
     get_tools_for_initial_publish, SQLI_INDICATORS,
     detect_app_type,
 )
+from finding_router import FindingRouter
 from shared.rabbitmq import RabbitMQPublisher
+from result_processor import process_tool_results
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
 
@@ -113,6 +115,8 @@ class PipelineManager:
     def __init__(self, pub: RabbitMQPublisher):
         self.publisher = pub
         self._connection: Optional[aio_pika.abc.AbstractRobustConnection] = None
+        # M7: Finding Router — routes high-value findings to specialized tools
+        self.finding_router = FindingRouter(pub.publish)
 
     async def start(self):
         self._connection = await aio_pika.connect_robust(settings.rabbitmq_url)
@@ -209,6 +213,35 @@ class PipelineManager:
 
                 await self._publish_phase(scan_id, scan, phase, selected_tools, app_context or {})
 
+            # M7: Route any newly-emitted high-value findings to specialized tools.
+            # Runs after phase triggers so both paths are committed together.
+            routed = await self.finding_router.route_new_findings(
+                scan_id, scan, session
+            )
+            if routed > 0:
+                logger.info(
+                    f"[pipeline] finding-router: {routed} new routing(s) "
+                    f"triggered for scan {scan_id}"
+                )
+
+            # M12: Quality Layer — dedup + confidence scoring for the just-completed tool.
+            # Only runs on success (failed tools may emit partial/noisy results).
+            if tool_status == "completed" and completed_tool:
+                try:
+                    processed = await process_tool_results(scan_id, completed_tool, session)
+                    if processed:
+                        logger.info(
+                            f"[quality] processed {processed} results "
+                            f"for tool={completed_tool} scan={scan_id}"
+                        )
+                except Exception as qe:
+                    # Quality layer errors must never abort the pipeline.
+                    logger.warning(
+                        f"[quality] result_processor failed for "
+                        f"tool={completed_tool} scan={scan_id}: {qe}",
+                        exc_info=True,
+                    )
+
             # Check overall completion
             if is_scan_complete(selected_tools, completed_tools):
                 any_failed = any(
@@ -262,6 +295,10 @@ class PipelineManager:
                     "is_spa":    app_context.get("is_spa", False),
                     "framework": app_context.get("framework"),
                     "tech_stack": app_context.get("tech_stack", []),
+                    # M11: second user context for BOLA cross-user testing (optional)
+                    **({"second_auth_context": scan.config["second_auth_context"]}
+                       if tool == "bola" and scan.config.get("second_auth_context")
+                       else {}),
                 },
             }
             await self.publisher.publish(queue_name, payload)
@@ -348,6 +385,26 @@ async def _run_migrations(conn):
            )""",
         "CREATE INDEX IF NOT EXISTS idx_vuln_history_result_id  ON vuln_status_history (result_id)",
         "CREATE INDEX IF NOT EXISTS idx_scan_results_vuln_status ON scan_results (vuln_status)",
+        # M7: Finding Router — tracks which findings have been routed to specialized tools
+        """ALTER TABLE scan_results
+               ADD COLUMN IF NOT EXISTS routed_at TIMESTAMPTZ""",
+        # Index for the router's "unrouted candidates" query (hot path on every pipeline event)
+        """CREATE INDEX IF NOT EXISTS idx_scan_results_routing
+               ON scan_results (scan_id, vulnerability_type, routed_at)
+               WHERE routed_at IS NULL""",
+        # M12: Quality Layer — deduplication + confidence scoring columns
+        """ALTER TABLE scan_results
+               ADD COLUMN IF NOT EXISTS dedup_key   VARCHAR(16),
+               ADD COLUMN IF NOT EXISTS confidence  INTEGER NOT NULL DEFAULT 50,
+               ADD COLUMN IF NOT EXISTS confirmed_by JSONB""",
+        # Index for bucket lookups in result_processor (hot path after every tool)
+        """CREATE INDEX IF NOT EXISTS idx_scan_results_dedup_key
+               ON scan_results (scan_id, dedup_key)
+               WHERE dedup_key IS NOT NULL""",
+        # Index to quickly find unprocessed rows (dedup_key IS NULL)
+        """CREATE INDEX IF NOT EXISTS idx_scan_results_unprocessed
+               ON scan_results (scan_id, tool)
+               WHERE dedup_key IS NULL""",
     ]
     try:
         for stmt in statements:

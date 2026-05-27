@@ -29,6 +29,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from shared.worker_base import BaseWorker
 from shared.models import SeverityLevel
+from shared.app_strategies import get_strategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -128,13 +129,30 @@ class ZAPWorker(BaseWorker):
         if not endpoints:
             endpoints = [target]
 
-        # M8: app-type aware strategy
-        app_type = task_payload.get("app_type", "unknown")
-        is_spa   = task_payload.get("is_spa", False)
-        if is_spa:
-            # Give AJAX Spider more time for SPA route discovery
-            self.ajax_timeout = max(self.ajax_timeout, 240)
-            logger.info(f"[zap] SPA detected ({app_type}) — AJAX Spider timeout extended to {self.ajax_timeout}s")
+        # M8: app-type adaptive strategy
+        app_type  = task_payload.get("app_type", "unknown")
+        is_spa    = task_payload.get("is_spa", False)
+        framework = task_payload.get("framework")
+
+        strategy = get_strategy(app_type, "zap", framework)
+
+        # Strategy flags — defaults favour full scanning (safe for unknown apps)
+        run_ajax_spider        = strategy.get("run_ajax_spider",        True)
+        run_traditional_spider = strategy.get("run_traditional_spider", True)
+        run_openapi_import     = strategy.get("run_openapi_import",     False)
+        ajax_timeout_strat     = strategy.get("ajax_timeout")
+
+        # SPA: extend AJAX timeout if strategy or is_spa flag says so
+        if is_spa and not ajax_timeout_strat:
+            ajax_timeout_strat = 240
+        if ajax_timeout_strat:
+            self.ajax_timeout = max(self.ajax_timeout, int(ajax_timeout_strat))
+
+        logger.info(
+            f"[zap] M8 strategy (app_type={app_type!r}, framework={framework!r}): "
+            f"ajax={run_ajax_spider}, traditional={run_traditional_spider}, "
+            f"openapi={run_openapi_import}, ajax_timeout={self.ajax_timeout}s"
+        )
 
         # Derive the base URL (scheme://host) for spidering and alert collection
         base_url = _extract_base_url(target)
@@ -167,15 +185,25 @@ class ZAPWorker(BaseWorker):
                     except Exception:
                         pass
 
-                # ── Phase 1: AJAX Spider (Chromium-based, best for SPAs) ───────
-                logger.info("[zap] Starting AJAX Spider (SPA/JS coverage phase)…")
-                await self._run_ajax_spider(client, target)
+                # ── Phase 1: OpenAPI import (API/GraphQL app types) ───────────
+                if run_openapi_import:
+                    await self._run_openapi_import(client, target, task_payload)
 
-                # ── Phase 2: Traditional Spider (link following) ───────────────
-                spider_id = await self._start_spider(client, base_url)
-                await self._wait_scan(client, "spider", spider_id)
+                # ── Phase 2: AJAX Spider (Chromium-based, best for SPAs) ───────
+                if run_ajax_spider:
+                    logger.info("[zap] Starting AJAX Spider (SPA/JS coverage phase)…")
+                    await self._run_ajax_spider(client, target)
+                else:
+                    logger.info(f"[zap] AJAX Spider skipped (app_type={app_type!r})")
 
-                # ── Phase 3: Active Scan ───────────────────────────────────────
+                # ── Phase 3: Traditional Spider (link following) ───────────────
+                if run_traditional_spider:
+                    spider_id = await self._start_spider(client, base_url)
+                    await self._wait_scan(client, "spider", spider_id)
+                else:
+                    logger.info(f"[zap] Traditional Spider skipped (app_type={app_type!r})")
+
+                # ── Phase 4: Active Scan ───────────────────────────────────────
                 ascan_id = await self._start_ascan(client, base_url)
                 await self._wait_scan(client, "ascan", ascan_id)
 
@@ -294,6 +322,68 @@ class ZAPWorker(BaseWorker):
                 )
             except Exception as exc:
                 logger.warning(f"[zap] Failed to set header {name}: {exc}")
+
+    # ── OpenAPI / Swagger import (M8: API apps) ───────────────────────────────
+
+    async def _run_openapi_import(
+        self,
+        client: httpx.AsyncClient,
+        target: str,
+        task_payload: Dict[str, Any],
+    ):
+        """
+        Import an OpenAPI/Swagger spec into ZAP so the active scanner knows
+        every endpoint without needing to crawl.
+
+        Tries, in order:
+          1. Explicit spec URL from task_payload["openapi_url"]
+          2. Well-known spec paths probed against the target host
+        """
+        # Explicit spec URL takes priority
+        spec_url: Optional[str] = task_payload.get("openapi_url")
+
+        if not spec_url:
+            # Probe common OpenAPI spec paths
+            base = _extract_base_url(target)
+            candidates = [
+                f"{base}/openapi.json",
+                f"{base}/openapi.yaml",
+                f"{base}/swagger.json",
+                f"{base}/swagger.yaml",
+                f"{base}/api/openapi.json",
+                f"{base}/api/swagger.json",
+                f"{base}/v1/openapi.json",
+                f"{base}/v2/api-docs",   # Spring Boot default
+                f"{base}/api-docs",
+            ]
+            for candidate in candidates:
+                try:
+                    resp = await client.get(candidate, timeout=5, follow_redirects=True)
+                    if resp.status_code == 200 and (
+                        "openapi" in resp.text[:200].lower()
+                        or "swagger" in resp.text[:200].lower()
+                        or '"paths"' in resp.text[:500]
+                    ):
+                        spec_url = candidate
+                        logger.info(f"[zap] OpenAPI spec discovered at {spec_url}")
+                        break
+                except Exception:
+                    continue
+
+        if not spec_url:
+            logger.info("[zap] OpenAPI import: no spec found at well-known paths")
+            return
+
+        try:
+            result = await self._zap(
+                client,
+                "openapi/action/importUrl/",
+                url=spec_url,
+                hostOverride=_extract_base_url(target),
+            )
+            logger.info(f"[zap] OpenAPI import result: {result}")
+        except Exception as exc:
+            logger.warning(f"[zap] OpenAPI import failed (add-on not loaded?): {exc}")
 
     # ── AJAX Spider (M8: SPA/JS coverage) ─────────────────────────────────────
 

@@ -23,6 +23,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from shared.worker_base import BaseWorker
 from shared.models import SeverityLevel
+from shared.app_strategies import get_strategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +72,22 @@ class GobusterWorker(BaseWorker):
 
         os.makedirs(WORK_DIR, exist_ok=True)
 
+        # M8: app-type adaptive strategy — override extensions unless explicitly
+        # provided in the task payload (payload wins for manual overrides).
+        if "extensions" not in task_payload:
+            strategy = get_strategy(
+                task_payload.get("app_type", "unknown"),
+                "gobuster",
+                task_payload.get("framework"),
+            )
+            if strategy.get("extensions"):
+                task_payload = {**task_payload, "extensions": strategy["extensions"]}
+                logger.info(
+                    f"[gobuster] M8 extensions override "
+                    f"(app_type={task_payload.get('app_type', 'unknown')!r}): "
+                    f"{strategy['extensions']}"
+                )
+
         if mode == "dir":
             return await self._run_dir(endpoints, target, auth_context, task_payload)
         elif mode == "dns":
@@ -110,6 +127,14 @@ class GobusterWorker(BaseWorker):
             "--timeout", f"{timeout}s",
             "--no-progress",
             "--output", OUTPUT_FILE,
+            # Continue even if the target returns a wildcard response for
+            # non-existent paths (e.g. Heroku apps returning 503 for everything).
+            # Without this flag gobuster exits with an error immediately.
+            "--wildcard",
+            # Positive status codes — we want to see 200/30x/401/403/405.
+            # 503 is explicitly excluded: it means the host is overloaded and
+            # would flood results with false positives.
+            "-s", "200,204,301,302,307,308,401,403,405",
         ]
 
         # Inject auth headers

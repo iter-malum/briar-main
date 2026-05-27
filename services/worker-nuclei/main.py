@@ -20,6 +20,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from shared.worker_base import BaseWorker
 from shared.models import SeverityLevel
+from shared.app_strategies import get_nuclei_tags, get_strategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,33 +93,39 @@ class NucleiWorker(BaseWorker):
                 cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
                 cmd.extend(["-H", f"Cookie: {cookie_str}"])
 
-            # M8: Technology-based template selection.
-            # Merge DB-derived tags with app_type context already in the payload
-            # (from orchestrator's detect_app_type call — no extra DB round-trip needed).
-            tech_tags: set = set()
+            # M8: App-type adaptive template selection via centralised strategy matrix.
+            # get_nuclei_tags() merges: OWASP baseline + app_type strategy tags +
+            # framework override tags + tech_stack keyword mapping.
+            app_type  = task_payload.get("app_type",  "unknown")
+            framework = task_payload.get("framework")
 
-            # Fast path: tech_stack already resolved by orchestrator
-            payload_tech = task_payload.get("tech_stack", [])
-            if payload_tech:
-                from shared.pipeline import TECH_TO_NUCLEI_TAGS
-                for kw in payload_tech:
-                    for key, tag_list in TECH_TO_NUCLEI_TAGS.items():
-                        if key in kw.lower():
-                            tech_tags.update(tag_list)
+            tech_tags: set = set(get_nuclei_tags(
+                app_type,
+                framework,
+                task_payload.get("tech_stack"),
+            ))
 
-            # Slow path: DB lookup (catches cases where whatweb ran before detection)
-            if scan_id and not tech_tags:
+            # Supplement with WhatWeb results stored in the DB (if scan_id available)
+            if scan_id:
                 db_tags = await self.get_tech_tags(scan_id)
                 tech_tags.update(db_tags)
 
-            # Always include OWASP Top 10 critical categories
-            tech_tags.update(["xss", "sqli", "rce", "ssrf", "lfi", "idor", "xxe"])
-
             if tech_tags:
-                cmd.extend(["-tags", ",".join(tech_tags)])
-                logger.info(f"[nuclei] Template tags: {sorted(tech_tags)}")
+                cmd.extend(["-tags", ",".join(sorted(tech_tags))])
+                logger.info(
+                    f"[nuclei] Template tags "
+                    f"(app_type={app_type!r}, framework={framework!r}): "
+                    f"{sorted(tech_tags)}"
+                )
 
-            # Extra payload overrides
+            # M8: Strategy-specific template directories (e.g. cms/ for CMS apps)
+            strategy       = get_strategy(app_type, "nuclei", framework)
+            template_paths = strategy.get("template_paths", [])
+            if template_paths:
+                cmd.extend(["-t", ",".join(template_paths)])
+                logger.info(f"[nuclei] Extra template paths: {template_paths}")
+
+            # Extra payload overrides (explicit caller instructions always win)
             if task_payload.get("templates"):
                 cmd.extend(["-t", ",".join(task_payload["templates"])])
 

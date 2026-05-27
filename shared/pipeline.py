@@ -26,17 +26,85 @@ from typing import Dict, List, Optional, Set
 # ── Queue routing table ────────────────────────────────────────────────────────
 
 TOOL_QUEUES: Dict[str, str] = {
-    "whatweb":  "scan.recon.whatweb",
-    "katana":   "scan.crawl.katana",
-    "httpx":    "scan.probe.httpx",
-    "ffuf":     "scan.fuzz.ffuf",
-    "gobuster": "scan.probe.gobuster",
-    "arjun":    "scan.probe.arjun",
-    "nuclei":   "scan.dast.nuclei",
-    "zap":      "scan.dast.zap",
-    "nikto":    "scan.dast.nikto",
-    "dalfox":   "scan.dast.dalfox",
-    "sqlmap":   "scan.exploit.sqlmap",
+    "whatweb":   "scan.recon.whatweb",
+    "katana":    "scan.crawl.katana",
+    "httpx":     "scan.probe.httpx",
+    "gobuster":  "scan.probe.gobuster",
+    "ffuf":      "scan.fuzz.ffuf",
+    "arjun":     "scan.probe.arjun",
+    "inspector": "scan.inspect.inspector",
+    "nuclei":    "scan.dast.nuclei",
+    "zap":       "scan.dast.zap",
+    "nikto":     "scan.dast.nikto",
+    "dalfox":    "scan.dast.dalfox",
+    "sqlmap":    "scan.exploit.sqlmap",
+    # ── M9: New exploit / verification workers ────────────────────────────────
+    "tplmap":   "scan.exploit.tplmap",
+    "commix":   "scan.exploit.commix",
+    "jwt_tool": "scan.dast.jwt_tool",
+    # ── M10: Discovery intelligence ────────────────────────────────────────────
+    "graphql":    "scan.dast.graphql",
+    "openapi":    "scan.dast.openapi",
+    "jsscanner":  "scan.probe.jsscanner",
+    # ── M11: Access control testing ────────────────────────────────────────────
+    "cors":       "scan.dast.cors",
+    "bola":       "scan.dast.bola",
+}
+
+# ── M7: Finding Router — finding type → tool routing table ────────────────────
+#
+# Each entry maps a vulnerability_type emitted by a worker to the tool that
+# should be triggered immediately when that finding appears.
+#
+# requires_exploit = True  → only route when scan.config.exploit_enabled = True
+# requires_exploit = False → always route (confirmation/verification tools)
+#
+# M9: tplmap, commix, jwt_tool deployed.
+# M10: graphql, openapi, jsscanner deployed.
+# The router silently skips entries whose tool is not yet in TOOL_QUEUES,
+# accumulating candidates that are dispatched once the worker comes online.
+
+FINDING_ROUTES: Dict[str, Dict] = {
+    # ── Inspector / DAST candidates → exploitation ───────────────────────────
+    "sqli_candidate": {
+        "tool":             "sqlmap",
+        "requires_exploit": True,
+        "description":      "SQL injection surface → sqlmap exploitation",
+    },
+    # ── Inspector candidates → verification (non-exploitative) ───────────────
+    "xss_candidate": {
+        "tool":             "dalfox",
+        "requires_exploit": False,
+        "description":      "XSS reflection surface → dalfox payload crafting",
+    },
+    # ── M9: SSTI + CMDi exploitation ─────────────────────────────────────────
+    "ssti_candidate": {
+        "tool":             "tplmap",
+        "requires_exploit": True,
+        "description":      "SSTI surface → tplmap engine detection + RCE confirmation",
+    },
+    "cmdi_candidate": {
+        "tool":             "commix",
+        "requires_exploit": True,
+        "description":      "Command injection surface → commix confirmation",
+    },
+    # ── M9: JWT security testing (non-exploitative) ───────────────────────────
+    "jwt_found": {
+        "tool":             "jwt_tool",
+        "requires_exploit": False,
+        "description":      "JWT token detected → jwt_tool security tests",
+    },
+    # ── M10: API discovery intelligence ──────────────────────────────────────
+    "graphql_found": {
+        "tool":             "graphql",
+        "requires_exploit": False,
+        "description":      "GraphQL endpoint → introspection + 8-test security battery",
+    },
+    "swagger_found": {
+        "tool":             "openapi",
+        "requires_exploit": False,
+        "description":      "OpenAPI spec found → spec-driven auth/BOLA/mass-assignment testing",
+    },
 }
 
 # ── Technology → Nuclei template tags ─────────────────────────────────────────
@@ -82,50 +150,126 @@ SQLI_INDICATORS = [
 #   requires_sqli   – phase only runs if SQLi findings exist
 
 PHASES: List[Dict] = [
+    # ── Phase 1: RECON ────────────────────────────────────────────────────────
+    # katana discovers all endpoints (SPA crawl + passive gau + JS extraction).
+    # whatweb fingerprints the tech stack for adaptive strategy in later phases.
+    # Both run immediately in parallel.
     {
         "id": "recon",
         "tools": {"whatweb", "katana"},
-        "trigger_after": set(),          # Start immediately
-        "source_tools": {},              # Use original target URL
+        "trigger_after": set(),
+        "source_tools": {},              # Use original scan target URL
         "requires_explicit": False,
         "requires_sqli": False,
     },
+
+    # ── Phase 2: PROBE (URL validation) ──────────────────────────────────────
+    # httpx probes every URL katana and gobuster found, stamping each with an
+    # HTTP status code.  This creates the "live endpoint" list that ffuf, arjun,
+    # and all DAST tools filter from.
+    # gobuster brute-forces directory paths in parallel with httpx — both run
+    # as soon as katana finishes (gobuster doesn't need live-URL filtering;
+    # it works against the base host).
     {
         "id": "probe",
-        "tools": {"httpx", "ffuf", "gobuster", "arjun"},
-        "trigger_after": {"katana"},     # Unlock when katana done
+        "tools": {"httpx", "gobuster", "jsscanner"},
+        "trigger_after": {"katana"},
         "source_tools": {
-            "httpx":    ["katana"],
-            "ffuf":     ["katana"],
-            "gobuster": ["katana"],
-            "arjun":    ["katana"],  # Uses crawled endpoints; httpx/ffuf run in parallel
+            "httpx":     ["katana"],
+            "gobuster":  ["katana"],
+            # M10: jsscanner gets .js URLs from katana for secret detection
+            "jsscanner": ["katana"],
         },
         "requires_explicit": False,
         "requires_sqli": False,
     },
+
+    # ── Phase 3: SMART FUZZ ───────────────────────────────────────────────────
+    # ffuf and arjun both run AFTER httpx so they operate on httpx-confirmed
+    # live endpoints (2xx/3xx) only — not raw katana/gobuster URLs that may
+    # include thousands of 404s.
+    #
+    # ffuf runs three strategies in parallel:
+    #   ROOT       – /FUZZ on every host (broad directory discovery)
+    #   API PREFIX – extract API mount points from live URLs, fuzz each prefix
+    #   IDOR       – replace integer segments with FUZZ, enumerate 1-2000
+    #
+    # arjun discovers hidden HTTP parameters on live endpoints.
+    # source_tools includes httpx so the live-endpoint filter activates.
+    {
+        "id": "fuzz",
+        "tools": {"ffuf", "arjun"},
+        "trigger_after": {"httpx", "gobuster"},
+        "source_tools": {
+            "ffuf":  ["katana", "gobuster", "httpx"],  # httpx triggers live filter
+            "arjun": ["katana", "httpx"],               # httpx triggers live filter
+        },
+        "requires_explicit": False,
+        "requires_sqli": False,
+    },
+
+    # ── Phase 4: INSPECT ──────────────────────────────────────────────────────
+    # Smart pre-exploitation triage.  Runs AFTER arjun has discovered hidden
+    # parameters.  Inspector sends lightweight canary payloads to each
+    # (endpoint, parameter) pair and emits structured candidates:
+    #   sqli_candidate   → sqlmap
+    #   ssti_candidate   → tplmap
+    #   cmdi_candidate   → commix
+    #   path_traversal   → nuclei (targeted)
+    #   open_redirect    → nuclei (targeted)
+    #   xss_candidate    → dalfox (targeted)
+    #
+    # DAST tools (phase 5) run in PARALLEL with inspect — they do broad
+    # coverage; inspector does targeted depth.  Both feed the exploit phase.
+    {
+        "id": "inspect",
+        "tools": {"inspector"},
+        "trigger_after": {"arjun"},
+        "source_tools": {
+            # httpx triggers live-endpoint filter; arjun provides discovered params
+            "inspector": ["katana", "httpx", "ffuf", "gobuster", "arjun"],
+        },
+        "requires_explicit": False,
+        "requires_sqli": False,
+    },
+
+    # ── Phase 5: DAST ─────────────────────────────────────────────────────────
+    # Broad active scanning runs in parallel with the inspect phase.
+    # DAST tools have the most complete, validated endpoint list.
+    # source_tools covers every discovery source so the live-URL filter can
+    # pick the best confirmed-alive subset for each tool.
     {
         "id": "dast",
-        "tools": {"nuclei", "zap", "nikto", "dalfox"},
-        "trigger_after": {"httpx", "ffuf", "gobuster", "arjun"},  # Unlock when all probe tools done
+        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola"},
+        "trigger_after": {"httpx", "ffuf", "gobuster", "arjun"},
         "source_tools": {
-            # Use ALL discovered endpoints: katana + ffuf + gobuster + httpx
             "nuclei":  ["katana", "ffuf", "gobuster", "httpx"],
             "zap":     ["katana", "ffuf", "gobuster", "httpx"],
-            "nikto":   ["katana", "httpx"],  # Nikto works per-host
-            "dalfox":  ["katana", "ffuf", "gobuster", "httpx", "arjun"],  # Needs params
+            "nikto":   ["katana", "httpx"],
+            "dalfox":  ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            # M11: cors + bola use the full validated endpoint list
+            "cors":    ["katana", "ffuf", "gobuster", "httpx"],
+            "bola":    ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            # M10: graphql/openapi are finding-triggered (via finding_router), not phase-triggered
         },
         "requires_explicit": False,
         "requires_sqli": False,
     },
+
+    # ── Phase 6: EXPLOIT ──────────────────────────────────────────────────────
+    # Triggered by confirmed findings from both Inspector AND DAST tools.
+    # sqlmap: triggered by sqli_candidate (inspector) OR nuclei/zap SQLi finding
+    # The orchestrator's requires_sqli check scans ALL findings for SQL patterns,
+    # so inspector candidates are automatically included.
     {
         "id": "exploit",
         "tools": {"sqlmap"},
-        "trigger_after": {"nuclei", "zap"},
+        "trigger_after": {"nuclei", "zap", "inspector"},
         "source_tools": {
-            "sqlmap": ["nuclei", "zap"],     # Only SQLi-positive endpoints
+            "sqlmap": ["nuclei", "zap", "inspector"],
         },
-        "requires_explicit": True,           # scan.config.exploit_enabled = true
-        "requires_sqli": True,               # Must have confirmed SQLi
+        "requires_explicit": True,
+        "requires_sqli": True,
     },
 ]
 
