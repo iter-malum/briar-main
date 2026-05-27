@@ -5,7 +5,8 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git curl \
     && git clone --depth 1 https://github.com/commixproject/commix /opt/commix \
-    && pip install --no-cache-dir -r /opt/commix/requirements.txt \
+    && (pip install --no-cache-dir -r /opt/commix/requirements.txt 2>/dev/null \
+        || pip install --no-cache-dir requests) \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
