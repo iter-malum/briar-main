@@ -1,4 +1,4 @@
-import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition, Schedule, AppInfo } from '../types'
+import type { GraphData, Scan, Vulnerability, AuthSession, ToolDefinition, Schedule, AppInfo, ScanReport } from '../types'
 
 // All requests use relative URLs — the browser always calls back to
 // the same host that served the page (the Vite dev server), which then
@@ -93,6 +93,8 @@ export interface VulnParams {
   tool?: string
   limit?: number
   deduplicate?: boolean
+  min_confidence?: number
+  vuln_status?: string
 }
 
 export const fetchVulnerabilities = (params: VulnParams = {}): Promise<Vulnerability[]> => {
@@ -101,6 +103,7 @@ export const fetchVulnerabilities = (params: VulnParams = {}): Promise<Vulnerabi
   if (params.severity) qs.set('severity', params.severity)
   if (params.tool) qs.set('tool', params.tool)
   if (params.limit) qs.set('limit', String(params.limit))
+  if (params.min_confidence) qs.set('min_confidence', String(params.min_confidence))
   qs.set('deduplicate', String(params.deduplicate ?? true))
   return get(`/api/v1/vulnerabilities?${qs}`)
 }
@@ -111,6 +114,11 @@ export interface CreateScanPayload {
   target_url: string
   tools: string[]
   auth_session_id?: string | null
+  exploit_enabled?: boolean
+  second_auth_context?: {
+    session_id: string
+    target_url: string
+  } | null
 }
 
 export async function createScan(
@@ -324,6 +332,33 @@ export const fetchScheduleDiff = (id: string): Promise<ScanDiff> =>
 
 export const fetchAppInfo = (scanId: string): Promise<AppInfo> =>
   get(`/api/v1/scans/${scanId}/app-info`)
+
+// ── M13: Reports ─────────────────────────────────────────────────────────────
+
+export const fetchScanReport = (scanId: string): Promise<ScanReport> =>
+  get(`/api/v1/scans/${scanId}/report?format=json`)
+
+export const downloadHtmlReport = async (scanId: string): Promise<void> => {
+  const res = await fetch(`/api/v1/scans/${scanId}/report?format=html`)
+  if (!res.ok) throw new Error(`Report generation failed: ${res.statusText}`)
+  const html = await res.text()
+  const blob = new Blob([html], { type: 'text/html' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `briar-report-${scanId.slice(0, 8)}.html`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
+
+export const downloadJsonReport = async (scanId: string): Promise<void> => {
+  const report = await fetchScanReport(scanId)
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' })
+  const a = document.createElement('a')
+  a.href = URL.createObjectURL(blob)
+  a.download = `briar-report-${scanId.slice(0, 8)}.json`
+  a.click()
+  URL.revokeObjectURL(a.href)
+}
 
 // ── WebSocket URL (relative → same host as the page) ─────────────────────────
 

@@ -1,23 +1,70 @@
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink, StopCircle, Trash2 } from 'lucide-react'
-import { fetchScans, createScan, cancelScan, deleteScan, fetchAuthSessions } from '../api/client'
+import {
+  RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink,
+  StopCircle, Trash2, FileBarChart, ChevronDown, ChevronUp,
+  AlertTriangle, Zap,
+} from 'lucide-react'
+import {
+  fetchScans, createScan, cancelScan, deleteScan,
+  fetchAuthSessions, downloadHtmlReport, downloadJsonReport,
+} from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import type { Scan, AuthSession } from '../types'
 
-const AVAILABLE_TOOLS = ['katana', 'httpx', 'nuclei', 'ffuf', 'zap', 'whatweb', 'gobuster', 'arjun', 'nikto', 'dalfox']
+// ── Tool catalogue ─────────────────────────────────────────────────────────────
+
+const TOOL_GROUPS: Record<string, { label: string; tools: string[]; color: string }> = {
+  recon: {
+    label: 'Recon',
+    color: 'text-blue-400',
+    tools: ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun'],
+  },
+  dast: {
+    label: 'DAST',
+    color: 'text-yellow-400',
+    tools: ['nuclei', 'zap', 'nikto', 'dalfox', 'inspector'],
+  },
+  api: {
+    label: 'API / Secrets',
+    color: 'text-purple-400',
+    tools: ['jsscanner', 'graphql', 'openapi', 'cors', 'bola'],
+  },
+  exploit: {
+    label: 'Exploit (needs flag)',
+    color: 'text-red-400',
+    tools: ['sqlmap', 'tplmap', 'commix', 'jwt_tool'],
+  },
+}
+
+const ALL_TOOLS = Object.values(TOOL_GROUPS).flatMap((g) => g.tools)
+
+const PRESETS: Record<string, string[]> = {
+  quick:  ['whatweb', 'katana', 'httpx', 'nuclei'],
+  full:   ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun',
+           'nuclei', 'zap', 'nikto', 'dalfox', 'inspector',
+           'jsscanner', 'cors', 'bola'],
+  api:    ['whatweb', 'katana', 'httpx', 'arjun',
+           'jsscanner', 'graphql', 'openapi', 'cors', 'bola', 'jwt_tool'],
+  exploit: ALL_TOOLS,
+}
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleString()
 }
 
+// ── New scan modal ─────────────────────────────────────────────────────────────
+
 function NewScanModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient()
   const [url, setUrl] = useState('')
-  const [tools, setTools] = useState<string[]>(['katana', 'httpx', 'nuclei'])
-  const [preset, setPreset] = useState<'quick' | 'full' | 'custom'>('quick')
-  const [selectedSession, setSelectedSession] = useState<string>('')
+  const [tools, setTools] = useState<string[]>(PRESETS.quick)
+  const [preset, setPreset] = useState<string>('quick')
+  const [selectedSession, setSelectedSession] = useState('')
+  const [secondSession, setSecondSession] = useState('')
+  const [exploitEnabled, setExploitEnabled] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState('')
 
   const { data: sessions } = useQuery({
@@ -25,15 +72,10 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
     queryFn: fetchAuthSessions,
   })
 
-  const PRESETS = {
-    quick: ['katana', 'httpx', 'nuclei'],
-    full:  ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun', 'nuclei', 'zap', 'nikto', 'dalfox'],
-    custom: tools,
-  }
-
-  const applyPreset = (p: 'quick' | 'full' | 'custom') => {
+  const applyPreset = (p: string) => {
     setPreset(p)
-    if (p !== 'custom') setTools(PRESETS[p])
+    setTools(PRESETS[p] ?? [])
+    if (p === 'exploit') setExploitEnabled(true)
   }
 
   const toggleTool = (t: string) => {
@@ -46,22 +88,26 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
       target_url: url,
       tools,
       auth_session_id: selectedSession || null,
+      exploit_enabled: exploitEnabled,
+      second_auth_context: (secondSession && tools.includes('bola'))
+        ? { session_id: secondSession, target_url: url }
+        : null,
     }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['scans'] })
-      onClose()
-    },
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['scans'] }); onClose() },
     onError: (e: Error) => setError(e.message),
   })
 
   const inputCls = 'w-full bg-briar-bg border border-briar-border rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-briar-accent'
+  const hasBola = tools.includes('bola')
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-      <div className="card w-full max-w-md mx-4 space-y-4">
-        <h2 className="text-lg font-semibold">New Scan</h2>
+    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 overflow-y-auto py-6">
+      <div className="card w-full max-w-lg mx-4 space-y-4">
+        <h2 className="text-lg font-semibold flex items-center gap-2">
+          <Plus size={18} className="text-briar-accent" /> New Scan
+        </h2>
 
-        <div className="space-y-3">
+        <div className="space-y-4">
           {/* Target URL */}
           <div>
             <label className="text-xs text-slate-400 mb-1 block">Target URL</label>
@@ -99,45 +145,127 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
           {/* Presets */}
           <div>
             <label className="text-xs text-slate-400 mb-2 block">Scan Preset</label>
-            <div className="flex gap-2 mb-3">
-              {(['quick', 'full', 'custom'] as const).map(p => (
+            <div className="flex gap-2 mb-3 flex-wrap">
+              {[
+                { key: 'quick',   label: 'Quick',   hint: '~5 min' },
+                { key: 'full',    label: 'Full',    hint: '~45 min' },
+                { key: 'api',     label: 'API',     hint: 'REST/GraphQL' },
+                { key: 'exploit', label: 'Exploit', hint: 'all tools' },
+                { key: 'custom',  label: 'Custom',  hint: '' },
+              ].map(({ key, label, hint }) => (
                 <button
-                  key={p}
+                  key={key}
                   type="button"
-                  onClick={() => applyPreset(p)}
-                  className={`px-3 py-1 rounded-lg text-xs border transition-colors capitalize ${
-                    preset === p
+                  onClick={() => applyPreset(key)}
+                  className={`px-3 py-1 rounded-lg text-xs border transition-colors ${
+                    preset === key
                       ? 'bg-briar-accent border-briar-accent text-white'
                       : 'border-briar-border text-slate-400 hover:border-slate-500'
                   }`}
                 >
-                  {p}
-                  {p === 'quick' && <span className="ml-1 text-slate-500">~5min</span>}
-                  {p === 'full' && <span className="ml-1 text-slate-500">~30min</span>}
+                  {label}
+                  {hint && <span className="ml-1 opacity-60">{hint}</span>}
                 </button>
               ))}
             </div>
 
-            {/* Tools */}
-            <label className="text-xs text-slate-400 mb-2 block">Tools</label>
-            <div className="flex flex-wrap gap-2">
-              {AVAILABLE_TOOLS.map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => toggleTool(t)}
-                  className={`px-3 py-1 rounded-lg text-sm border transition-colors ${
-                    tools.includes(t)
-                      ? 'bg-briar-accent border-briar-accent text-white'
-                      : 'border-briar-border text-slate-400 hover:border-slate-500'
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
-            </div>
+            {/* Tool groups */}
+            {Object.entries(TOOL_GROUPS).map(([gk, g]) => (
+              <div key={gk} className="mb-3">
+                <p className={`text-xs font-semibold mb-1 ${g.color}`}>{g.label}</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {g.tools.map((t) => (
+                    <button
+                      key={t}
+                      type="button"
+                      onClick={() => toggleTool(t)}
+                      className={`px-2.5 py-0.5 rounded text-xs border transition-colors ${
+                        tools.includes(t)
+                          ? 'bg-briar-accent/20 border-briar-accent text-briar-accent'
+                          : 'border-briar-border text-slate-500 hover:border-slate-400 hover:text-slate-300'
+                      }`}
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {/* Advanced options */}
+          <div>
+            <button
+              type="button"
+              onClick={() => setShowAdvanced((x) => !x)}
+              className="flex items-center gap-1 text-xs text-slate-500 hover:text-slate-300"
+            >
+              {showAdvanced ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+              Advanced options
+            </button>
+
+            {showAdvanced && (
+              <div className="mt-3 space-y-3 pl-3 border-l border-briar-border">
+                {/* Exploit enabled */}
+                <label className="flex items-center gap-3 cursor-pointer">
+                  <div
+                    onClick={() => setExploitEnabled((x) => !x)}
+                    className={`w-9 h-5 rounded-full transition-colors flex items-center ${
+                      exploitEnabled ? 'bg-red-500' : 'bg-briar-border'
+                    }`}
+                  >
+                    <div className={`w-4 h-4 bg-white rounded-full shadow transition-transform mx-0.5 ${
+                      exploitEnabled ? 'translate-x-4' : 'translate-x-0'
+                    }`} />
+                  </div>
+                  <div>
+                    <p className="text-xs text-slate-300 font-medium flex items-center gap-1">
+                      <AlertTriangle size={11} className="text-red-400" />
+                      Enable exploit mode
+                    </p>
+                    <p className="text-xs text-slate-600">
+                      Allows sqlmap/tplmap/commix to attempt actual exploitation (safe targets only)
+                    </p>
+                  </div>
+                </label>
+
+                {/* Second auth context for BOLA */}
+                {hasBola && sessions && sessions.length > 1 && (
+                  <div>
+                    <label className="text-xs text-slate-400 mb-1 block flex items-center gap-1">
+                      <Zap size={11} className="text-purple-400" />
+                      BOLA: Second User Session
+                    </label>
+                    <select
+                      value={secondSession}
+                      onChange={e => setSecondSession(e.target.value)}
+                      className={`${inputCls} bg-briar-bg`}
+                    >
+                      <option value="">— Single-user test only —</option>
+                      {sessions
+                        .filter((s: AuthSession) => s.session_id !== selectedSession)
+                        .map((s: AuthSession) => (
+                          <option key={s.session_id} value={s.session_id}>
+                            [{s.auth_type}] {s.target_url} ({s.session_id.slice(0, 8)})
+                          </option>
+                        ))}
+                    </select>
+                    <p className="text-xs text-slate-600 mt-1">
+                      Used for cross-user BOLA testing — worker will compare resource access between both sessions.
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
+
+        {exploitEnabled && (
+          <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-400 flex items-start gap-2">
+            <AlertTriangle size={14} className="mt-0.5 shrink-0" />
+            Exploit mode is ON. Only use against targets you own or have written permission to test.
+          </div>
+        )}
 
         {error && <p className="text-red-400 text-sm">{error}</p>}
 
@@ -156,8 +284,11 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
   )
 }
 
+// ── Scan row ───────────────────────────────────────────────────────────────────
+
 function ScanRow({ scan }: { scan: Scan }) {
   const qc = useQueryClient()
+  const [reportLoading, setReportLoading] = useState(false)
   const completed = scan.steps.filter((s) => s.status === 'completed').length
   const total = scan.steps.length
   const pct = total ? Math.round((completed / total) * 100) : 0
@@ -173,6 +304,13 @@ function ScanRow({ scan }: { scan: Scan }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['scans'] }),
     onError: (e: Error) => alert(e.message),
   })
+
+  const handleReport = async () => {
+    setReportLoading(true)
+    try { await downloadHtmlReport(scan.id) }
+    catch (e: any) { alert(e.message) }
+    finally { setReportLoading(false) }
+  }
 
   return (
     <tr className="border-b border-briar-border hover:bg-white/[0.02] transition-colors">
@@ -206,24 +344,36 @@ function ScanRow({ scan }: { scan: Scan }) {
               style={{ width: `${pct}%` }}
             />
           </div>
-          <span className="text-xs text-slate-500">{pct}%</span>
+          <span className="text-xs text-slate-500">{completed}/{total}</span>
         </div>
       </td>
       <td className="table-cell text-slate-500 text-xs">{formatDate(scan.created_at)}</td>
       <td className="table-cell">
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 flex-wrap">
           <Link to={`/scan/${scan.id}/graph`} className="btn-ghost py-1 px-2 flex items-center gap-1">
             <GitGraph size={14} /> Graph
           </Link>
           <Link to={`/scan/${scan.id}/vulns`} className="btn-ghost py-1 px-2 flex items-center gap-1">
             <ShieldAlert size={14} /> Vulns
           </Link>
+          <Link to={`/scan/${scan.id}/report`} className="btn-ghost py-1 px-2 flex items-center gap-1 text-briar-accent">
+            <FileBarChart size={14} /> Report
+          </Link>
+          {scan.status === 'completed' && (
+            <button
+              onClick={handleReport}
+              disabled={reportLoading}
+              className="btn-ghost py-1 px-2 flex items-center gap-1 text-xs"
+              title="Download HTML report"
+            >
+              {reportLoading ? '…' : '↓ HTML'}
+            </button>
+          )}
           {(scan.status === 'running' || scan.status === 'pending') && (
             <button
               onClick={() => { if (confirm('Cancel this scan?')) cancelMut.mutate() }}
               disabled={cancelMut.isPending}
               className="flex items-center gap-1 px-2 py-1 rounded text-red-400 border border-red-500/30 hover:bg-red-500/10 text-xs transition-colors"
-              title="Stop scan"
             >
               <StopCircle size={12} />
               {cancelMut.isPending ? '…' : 'Stop'}
@@ -234,7 +384,6 @@ function ScanRow({ scan }: { scan: Scan }) {
               onClick={() => { if (confirm('Delete this scan and all its data?')) deleteMut.mutate() }}
               disabled={deleteMut.isPending}
               className="flex items-center gap-1 px-2 py-1 rounded text-slate-500 border border-slate-700 hover:text-red-400 hover:border-red-500/30 hover:bg-red-500/10 text-xs transition-colors"
-              title="Delete scan"
             >
               <Trash2 size={12} />
               {deleteMut.isPending ? '…' : 'Delete'}
@@ -245,6 +394,8 @@ function ScanRow({ scan }: { scan: Scan }) {
     </tr>
   )
 }
+
+// ── Dashboard ──────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
   const [showModal, setShowModal] = useState(false)
@@ -281,10 +432,10 @@ export default function Dashboard() {
       {scans && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
           {[
-            { label: 'Total', value: scans.length, color: 'text-slate-100' },
-            { label: 'Running', value: scans.filter((s) => s.status === 'running').length, color: 'text-blue-400' },
-            { label: 'Completed', value: scans.filter((s) => s.status === 'completed').length, color: 'text-emerald-400' },
-            { label: 'Failed', value: scans.filter((s) => s.status === 'failed').length, color: 'text-red-400' },
+            { label: 'Total',     value: scans.length,                                          color: 'text-slate-100' },
+            { label: 'Running',   value: scans.filter((s) => s.status === 'running').length,    color: 'text-blue-400' },
+            { label: 'Completed', value: scans.filter((s) => s.status === 'completed').length,  color: 'text-emerald-400' },
+            { label: 'Failed',    value: scans.filter((s) => s.status === 'failed').length,     color: 'text-red-400' },
           ].map(({ label, value, color }) => (
             <div key={label} className="card text-center">
               <div className={`text-3xl font-bold ${color}`}>{value}</div>
@@ -296,12 +447,8 @@ export default function Dashboard() {
 
       {/* Table */}
       <div className="card p-0 overflow-hidden">
-        {isLoading && (
-          <div className="p-8 text-center text-slate-500">Loading scans…</div>
-        )}
-        {isError && (
-          <div className="p-8 text-center text-red-400">Failed to load scans. Is the UI service running?</div>
-        )}
+        {isLoading && <div className="p-8 text-center text-slate-500">Loading scans…</div>}
+        {isError && <div className="p-8 text-center text-red-400">Failed to load scans. Is the UI service running?</div>}
         {scans && scans.length === 0 && (
           <div className="p-8 text-center text-slate-500">No scans yet. Click "New Scan" to get started.</div>
         )}

@@ -13,7 +13,43 @@ import type { Severity, Vulnerability, VulnStatus } from '../types'
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const SEVERITIES: Array<Severity | ''> = ['', 'critical', 'high', 'medium', 'low', 'info']
-const TOOLS = ['', 'nuclei', 'zap', 'nikto', 'dalfox', 'sqlmap', 'ffuf']
+const TOOLS = [
+  '', 'nuclei', 'zap', 'nikto', 'dalfox', 'sqlmap', 'ffuf',
+  'katana', 'httpx', 'gobuster', 'arjun', 'whatweb', 'inspector',
+  'tplmap', 'commix', 'jwt_tool', 'graphql', 'openapi',
+  'jsscanner', 'cors', 'bola',
+]
+
+const CONFIDENCE_OPTIONS = [
+  { value: 0,  label: 'Any confidence' },
+  { value: 50, label: '≥ 50 (Medium+)' },
+  { value: 70, label: '≥ 70 (Confirmed)' },
+  { value: 80, label: '≥ 80 (High confidence)' },
+  { value: 90, label: '≥ 90 (Exploit-verified)' },
+]
+
+function ConfidencePill({ value }: { value?: number }) {
+  const v = value ?? 50
+  let cls = 'bg-slate-700 text-slate-400'
+  if (v >= 90) cls = 'bg-red-500/20 text-red-400'
+  else if (v >= 80) cls = 'bg-emerald-500/20 text-emerald-400'
+  else if (v >= 70) cls = 'bg-blue-500/20 text-blue-400'
+  else if (v >= 55) cls = 'bg-yellow-500/20 text-yellow-400'
+  return (
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-mono font-semibold ${cls}`}>
+      {v}%
+    </span>
+  )
+}
+
+function ConfirmedByBadge({ tools }: { tools?: string[] | null }) {
+  if (!tools || tools.length <= 1) return null
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-xs bg-purple-500/15 text-purple-400 border border-purple-500/30">
+      ✓ {tools.join(' · ')}
+    </span>
+  )
+}
 
 const VULN_STATUS_OPTIONS: Array<{ value: VulnStatus | ''; label: string }> = [
   { value: '',               label: 'All statuses' },
@@ -204,6 +240,12 @@ function GroupedRow({ v }: { v: Vulnerability }) {
         <td className="table-cell max-w-xs">
           <p className="text-xs text-slate-400 line-clamp-1">{v.description ?? '—'}</p>
         </td>
+        <td className="table-cell text-center">
+          <div className="flex flex-col items-center gap-1">
+            <ConfidencePill value={v.confidence} />
+            <ConfirmedByBadge tools={v.confirmed_by} />
+          </div>
+        </td>
         <td className="table-cell">
           <VulnStatusBadge status={status} />
         </td>
@@ -214,7 +256,7 @@ function GroupedRow({ v }: { v: Vulnerability }) {
 
       {open && (
         <tr className="border-b border-briar-border bg-briar-bg/40">
-          <td colSpan={7} className="px-4 py-3 space-y-3">
+          <td colSpan={8} className="px-4 py-3 space-y-3">
             {/* Affected URLs */}
             {urls.length > 0 && (
               <div className="space-y-1 max-h-36 overflow-y-auto">
@@ -447,6 +489,7 @@ export default function Vulnerabilities() {
   const [severity, setSeverity] = useState<string>('')
   const [tool, setTool] = useState<string>('')
   const [statusFilter, setStatusFilter] = useState<string>('open')
+  const [minConfidence, setMinConfidence] = useState<number>(0)
   const [grouped, setGrouped] = useState(true)
   const [diffTarget, setDiffTarget] = useState<string | null>(null)
 
@@ -461,10 +504,10 @@ export default function Vulnerabilities() {
       }),
     refetchInterval: 10000,
     select: (data) => {
-      // Client-side status filter (deduplicate mode uses worst-status heuristic,
-      // so we apply the filter after fetching to keep counts accurate)
-      if (!statusFilter) return data
-      return data.filter((v) => (v.vuln_status ?? 'open') === statusFilter)
+      let result = data
+      if (statusFilter) result = result.filter((v) => (v.vuln_status ?? 'open') === statusFilter)
+      if (minConfidence > 0) result = result.filter((v) => (v.confidence ?? 50) >= minConfidence)
+      return result
     },
   })
 
@@ -479,7 +522,7 @@ export default function Vulnerabilities() {
     ? vulns?.reduce((acc, v) => acc + (v.count ?? 1), 0) ?? 0
     : vulns?.length ?? 0
 
-  const hasFilters = !!(severity || tool || statusFilter)
+  const hasFilters = !!(severity || tool || statusFilter || minConfidence)
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-5">
@@ -608,9 +651,18 @@ export default function Vulnerabilities() {
             <option key={t} value={t}>{t || 'All tools'}</option>
           ))}
         </select>
+        <select
+          value={minConfidence}
+          onChange={(e) => setMinConfidence(Number(e.target.value))}
+          className="bg-briar-surface border border-briar-border rounded-lg px-3 py-1.5 text-sm text-slate-300 focus:outline-none focus:border-briar-accent"
+        >
+          {CONFIDENCE_OPTIONS.map((o) => (
+            <option key={o.value} value={o.value}>{o.label}</option>
+          ))}
+        </select>
         {hasFilters && (
           <button
-            onClick={() => { setSeverity(''); setTool(''); setStatusFilter('open') }}
+            onClick={() => { setSeverity(''); setTool(''); setStatusFilter('open'); setMinConfidence(0) }}
             className="text-xs text-slate-500 hover:text-slate-300"
           >
             Clear filters
@@ -644,6 +696,7 @@ export default function Vulnerabilities() {
                   <th className="table-header">Tool</th>
                   <th className="table-header text-center">{grouped ? 'Affected' : 'URL'}</th>
                   <th className="table-header">Description</th>
+                  <th className="table-header text-center">Confidence</th>
                   <th className="table-header">Status</th>
                   <th className="table-header w-6"></th>
                 </tr>
@@ -664,6 +717,10 @@ export default function Vulnerabilities() {
                         </td>
                         <td className="table-cell max-w-sm">
                           <p className="text-xs text-slate-400 line-clamp-2">{v.description ?? '—'}</p>
+                        </td>
+                        <td className="table-cell text-center">
+                          <ConfidencePill value={v.confidence} />
+                          <ConfirmedByBadge tools={v.confirmed_by} />
                         </td>
                         <td className="table-cell">
                           <VulnStatusBadge status={v.vuln_status} />

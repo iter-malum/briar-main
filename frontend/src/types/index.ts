@@ -34,6 +34,64 @@ export interface Vulnerability {
   // Vulnerability management
   vuln_status?: VulnStatus
   analyst_note?: string | null
+  // M12: Quality Layer
+  confidence?: number
+  dedup_key?: string | null
+  confirmed_by?: string[] | null
+}
+
+// ── M13: Report types ─────────────────────────────────────────────────────────
+
+export interface OWASPCellSummary {
+  id: string           // "A01:2021"
+  name: string
+  covered: boolean
+  max_severity: Severity | null
+  confirmed_count: number
+  severity_counts: Record<Severity, number>
+  finding_count: number
+}
+
+export interface ReportMeta {
+  scan_id: string
+  target_url: string
+  status: string
+  created_at: string
+  finished_at: string
+  duration_s: number | null
+  tools: string[]
+  generated_at: string
+}
+
+export interface ReportSummary {
+  total: number
+  by_severity: Record<Severity, number>
+  by_tool: Record<string, number>
+  confirmed_count: number
+  avg_confidence: number
+}
+
+export interface ReportFinding {
+  id: string
+  tool: string
+  severity: Severity
+  url: string
+  vulnerability_type: string
+  description: string
+  confidence: number
+  confirmed_by: string[]
+  dedup_key: string
+  vuln_status: string
+  owasp: string
+  request_method: string
+  analyst_note: string
+}
+
+export interface ScanReport {
+  meta: ReportMeta
+  summary: ReportSummary
+  owasp_coverage: Record<string, OWASPCellSummary>
+  findings: ReportFinding[]
 }
 
 export interface GraphNode {
