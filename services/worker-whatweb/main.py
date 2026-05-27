@@ -416,15 +416,20 @@ class WhatWebWorker(BaseWorker):
             out_file = tf.name
 
         try:
+            # Choose redirect policy: plain-HTTP targets use NEW-SITE (follow
+            # any redirect), HTTPS targets use HTTPS_ONLY (avoid downgrade).
+            # Using HTTPS_ONLY on a plain-HTTP target prevents WhatWeb from
+            # following HTTP→HTTP redirects, causing 0 plugins detected.
+            follow_redirect = (
+                "HTTPS_ONLY" if target.startswith("https://") else "NEW-SITE"
+            )
+
             cmd = [
                 "whatweb",
                 "--no-errors",
                 f"--aggression={self.aggression}",
                 f"--log-json={out_file}",
-                # Follow HTTP→HTTPS redirects (GitHub Pages, CDNs, Heroku, etc.).
-                # Default is NEVER — without this WhatWeb scans the 301 response
-                # and gets 0 useful plugins.
-                "--follow-redirect=HTTPS_ONLY",
+                f"--follow-redirect={follow_redirect}",
                 # Generic browser UA — some CDNs/WAFs block non-browser strings.
                 "--user-agent=Mozilla/5.0 (compatible; Briar-Scanner/1.0)",
                 # NOTE: do NOT add --quiet — it suppresses --log-json output in
