@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
 from shared.config import settings
-from shared.models import ScanResultORM, ScanStatus, ScanStepORM, SeverityLevel
+from shared.models import ScanORM, ScanResultORM, ScanStatus, ScanStepORM, SeverityLevel
 from shared.pipeline import TECH_TO_NUCLEI_TAGS
 
 logger = logging.getLogger("worker-base")
@@ -187,6 +187,13 @@ class BaseWorker(ABC):
 
         _task_start = _time.monotonic()
         try:
+            # Guard: if the scan was deleted between enqueue and consume, drop the task.
+            async with self.session_factory() as _chk:
+                exists = await _chk.get(ScanORM, UUID(scan_id))
+            if not exists:
+                logger.warning(f"[{self.tool_name}] Scan {scan_id} not found in DB — discarding stale task")
+                return
+
             await self._update_step_status(scan_id, ScanStatus.running)
 
             # Load endpoints from previous-phase tools.
@@ -538,7 +545,13 @@ class BaseWorker(ABC):
                 return
 
             session.add_all(items)
-            await session.commit()
+            try:
+                await session.commit()
+            except Exception as db_exc:
+                if "ForeignKeyViolation" in type(db_exc).__name__ or "ForeignKeyViolationError" in str(db_exc):
+                    logger.warning(f"[{self.tool_name}] Scan {scan_id} deleted before results committed — discarding {len(items)} results")
+                    return
+                raise
             logger.info(f"[{self.tool_name}] Saved {len(items)} results for scan {scan_id}")
 
         # Prometheus: count findings by severity
