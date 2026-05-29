@@ -416,20 +416,16 @@ class WhatWebWorker(BaseWorker):
             out_file = tf.name
 
         try:
-            # Choose redirect policy: plain-HTTP targets use NEW-SITE (follow
-            # any redirect), HTTPS targets use HTTPS_ONLY (avoid downgrade).
-            # Using HTTPS_ONLY on a plain-HTTP target prevents WhatWeb from
-            # following HTTP→HTTP redirects, causing 0 plugins detected.
-            follow_redirect = (
-                "HTTPS_ONLY" if target.startswith("https://") else "NEW-SITE"
-            )
-
             cmd = [
                 "whatweb",
                 "--no-errors",
                 f"--aggression={self.aggression}",
                 f"--log-json={out_file}",
-                f"--follow-redirect={follow_redirect}",
+                # --follow-redirect is intentionally omitted for plain HTTP
+                # targets: WhatWeb 0.5.5 writes an incomplete JSON array (`[`)
+                # when any --follow-redirect flag is set on an HTTP URL, giving
+                # 0 results.  For HTTPS targets we add HTTPS_ONLY below to
+                # follow HTTPS→HTTPS redirects without risking a downgrade.
                 # Generic browser UA — some CDNs/WAFs block non-browser strings.
                 "--user-agent=Mozilla/5.0 (compatible; Briar-Scanner/1.0)",
                 # NOTE: do NOT add --quiet — it suppresses --log-json output in
@@ -437,6 +433,10 @@ class WhatWebWorker(BaseWorker):
                 # NOTE: --color=never and --max-redirect=N do NOT exist in
                 # WhatWeb 0.5.5 (Debian apt) and cause exit code 1.
             ]
+
+            # HTTPS targets need redirect following (e.g. HTTPS→HTTPS CDN hops)
+            if target.startswith("https://"):
+                cmd.append("--follow-redirect=HTTPS_ONLY")
 
             # Auth headers → Cookie flag
             cookies = auth_context.get("cookies", [])
