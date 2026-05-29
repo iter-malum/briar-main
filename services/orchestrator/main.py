@@ -170,6 +170,17 @@ class PipelineManager:
                 logger.warning(f"[pipeline] scan {scan_id} not found")
                 return
 
+            # Guard: ignore stale completion events from workers that were still
+            # running when the scan was cancelled or already completed.
+            # run_tool re-opens the scan (sets it back to running) before publishing,
+            # so legitimate re-runs from the UI are NOT blocked here.
+            if scan.status in (ScanStatus.completed, ScanStatus.failed):
+                logger.info(
+                    f"[pipeline] scan {scan_id} already {scan.status.value} "
+                    f"— ignoring late event from {completed_tool}"
+                )
+                return
+
             selected_tools = set(scan.config.get("tools", []))
             exploit_enabled = scan.config.get("exploit_enabled", False)
 
@@ -243,12 +254,30 @@ class PipelineManager:
                         exc_info=True,
                     )
 
-            # Check overall completion
+            # Check overall completion.
+            # Re-derive selected_tools and completed_tools AFTER the finding_router
+            # may have appended new tools+steps so that is_scan_complete uses
+            # the most up-to-date picture.
+            selected_tools = set(scan.config.get("tools", []))
+            completed_tools = {
+                s.tool for s in scan.steps
+                if s.status in (ScanStatus.completed, ScanStatus.failed)
+            }
             if is_scan_complete(selected_tools, completed_tools):
+                # A tool only counts as "failed" if it has NO completed step.
+                # If a tool had a failed first attempt but a completed retry we
+                # must not mark the whole scan as failed.
+                def _tool_net_status(tool: str) -> str:
+                    tool_steps = [s for s in scan.steps if s.tool == tool]
+                    if any(s.status == ScanStatus.completed for s in tool_steps):
+                        return "completed"
+                    if any(s.status == ScanStatus.failed for s in tool_steps):
+                        return "failed"
+                    return "pending"
+
                 any_failed = any(
-                    s.status == ScanStatus.failed
-                    for s in scan.steps
-                    if s.tool in selected_tools
+                    _tool_net_status(t) == "failed"
+                    for t in selected_tools
                 )
                 final_status = ScanStatus.failed if any_failed else ScanStatus.completed
                 scan.status = final_status
