@@ -167,11 +167,13 @@ class FindingRouter:
                 session.add(new_step)
                 # Append to in-memory list so further checks in this loop are correct
                 scan.steps.append(new_step)
-                # Add tool to scan.config so orchestrator tracks it going forward
+                # Add to "tools" (full tracking) but NOT to "user_tools" (the
+                # user's explicit selection).  Completion checking uses user_tools
+                # only, so router-triggered tools never block scan completion.
                 tools_list = list(scan.config.get("tools", []))
                 if tool not in tools_list:
                     scan.config = {**scan.config, "tools": tools_list + [tool]}
-                logger.info(f"[router] Created step + registered '{tool}' for scan {scan_id}")
+                logger.info(f"[router] Created step + triggered '{tool}' for scan {scan_id}")
 
             # Publish task to the tool's queue
             payload = self._build_payload(scan_id, scan, best, url, vtype, param, tool)

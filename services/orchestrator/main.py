@@ -181,7 +181,14 @@ class PipelineManager:
                 )
                 return
 
-            selected_tools = set(scan.config.get("tools", []))
+            # user_tools = what the user explicitly selected (immutable).
+            # selected_tools = same thing, used for phase triggering.
+            # Dynamic tools added by finding_router / run-tool go into "tools"
+            # but do NOT count for pipeline completion.
+            user_tools = set(
+                scan.config.get("user_tools") or scan.config.get("tools", [])
+            )
+            selected_tools = user_tools
             exploit_enabled = scan.config.get("exploit_enabled", False)
 
             # Mark scan as running on first completion event
@@ -254,16 +261,14 @@ class PipelineManager:
                         exc_info=True,
                     )
 
-            # Check overall completion.
-            # Re-derive selected_tools and completed_tools AFTER the finding_router
-            # may have appended new tools+steps so that is_scan_complete uses
-            # the most up-to-date picture.
-            selected_tools = set(scan.config.get("tools", []))
+            # Check overall completion — based on user_tools only.
+            # finding_router / run-tool extras are supplementary and do NOT
+            # block or influence scan completion.
             completed_tools = {
                 s.tool for s in scan.steps
                 if s.status in (ScanStatus.completed, ScanStatus.failed)
             }
-            if is_scan_complete(selected_tools, completed_tools):
+            if is_scan_complete(user_tools, completed_tools):
                 # A tool only counts as "failed" if it has NO completed step.
                 # If a tool had a failed first attempt but a completed retry we
                 # must not mark the whole scan as failed.
@@ -277,7 +282,7 @@ class PipelineManager:
 
                 any_failed = any(
                     _tool_net_status(t) == "failed"
-                    for t in selected_tools
+                    for t in user_tools
                 )
                 final_status = ScanStatus.failed if any_failed else ScanStatus.completed
                 scan.status = final_status
@@ -486,6 +491,11 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
             target_url=str(payload.target_url).rstrip("/"),
             config={
                 "tools": payload.tools,
+                # user_tools is the immutable set the user explicitly selected.
+                # Pipeline completion is based ONLY on user_tools — dynamically
+                # triggered tools (finding_router, run-tool) don't block or change
+                # the scan's lifecycle.
+                "user_tools": payload.tools,
                 "auth_session_id": str(payload.auth_session_id) if payload.auth_session_id else None,
                 "exploit_enabled": payload.exploit_enabled,
             },
@@ -642,6 +652,9 @@ async def run_tool(
             existing_step.finished_at = None
         else:
             session.add(ScanStepORM(scan_id=scan.id, tool=tool, status=ScanStatus.pending))
+            # Track in "tools" (full history) but NOT in "user_tools" (user's
+            # explicit selection).  Completion checking uses user_tools only,
+            # so manually-run tools don't block or affect the scan lifecycle.
             tools = scan.config.get("tools", [])
             if tool not in tools:
                 scan.config = {**scan.config, "tools": tools + [tool]}
