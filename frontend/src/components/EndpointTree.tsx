@@ -20,15 +20,15 @@ import type { EndpointItem } from '../api/client'
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
-const LEAF_W     = 200   // leaf (endpoint) pill width
-const SEG_W      = 130   // segment branch node width
-const ROOT_W     = 180   // root node width
-const NODE_H     = 28    // node height (all types)
-const LEVEL_H    = 105   // vertical distance between levels
-const NODE_SEP   = 220   // horizontal space allocated per node by d3.tree
-const PAD_X      = 80    // horizontal padding around the tree
-const PAD_BOTTOM = 60    // space below root
-const PAD_TOP    = 50    // space above top leaves
+const LEAF_W     = 180   // leaf (endpoint) pill width
+const SEG_W      = 110   // segment branch node width
+const ROOT_W     = 160   // root node width
+const NODE_H     = 24    // node height (all types)
+const LEVEL_H    = 70    // vertical distance between levels
+const NODE_SEP   = 195   // horizontal space allocated per node by d3.tree
+const PAD_X      = 40    // horizontal padding around the tree
+const PAD_BOTTOM = 44    // space below root
+const PAD_TOP    = 30    // space above top leaves
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 
@@ -161,41 +161,41 @@ function RootNode({
 }: {
   cx: number; cy: number; label: string; count: number
 }) {
-  const w = ROOT_W, h = NODE_H + 10
+  const w = ROOT_W, h = NODE_H + 6
   return (
     <g transform={`translate(${cx}, ${cy})`}>
       {/* glow halo */}
       <rect
-        x={-w / 2 - 4} y={-h / 2 - 4}
-        width={w + 8} height={h + 8}
-        rx={14} fill="rgba(245,158,11,0.08)"
+        x={-w / 2 - 3} y={-h / 2 - 3}
+        width={w + 6} height={h + 6}
+        rx={11} fill="rgba(245,158,11,0.08)"
       />
       {/* main rect */}
       <rect
         x={-w / 2} y={-h / 2}
         width={w} height={h}
-        rx={10}
+        rx={8}
         fill="#f59e0b"
         stroke="rgba(245,158,11,0.6)"
         strokeWidth={1}
       />
       <text
-        x={0} y={-3}
+        x={0} y={-2}
         textAnchor="middle"
         fill="#1a0e00"
-        fontSize={12}
+        fontSize={11}
         fontWeight={700}
         fontFamily="JetBrains Mono, monospace"
       >
-        {trunc(label, 22)}
+        {trunc(label, 20)}
       </text>
       <text
-        x={0} y={12}
+        x={0} y={10}
         textAnchor="middle"
         fill="rgba(0,0,0,0.5)"
-        fontSize={9}
+        fontSize={8}
       >
-        {count} endpoints
+        {count} ep
       </text>
     </g>
   )
@@ -222,12 +222,12 @@ function SegmentNode({
       style={{ cursor: hasChildren ? 'pointer' : 'default' }}
     >
       {/* hit area */}
-      <rect x={-w / 2 - 4} y={-h / 2 - 4} width={w + 8} height={h + 8} rx={10} fill="transparent" />
+      <rect x={-w / 2 - 3} y={-h / 2 - 3} width={w + 6} height={h + 6} rx={8} fill="transparent" />
       {/* body */}
       <rect
         x={-w / 2} y={-h / 2}
         width={w} height={h}
-        rx={7}
+        rx={5}
         fill={isHovered ? '#242121' : '#1c1a1a'}
         stroke={isHovered ? 'rgba(245,158,11,0.5)' : '#2e2b2b'}
         strokeWidth={1}
@@ -236,44 +236,44 @@ function SegmentNode({
       <rect
         x={-w / 2} y={-h / 2}
         width={3} height={h}
-        rx={2}
+        rx={1}
         fill="rgba(245,158,11,0.35)"
       />
 
       {/* collapse chevron */}
       {hasChildren && (
-        <text x={-w / 2 + 10} y={4} fill="rgba(245,158,11,0.7)" fontSize={9} fontWeight={700}>
+        <text x={-w / 2 + 8} y={3} fill="rgba(245,158,11,0.7)" fontSize={8} fontWeight={700}>
           {isCollapsed ? '▶' : '▼'}
         </text>
       )}
 
       {/* segment label */}
       <text
-        x={hasChildren ? -w / 2 + 24 : -w / 2 + 10}
-        y={4}
+        x={hasChildren ? -w / 2 + 20 : -w / 2 + 8}
+        y={3}
         fill="#e2e8f0"
-        fontSize={11}
+        fontSize={10}
         fontFamily="JetBrains Mono, monospace"
       >
-        {trunc('/' + label, hasChildren ? 12 : 14)}
+        {trunc('/' + label, hasChildren ? 10 : 13)}
       </text>
 
       {/* endpoint count badge */}
       {count > 0 && (
         <>
           <rect
-            x={w / 2 - 28} y={-8}
-            width={24} height={16}
-            rx={8}
+            x={w / 2 - 24} y={-7}
+            width={20} height={14}
+            rx={7}
             fill="rgba(245,158,11,0.12)"
             stroke="rgba(245,158,11,0.25)"
             strokeWidth={1}
           />
           <text
-            x={w / 2 - 16} y={4}
+            x={w / 2 - 14} y={3}
             textAnchor="middle"
             fill="#f59e0b"
-            fontSize={9}
+            fontSize={8}
             fontWeight={600}
           >
             {count > 99 ? '99+' : count}
@@ -299,12 +299,12 @@ function LeafNode({
   const w = LEAF_W, h = NODE_H
   const mc = methodClr(endpoint.method)
   const sc = statusClr(endpoint.status_code)
-  const method = (endpoint.method || 'GET').toUpperCase().slice(0, 7)
-  const methodW = Math.max(method.length * 7 + 10, 36)
+  const method = (endpoint.method || 'GET').toUpperCase().slice(0, 6)
+  const methodW = Math.max(method.length * 6 + 8, 30)
 
   let pathname = '/'
   try { pathname = new URL(endpoint.url).pathname } catch {}
-  const pathLabel = trunc(pathname, 20)
+  const pathLabel = trunc(pathname, 18)
 
   return (
     <g
@@ -313,13 +313,13 @@ function LeafNode({
       style={{ cursor: 'pointer', opacity: isDimmed ? 0.3 : 1 }}
     >
       {/* hit area */}
-      <rect x={-w / 2 - 3} y={-h / 2 - 3} width={w + 6} height={h + 6} rx={16} fill="transparent" />
+      <rect x={-w / 2 - 2} y={-h / 2 - 2} width={w + 4} height={h + 4} rx={13} fill="transparent" />
 
       {/* body */}
       <rect
         x={-w / 2} y={-h / 2}
         width={w} height={h}
-        rx={14}
+        rx={11}
         fill={isSelected ? 'rgba(245,158,11,0.12)' : isHovered ? '#242121' : '#1c1a1a'}
         stroke={isSelected ? '#f59e0b' : isHovered ? 'rgba(245,158,11,0.35)' : '#2e2b2b'}
         strokeWidth={isSelected ? 1.5 : 1}
@@ -327,17 +327,17 @@ function LeafNode({
 
       {/* method badge */}
       <rect
-        x={-w / 2 + 5} y={-h / 2 + 4}
-        width={methodW} height={h - 8}
-        rx={9}
+        x={-w / 2 + 4} y={-h / 2 + 3}
+        width={methodW} height={h - 6}
+        rx={7}
         fill={mc.fill}
       />
       <text
-        x={-w / 2 + 5 + methodW / 2}
-        y={4}
+        x={-w / 2 + 4 + methodW / 2}
+        y={3}
         textAnchor="middle"
         fill={mc.text}
-        fontSize={9}
+        fontSize={8}
         fontWeight={700}
         fontFamily="JetBrains Mono, monospace"
       >
@@ -346,10 +346,10 @@ function LeafNode({
 
       {/* path */}
       <text
-        x={-w / 2 + methodW + 12}
-        y={4}
+        x={-w / 2 + methodW + 10}
+        y={3}
         fill="#cbd5e1"
-        fontSize={10}
+        fontSize={9}
         fontFamily="JetBrains Mono, monospace"
       >
         {pathLabel}
@@ -358,13 +358,13 @@ function LeafNode({
       {/* status dot + code */}
       {endpoint.status_code > 0 && (
         <>
-          <circle cx={w / 2 - 22} cy={0} r={3} fill={sc} />
+          <circle cx={w / 2 - 20} cy={0} r={2.5} fill={sc} />
           <text
-            x={w / 2 - 16}
-            y={4}
+            x={w / 2 - 15}
+            y={3}
             textAnchor="start"
             fill={sc}
-            fontSize={9}
+            fontSize={8}
             fontFamily="JetBrains Mono, monospace"
           >
             {endpoint.status_code}
