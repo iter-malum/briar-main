@@ -21,7 +21,7 @@ export function useWebSocket(url: string | null): UseWebSocketReturn {
     function connect() {
       if (activeUrl.current !== url) return
 
-      const ws = new WebSocket(url)
+      const ws = new WebSocket(url as string)
       wsRef.current = ws
 
       ws.onopen = () => setConnected(true)
