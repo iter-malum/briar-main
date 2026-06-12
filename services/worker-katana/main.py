@@ -641,8 +641,13 @@ class KatanaWorker(BaseWorker):
                             continue
 
                         # ── Quality filters (false-positive suppression) ───────
-                        # Rule 1: template literal artifacts
+                        # Rule 1: template literal artifacts (raw or URL-encoded).
+                        # %27 = ', %28 = (, %29 = ), %2B = +, %20 = space.
+                        # These appear when a JS string-concatenation expression
+                        # like `'+'_(i[11]||f[g])'+'` is captured literally.
                         if self._TEMPLATE_ARTIFACT_RE.search(raw_path):
+                            continue
+                        if re.search(r'%27|%28|%29|%2B|%20|%09', raw_path, re.IGNORECASE):
                             continue
 
                         # Rule 2: separator segments (---...---, ___, etc.)

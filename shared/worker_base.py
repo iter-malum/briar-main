@@ -314,18 +314,56 @@ class BaseWorker(ABC):
         try:
             from sqlalchemy import text as sa_text
             async with self.session_factory() as session:
-                # Raw SQL: PostgreSQL JSON ->> operator extracts text from the
-                # json column; we cast to int and keep only 2xx/3xx responses.
+                # Two-part query:
+                #
+                # Part 1 — GET endpoints confirmed live by httpx (2xx/3xx).
+                #   httpx probes every URL via GET, so this catches all endpoints
+                #   that return a success status on a GET request.
+                #
+                # Part 2 — Non-GET endpoints from source tools that httpx never
+                #   probed (httpx only does GET).  POST/PUT/PATCH/DELETE endpoints
+                #   discovered by katana would be filtered out if we only trusted
+                #   httpx, causing DAST tools to miss critical injection points
+                #   like POST /rest/user/login (SQLi) or POST /api/Users.
+                #   We include them as long as httpx did NOT explicitly mark that
+                #   URL as dead (4xx/5xx on GET).
                 stmt = sa_text("""
-                    SELECT DISTINCT url
-                    FROM   scan_results
-                    WHERE  scan_id  = :scan_id
-                      AND  tool     = 'httpx'
-                      AND  url      IS NOT NULL
-                      AND  url      != ''
-                      AND  (raw_output->>'status_code')::int BETWEEN 200 AND 399
+                    WITH httpx_live AS (
+                        SELECT DISTINCT url
+                        FROM   scan_results
+                        WHERE  scan_id = :scan_id
+                          AND  tool    = 'httpx'
+                          AND  url     IS NOT NULL
+                          AND  url     != ''
+                          AND  (raw_output->>'status_code')::int BETWEEN 200 AND 399
+                    ),
+                    httpx_dead AS (
+                        SELECT DISTINCT url
+                        FROM   scan_results
+                        WHERE  scan_id = :scan_id
+                          AND  tool    = 'httpx'
+                          AND  url     IS NOT NULL
+                          AND  (raw_output->>'status_code')::int BETWEEN 400 AND 599
+                    ),
+                    post_endpoints AS (
+                        SELECT DISTINCT url
+                        FROM   scan_results
+                        WHERE  scan_id       = :scan_id
+                          AND  tool          = ANY(:source_tools)
+                          AND  url           IS NOT NULL
+                          AND  url           != ''
+                          AND  request_method IS NOT NULL
+                          AND  request_method NOT IN ('GET', 'HEAD', 'OPTIONS', '')
+                          AND  url NOT IN (SELECT url FROM httpx_dead)
+                    )
+                    SELECT url FROM httpx_live
+                    UNION
+                    SELECT url FROM post_endpoints
                 """)
-                result = await session.execute(stmt, {"scan_id": str(scan_id)})
+                result = await session.execute(
+                    stmt,
+                    {"scan_id": str(scan_id), "source_tools": list(source_tools)},
+                )
                 live_urls = [
                     url for (url,) in result.all()
                     if url and url.startswith("http")

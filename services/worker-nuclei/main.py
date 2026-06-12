@@ -110,7 +110,24 @@ class NucleiWorker(BaseWorker):
                 db_tags = await self.get_tech_tags(scan_id)
                 tech_tags.update(db_tags)
 
-            if tech_tags:
+            # Always include broad detection categories regardless of app type.
+            # 'exposure' catches sensitive file/directory disclosures (e.g. /ftp/,
+            # backup files, .env).  'misconfig' catches header/TLS issues.
+            # Without these, Juice Shop's directory traversal and file-exposure
+            # challenges are invisible to nuclei.
+            tech_tags.update({"exposure", "misconfig"})
+
+            # When app_type is unknown and WhatWeb found nothing, running with a
+            # narrow tag filter produces zero results — nuclei silently skips
+            # all templates that don't match the tiny tag set.
+            # Strategy: omit -tags entirely for unknown apps so nuclei runs its
+            # full template library.  This is slower but finds real issues.
+            if app_type == "unknown" and len(tech_tags) <= 3:
+                logger.info(
+                    f"[nuclei] app_type='unknown' — running without tag filter "
+                    f"for maximum coverage (ignoring computed tags: {sorted(tech_tags)})"
+                )
+            else:
                 cmd.extend(["-tags", ",".join(sorted(tech_tags))])
                 logger.info(
                     f"[nuclei] Template tags "

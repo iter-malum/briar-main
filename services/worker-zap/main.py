@@ -144,9 +144,14 @@ class ZAPWorker(BaseWorker):
 
         strategy = get_strategy(app_type, "zap", framework)
 
-        # Strategy flags — defaults favour full scanning (safe for unknown apps)
+        # Strategy flags.
+        # Traditional spider is DISABLED by default — on SPAs it follows relative
+        # links from Angular/React routes, creating exponentially nested garbage
+        # paths (e.g. /address/assets/public/assets/public/…) that flood ZAP's
+        # site tree and waste the entire active-scan budget on fake URLs.
+        # The AJAX spider (Chromium-based) provides superior SPA coverage anyway.
         run_ajax_spider        = strategy.get("run_ajax_spider",        True)
-        run_traditional_spider = strategy.get("run_traditional_spider", True)
+        run_traditional_spider = strategy.get("run_traditional_spider", False)
         run_openapi_import     = strategy.get("run_openapi_import",     False)
         ajax_timeout_strat     = strategy.get("ajax_timeout")
 
@@ -210,6 +215,13 @@ class ZAPWorker(BaseWorker):
                     await self._wait_scan(client, "spider", spider_id)
                 else:
                     logger.info(f"[zap] Traditional Spider skipped (app_type={app_type!r})")
+
+                # ── Phase 3.5: Exclusions — keep active scanner on API paths ──
+                # Exclude static assets and SPA frontend routes from active scan.
+                # Without this, ZAP attacks hundreds of .js/.css files and
+                # Angular router paths that all return the same index.html,
+                # producing zero findings while consuming the entire scan budget.
+                await self._add_ascan_exclusions(client)
 
                 # ── Phase 4: Active Scan ───────────────────────────────────────
                 ascan_id = await self._start_ascan(client, base_url)
@@ -472,6 +484,37 @@ class ZAPWorker(BaseWorker):
         scan_id = data.get("scan", "0")
         logger.info(f"[zap] Traditional Spider started, id={scan_id}")
         return scan_id
+
+    # ── Exclusion patterns ────────────────────────────────────────────────────
+
+    # Regex patterns excluded from ZAP active scan.
+    # Covers static assets (.js, .css, images, fonts) and deeply-nested paths
+    # that SPAs generate by resolving relative links on Angular/React routes.
+    _ASCAN_EXCLUDES = [
+        r".*\.js(\?.*)?$",             # JavaScript bundles
+        r".*\.css(\?.*)?$",            # Stylesheets
+        r".*\.map(\?.*)?$",            # Source maps
+        r".*\.(png|jpg|jpeg|gif|svg|ico|webp|bmp|avif)(\?.*)?$",
+        r".*\.(woff2?|ttf|eot|otf)(\?.*)?$",
+        r".*\.(mp3|mp4|webm|ogg|wav)(\?.*)?$",
+        # Paths with repeated segments — signature of SPA link-following explosion
+        r".*/assets/public/assets/.*",
+        r".*/node_modules/.*",
+        r".*/build/routes/.*",
+        # Stack-trace leak patterns (serve-index / express router line refs)
+        r".*\.js:\d+:\d+$",
+    ]
+
+    async def _add_ascan_exclusions(self, client: httpx.AsyncClient):
+        """Register exclusion patterns with ZAP before active scanning."""
+        for pattern in self._ASCAN_EXCLUDES:
+            try:
+                await self._zap(
+                    client, "ascan/action/addExcludedURL/", regex=pattern,
+                )
+            except Exception as exc:
+                logger.debug(f"[zap] Could not add exclusion {pattern!r}: {exc}")
+        logger.info(f"[zap] Registered {len(self._ASCAN_EXCLUDES)} ascan exclusion patterns")
 
     # ── Active scan ────────────────────────────────────────────────────────────
 
