@@ -24,6 +24,11 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+      # Raise consumer_timeout to 4 hours (14 400 000 ms).
+      # Default is 30 min — too short for ZAP, nuclei, sqlmap on large targets.
+      # RabbitMQ 3.12 introduced this as a server-wide setting; the Erlang flag
+      # below sets it via the additional_erl_args mechanism.
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit consumer_timeout 14400000"
     ports:
       - "5672:5672"
       - "15672:15672"

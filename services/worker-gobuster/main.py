@@ -127,10 +127,9 @@ class GobusterWorker(BaseWorker):
             "--timeout", f"{timeout}s",
             "--no-progress",
             "--output", OUTPUT_FILE,
-            # Continue even if the target returns a wildcard response for
-            # non-existent paths (e.g. Heroku apps returning 503 for everything).
-            # Without this flag gobuster exits with an error immediately.
-            "--wildcard",
+            # NOTE: --wildcard was removed in gobuster ≥3.5; wildcard detection is
+            # now always-on.  The flag causes "flag provided but not defined" crash
+            # on the installed version, so it must NOT be here.
             # Positive status codes — we want to see 200/30x/401/403/405.
             # 503 is explicitly excluded: it means the host is overloaded and
             # would flood results with false positives.
