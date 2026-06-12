@@ -64,6 +64,7 @@ class HTTPXWorker(BaseWorker):
             "-content-length",
             "-title",
             "-tech-detect",
+            "-hash", "md5",
             "-threads", str(self.threads),
             "-rate-limit", str(self.rate_limit),
             "-timeout", "10",
@@ -118,8 +119,12 @@ class HTTPXWorker(BaseWorker):
                 if stderr_output:
                     logger.warning(f"httpx-pd exited {process.returncode}: {stderr_output[:300]}")
             
-            logger.info(f"Found {len(results)} results from {len(unique_endpoints)} endpoints")
-            return results
+            live_results = self._filter_and_dedup(results)
+            logger.info(
+                f"Found {len(live_results)} live 2XX endpoints "
+                f"(from {len(results)} probed, {len(unique_endpoints)} unique targets)"
+            )
+            return live_results
             
         except asyncio.TimeoutError:
             logger.error(f"HTTPX timed out after {self.timeout}s")
@@ -131,20 +136,17 @@ class HTTPXWorker(BaseWorker):
             logger.error(f"Execution failed: {e}", exc_info=True)
             return []
 
-    # ✅ ИСПРАВЛЕННАЯ СИГНАТУРА: data: Dict[str, Any]
     def _process_result(self, data: Dict[str, Any], results_list: List):
         url = data.get("url") or data.get("input")
         if not url:
             return
-        
+
         status = data.get("status_code", 0)
-        severity = SeverityLevel.medium if status >= 500 else SeverityLevel.low if status in [401, 403, 407] else SeverityLevel.info
-        
         results_list.append({
             "url": url,
             "type": "probe_result",
             "description": f"HTTP {status} - {data.get('title', '')[:80]}",
-            "severity": severity,
+            "severity": SeverityLevel.info,
             "status_code": status,
             "content_type": data.get("content_type", ""),
             "content_length": data.get("content_length", 0),
@@ -152,8 +154,36 @@ class HTTPXWorker(BaseWorker):
             "technologies": data.get("tech", []),
             "web_server": data.get("webserver", ""),
             "response_time_ms": data.get("response-time", 0),
-            "raw_output": data
+            "_content_hash": data.get("hash", ""),
+            "raw_output": {**data, "status_code": status},
         })
+
+    def _filter_and_dedup(self, results: List[Dict]) -> List[Dict]:
+        """Keep only 2XX responses; deduplicate by content fingerprint."""
+        live = [r for r in results if 200 <= r.get("status_code", 0) <= 299]
+
+        seen: set = set()
+        deduped = []
+        for r in live:
+            content_hash = r.pop("_content_hash", "") or ""
+            if content_hash:
+                fp = f"hash:{content_hash}"
+            else:
+                # Fallback: title + content-length is a reasonable proxy
+                fp = f"title:{r.get('title', '')}|len:{r.get('content_length', 0)}"
+
+            if fp in seen:
+                continue
+            seen.add(fp)
+            deduped.append(r)
+
+        skipped_status = len(results) - len(live)
+        skipped_dup = len(live) - len(deduped)
+        if skipped_status:
+            logger.info(f"[httpx] Filtered out {skipped_status} non-2XX response(s)")
+        if skipped_dup:
+            logger.info(f"[httpx] Content dedup: removed {skipped_dup} endpoint(s) returning identical page")
+        return deduped
 
 
 async def main():

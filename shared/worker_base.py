@@ -156,22 +156,34 @@ class BaseWorker(ABC):
     # ── Message handling ───────────────────────────────────────────────────────
 
     async def _on_message(self, message: aio_pika.IncomingMessage):
-        async with message.process(ignore_processed=True):
-            try:
-                body = json.loads(message.body.decode())
-                scan_id = body.get("scan_id", "?")
-                logger.info(f"[{self.tool_name}] Task received for scan {scan_id}")
+        try:
+            async with message.process(ignore_processed=True):
+                try:
+                    body = json.loads(message.body.decode())
+                    scan_id = body.get("scan_id", "?")
+                    logger.info(f"[{self.tool_name}] Task received for scan {scan_id}")
 
-                worker_timeout = int(os.getenv("WORKER_TIMEOUT", "3600"))
-                await asyncio.wait_for(self._process_task(body), timeout=worker_timeout)
+                    worker_timeout = int(os.getenv("WORKER_TIMEOUT", "3600"))
+                    await asyncio.wait_for(self._process_task(body), timeout=worker_timeout)
 
-            except asyncio.TimeoutError:
-                scan_id = json.loads(message.body.decode()).get("scan_id", "?")
-                logger.error(f"[{self.tool_name}] Task timed out for scan {scan_id}")
-                await self._update_step_status(scan_id, ScanStatus.failed)
-                await self._publish_completion(scan_id, "failed")
-            except Exception as exc:
-                logger.error(f"[{self.tool_name}] Unhandled error: {exc}", exc_info=True)
+                except asyncio.TimeoutError:
+                    scan_id = json.loads(message.body.decode()).get("scan_id", "?")
+                    logger.error(f"[{self.tool_name}] Task timed out for scan {scan_id}")
+                    await self._update_step_status(scan_id, ScanStatus.failed)
+                    await self._publish_completion(scan_id, "failed")
+                except Exception as exc:
+                    logger.error(f"[{self.tool_name}] Unhandled error: {exc}", exc_info=True)
+        except asyncio.CancelledError:
+            # Worker is shutting down — let it propagate so the event loop can stop cleanly.
+            # The message was not acked; RabbitMQ will redeliver it after reconnect.
+            raise
+        except Exception as exc:
+            # Channel was closed (reconnect, broker restart) while __aexit__ tried to
+            # ack/nack the message.  Log and swallow — the robust connection will
+            # re-establish the channel and the message will be redelivered automatically.
+            logger.warning(
+                f"[{self.tool_name}] Message ack/nack failed (channel closed): {exc}"
+            )
 
     async def _process_task(self, payload: Dict[str, Any]):
         import time as _time
