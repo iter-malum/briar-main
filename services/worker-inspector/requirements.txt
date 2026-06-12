@@ -3,3 +3,4 @@ aio-pika==9.4.1
 sqlalchemy==2.0.31
 asyncpg==0.29.0
 pydantic==2.7.4
+prometheus_client==0.20.0

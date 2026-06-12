@@ -93,11 +93,19 @@ RISK_MAP = {
 class ZAPWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="zap", queue_name="scan.dast.zap")
-        self.timeout         = int(os.getenv("ZAP_TIMEOUT",         "3600"))
-        self.zap_port        = int(os.getenv("ZAP_PORT",            "8090"))
-        self.api_key         = os.getenv("ZAP_API_KEY",             "briar-zap-api-key-2024")
-        self.max_duration    = int(os.getenv("ZAP_MAX_DURATION",    "120"))   # minutes
-        self.ajax_timeout    = int(os.getenv("ZAP_AJAX_TIMEOUT",    "120"))   # seconds
+        self.timeout             = int(os.getenv("ZAP_TIMEOUT",             "3600"))
+        self.zap_port            = int(os.getenv("ZAP_PORT",                "8090"))
+        self.api_key             = os.getenv("ZAP_API_KEY",                 "briar-zap-api-key-2024")
+        # Max total active-scan duration in MINUTES (ZAP -config scanner.maxDuration).
+        # Keep well below RabbitMQ consumer_timeout (now 4 h) and WORKER_TIMEOUT.
+        self.max_duration        = int(os.getenv("ZAP_MAX_DURATION",        "20"))    # minutes
+        # Max duration for a single active-scan rule in MINUTES.
+        # Without this, one broken rule can stall the entire scan indefinitely.
+        self.max_rule_duration   = int(os.getenv("ZAP_MAX_RULE_DURATION",   "2"))     # minutes
+        self.ajax_timeout        = int(os.getenv("ZAP_AJAX_TIMEOUT",        "120"))   # seconds
+        # Python-side deadline for the ascan poll loop (seconds).
+        # Must be > max_duration*60 to let ZAP stop itself first; 25 min gives buffer.
+        self.ascan_deadline      = int(os.getenv("ZAP_ASCAN_DEADLINE",      "1500"))  # seconds
         self.install_addons  = os.getenv("ZAP_INSTALL_ADDONS", "true").lower() not in ("false", "0", "no")
 
     # ── ZAP base URL ───────────────────────────────────────────────────────────
@@ -205,7 +213,10 @@ class ZAPWorker(BaseWorker):
 
                 # ── Phase 4: Active Scan ───────────────────────────────────────
                 ascan_id = await self._start_ascan(client, base_url)
-                await self._wait_scan(client, "ascan", ascan_id)
+                # Use a tighter deadline for the active scan so the Python loop
+                # exits cleanly before RabbitMQ's consumer_timeout fires.
+                await self._wait_scan(client, "ascan", ascan_id,
+                                      deadline_secs=self.ascan_deadline)
 
                 return await self._collect_alerts(client, base_url)
 
@@ -222,7 +233,27 @@ class ZAPWorker(BaseWorker):
 
     # ── ZAP daemon management ──────────────────────────────────────────────────
 
+    async def _kill_stale_zap(self):
+        """
+        Kill any leftover ZAP process from a previous (timed-out) run.
+        Without this, a redelivered task finds the port already in use and fails
+        immediately with 'All connection attempts failed'.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pkill", "-f", f"zap.*port.*{self.zap_port}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=5)
+            await asyncio.sleep(2)  # give the port time to release
+        except Exception:
+            pass  # no stale process — that's fine
+
     async def _start_zap_daemon(self) -> asyncio.subprocess.Process:
+        # Clean up any previous ZAP instance before starting a new one.
+        await self._kill_stale_zap()
+
         cmd = [
             "/zap/zap.sh",
             "-daemon",
@@ -230,9 +261,11 @@ class ZAPWorker(BaseWorker):
             "-host",   "127.0.0.1",
             "-config", f"api.key={self.api_key}",
             "-config", "api.disablekey=false",
+            # Hard cap on total active scan time — ZAP stops itself cleanly.
             "-config", f"scanner.maxDuration={self.max_duration}",
+            # Per-rule cap — prevents a single slow rule from blocking the scan.
+            "-config", f"scanner.maxRuleDurationInMins={self.max_rule_duration}",
             "-config", "spider.maxDuration=5",
-            # Enable all attack strength levels by default
             "-config", "ascan.attackPolicy=Default Policy",
         ]
         logger.info(f"[zap] Starting ZAP daemon on port {self.zap_port}")
@@ -451,13 +484,19 @@ class ZAPWorker(BaseWorker):
     # ── Poll until done ────────────────────────────────────────────────────────
 
     async def _wait_scan(
-        self, client: httpx.AsyncClient, scan_type: str, scan_id: str
+        self,
+        client: httpx.AsyncClient,
+        scan_type: str,
+        scan_id: str,
+        deadline_secs: int | None = None,
     ):
         """
         Poll ZAP scan progress until 100 (complete).
         scan_type must be "spider" or "ascan" — these are the actual ZAP API namespaces.
+        deadline_secs overrides self.timeout for scans that need a tighter limit.
         """
-        deadline = asyncio.get_event_loop().time() + self.timeout
+        limit = deadline_secs if deadline_secs is not None else self.timeout
+        deadline = asyncio.get_event_loop().time() + limit
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(10)
             try:

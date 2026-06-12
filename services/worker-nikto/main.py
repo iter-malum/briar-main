@@ -172,21 +172,12 @@ class NiktoWorker(BaseWorker):
         """
         Parse Nikto's JSON output file.
 
-        Expected structure:
-            {
-              "vulnerabilities": [
-                {
-                  "id": "...",
-                  "method": "GET",
-                  "url": "http://...",
-                  "msg": "...",
-                  "references": "...",
-                  "osvdbid": "...",
-                  "osvdblink": "..."
-                },
-                ...
-              ]
-            }
+        Nikto output format varies by version:
+          Old (≤2.1.x): {"vulnerabilities": [{...}, ...]}
+          New (≥2.5.x):  [{...}, ...]   — flat list at root
+          Wrapped array:  [{"vulnerabilities": [{...}]}]  — list of host objects
+
+        We handle all three formats.
         """
         results: List[Dict[str, Any]] = []
 
@@ -210,12 +201,33 @@ class NiktoWorker(BaseWorker):
             logger.error(f"[nikto] Cannot read output file: {exc}")
             return results
 
-        vulnerabilities = data.get("vulnerabilities", [])
-        if not isinstance(vulnerabilities, list):
-            logger.warning("[nikto] Unexpected JSON structure — 'vulnerabilities' is not a list")
+        # Normalise to a flat list of vulnerability dicts regardless of format.
+        vulnerabilities: list = []
+
+        if isinstance(data, list):
+            # Could be [vuln, vuln, ...] or [{"vulnerabilities": [...]}, ...]
+            for item in data:
+                if isinstance(item, dict) and "vulnerabilities" in item:
+                    # New nikto: array of host-scan objects, each with nested list
+                    nested = item.get("vulnerabilities", [])
+                    if isinstance(nested, list):
+                        vulnerabilities.extend(nested)
+                elif isinstance(item, dict):
+                    # Flat list of vuln dicts
+                    vulnerabilities.append(item)
+        elif isinstance(data, dict):
+            # Old nikto: single object with "vulnerabilities" key
+            nested = data.get("vulnerabilities", [])
+            if isinstance(nested, list):
+                vulnerabilities = nested
+            else:
+                logger.warning("[nikto] Unexpected JSON structure")
+                return results
+        else:
+            logger.warning(f"[nikto] Unexpected root type: {type(data).__name__}")
             return results
 
-        for vuln in vulnerabilities:
+        for vuln in vulnerabilities:  # type: ignore[assignment]
             if not isinstance(vuln, dict):
                 continue
 

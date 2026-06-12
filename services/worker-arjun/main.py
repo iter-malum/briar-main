@@ -101,15 +101,18 @@ class ArjunWorker(BaseWorker):
             cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
             headers_dict["Cookie"] = cookie_str
 
-        # Determine HTTP methods
-        method_param = task_payload.get("method", "GET").upper()
+        # Determine HTTP methods.
+        # Default is "GET,POST" — Juice Shop and most REST APIs expose params
+        # in POST JSON bodies, not GET query strings.  Running GET-only finds
+        # almost nothing on modern SPA/API targets.
+        method_param = task_payload.get("method", "GET,POST").upper()
         methods: List[str] = []
         if "GET" in method_param:
             methods.append("GET")
         if "POST" in method_param:
             methods.append("POST")
         if not methods:
-            methods = ["GET"]
+            methods = ["GET", "POST"]
 
         all_results: List[Dict[str, Any]] = []
 

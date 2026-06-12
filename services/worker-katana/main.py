@@ -660,6 +660,14 @@ class KatanaWorker(BaseWorker):
                         ):
                             continue
 
+                        # Rule 4: port-like first segment (e.g. "3000/path/to/file").
+                        # These are runtime-evaluated strings like `${port}/${path}`
+                        # captured literally; resolving them with urljoin produces
+                        # double-path URLs such as:
+                        #   http://host:3000/.well-known/3000/.well-known/chunk.js
+                        if _parts and re.match(r"^\d{2,5}$", _parts[0]):
+                            continue
+
                         # Resolve to absolute URL
                         if raw_path.startswith("/"):
                             abs_url = origin + raw_path
