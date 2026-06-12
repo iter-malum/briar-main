@@ -1,60 +1,52 @@
 /**
- * EndpointTree
- * ============
- * Visualises discovered endpoints as a living tree that grows upward:
- *   - Root  (trunk)  = target domain            — bottom of the canvas
- *   - Nodes (branch) = URL path segments         — middle layers
- *   - Leaves         = concrete endpoint+method  — top of the canvas
+ * EndpointTree — Radial tree visualisation
+ * =========================================
+ * Root (domain) sits at the centre.
+ * Path-segment branches radiate outward.
+ * Endpoint leaves appear as small method-coloured dots at the tips.
  *
- * Built with d3-hierarchy for layout + pure SVG rendering.
- * Supports: expand/collapse branches, click-to-detail, search filter.
+ * Layout engine: d3-hierarchy tree in polar coordinates.
+ * Rendering:     pure SVG — no canvas, no WebGL.
+ * Interactions:  pan (drag), zoom (wheel/buttons), collapse (click branch),
+ *                detail panel (click leaf).
  */
 
 import {
   useMemo, useState, useRef, useEffect, useCallback,
 } from 'react'
 import { hierarchy, tree as d3tree } from 'd3-hierarchy'
-import type { HierarchyPointNode, HierarchyPointLink } from 'd3-hierarchy'
-import { Search, X, ExternalLink, ChevronRight, ChevronDown } from 'lucide-react'
+import type { HierarchyPointNode } from 'd3-hierarchy'
+import { Search, X, ExternalLink, ZoomIn, ZoomOut, Maximize2 } from 'lucide-react'
 import type { EndpointItem } from '../api/client'
 
-// ── Layout constants ──────────────────────────────────────────────────────────
+// ── Constants ─────────────────────────────────────────────────────────────────
 
-const LEAF_W     = 180   // leaf (endpoint) pill width
-const SEG_W      = 110   // segment branch node width
-const ROOT_W     = 160   // root node width
-const NODE_H     = 24    // node height (all types)
-const LEVEL_H    = 70    // vertical distance between levels
-const NODE_SEP   = 195   // horizontal space allocated per node by d3.tree
-const PAD_X      = 40    // horizontal padding around the tree
-const PAD_BOTTOM = 44    // space below root
-const PAD_TOP    = 30    // space above top leaves
+const LEVEL_R   = 120   // radial distance between depth levels (px)
+const ROOT_R    = 22    // root node circle radius
+const SEG_R     = 10    // segment (branch) node radius
+const LEAF_R    = 5     // leaf (endpoint) dot radius
+const MIN_ZOOM  = 0.15
+const MAX_ZOOM  = 4
 
 // ── Colours ───────────────────────────────────────────────────────────────────
 
-const METHOD_CLR: Record<string, { fill: string; text: string }> = {
-  GET:     { fill: 'rgba(16,185,129,.15)',  text: '#10b981' },
-  POST:    { fill: 'rgba(56,189,248,.15)',  text: '#38bdf8' },
-  PUT:     { fill: 'rgba(234,179,8,.15)',   text: '#eab308' },
-  PATCH:   { fill: 'rgba(245,158,11,.15)',  text: '#f59e0b' },
-  DELETE:  { fill: 'rgba(239,68,68,.15)',   text: '#ef4444' },
-  OPTIONS: { fill: 'rgba(167,139,250,.15)', text: '#a78bfa' },
-  HEAD:    { fill: 'rgba(148,163,184,.15)', text: '#94a3b8' },
+const METHOD_CLR: Record<string, { fill: string; stroke: string }> = {
+  GET:     { fill: '#10b981', stroke: 'rgba(16,185,129,.4)' },
+  POST:    { fill: '#38bdf8', stroke: 'rgba(56,189,248,.4)' },
+  PUT:     { fill: '#eab308', stroke: 'rgba(234,179,8,.4)' },
+  PATCH:   { fill: '#f59e0b', stroke: 'rgba(245,158,11,.4)' },
+  DELETE:  { fill: '#ef4444', stroke: 'rgba(239,68,68,.4)' },
+  OPTIONS: { fill: '#a78bfa', stroke: 'rgba(167,139,250,.4)' },
+  HEAD:    { fill: '#94a3b8', stroke: 'rgba(148,163,184,.4)' },
 }
+const METHOD_DEFAULT = { fill: '#94a3b8', stroke: 'rgba(148,163,184,.4)' }
 
 function methodClr(m: string) {
-  return METHOD_CLR[m?.toUpperCase()] ?? { fill: 'rgba(148,163,184,.15)', text: '#94a3b8' }
+  return METHOD_CLR[m?.toUpperCase()] ?? METHOD_DEFAULT
 }
 
-function statusClr(code: number): string {
-  if (!code)       return '#475569'
-  if (code < 300)  return '#10b981'
-  if (code < 400)  return '#eab308'
-  return '#ef4444'
-}
-
-function trunc(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max - 1) + '…' : s
+function trunc(s: string, n: number) {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s
 }
 
 // ── Tree data model ───────────────────────────────────────────────────────────
@@ -66,10 +58,9 @@ interface TreeNode {
   endpoint?:     EndpointItem
   fullPath:      string
   children:      TreeNode[]
-  endpointCount: number   // total live endpoints in this subtree
+  endpointCount: number
 }
 
-// Build hierarchical tree from flat endpoint list.
 function buildTree(endpoints: EndpointItem[], domain: string): TreeNode {
   const root: TreeNode = {
     id: '__root__', label: domain, type: 'root',
@@ -78,13 +69,13 @@ function buildTree(endpoints: EndpointItem[], domain: string): TreeNode {
 
   for (const ep of endpoints) {
     let pathname = '/'
-    try { pathname = new URL(ep.url).pathname } catch { /* keep / */ }
+    try { pathname = new URL(ep.url).pathname } catch { /**/ }
 
-    const segments = pathname.replace(/\/$/, '').split('/').filter(Boolean)
+    const segs = pathname.replace(/\/$/, '').split('/').filter(Boolean)
     let cur = root
     let pathSoFar = ''
 
-    for (const seg of segments) {
+    for (const seg of segs) {
       pathSoFar += '/' + seg
       let child = cur.children.find(c => c.type === 'segment' && c.label === seg)
       if (!child) {
@@ -97,369 +88,108 @@ function buildTree(endpoints: EndpointItem[], domain: string): TreeNode {
       cur = child
     }
 
-    // leaf — one per (url, method) pair
     const leafId = `ep:${ep.method}:${ep.url}`
     if (!cur.children.find(c => c.id === leafId)) {
       cur.children.push({
-        id: leafId,
-        label: `${ep.method} ${pathname || '/'}`,
-        type: 'endpoint',
-        endpoint: ep,
-        fullPath: pathname || '/',
-        children: [],
-        endpointCount: 1,
+        id: leafId, label: `${ep.method} ${pathname || '/'}`,
+        type: 'endpoint', endpoint: ep,
+        fullPath: pathname || '/', children: [], endpointCount: 1,
       })
     }
   }
 
-  // Propagate endpoint counts upward
-  const count = (n: TreeNode): number => {
+  const countUp = (n: TreeNode): number => {
     if (n.type === 'endpoint') { n.endpointCount = 1; return 1 }
-    const total = n.children.reduce((s, c) => s + count(c), 0)
-    n.endpointCount = total
-    return total
+    const t = n.children.reduce((s, c) => s + countUp(c), 0)
+    n.endpointCount = t; return t
   }
-  count(root)
-
+  countUp(root)
   return root
 }
 
-// Prune collapsed branches before passing to d3-hierarchy
 function applyCollapse(node: TreeNode, collapsed: Set<string>): TreeNode {
   if (node.type === 'endpoint') return node
   if (collapsed.has(node.id)) return { ...node, children: [] }
   return { ...node, children: node.children.map(c => applyCollapse(c, collapsed)) }
 }
 
-// ── SVG sub-components ────────────────────────────────────────────────────────
+// ── Polar ↔ Cartesian ─────────────────────────────────────────────────────────
 
-// Organic branch curve from child (top) to parent (bottom)
-function BranchCurve({
-  src, dst, weight,
-}: {
-  src: { x: number; y: number }   // child position (flipped = top)
-  dst: { x: number; y: number }   // parent position (flipped = bottom)
-  weight: number                  // stroke width proportional to descendants
-}) {
-  const midY = (src.y + dst.y) / 2
-  const d = `M ${src.x} ${src.y} C ${src.x} ${midY}, ${dst.x} ${midY}, ${dst.x} ${dst.y}`
-  const opacity = weight > 1.5 ? 0.45 : 0.28
-  return (
-    <path
-      d={d}
-      fill="none"
-      stroke={`rgba(245,158,11,${opacity})`}
-      strokeWidth={weight}
-      strokeLinecap="round"
-    />
-  )
+/** d3 tree angles start from top and increase clockwise */
+function polar(angle: number, r: number) {
+  const a = angle - Math.PI / 2
+  return { x: r * Math.cos(a), y: r * Math.sin(a) }
 }
 
-// Root node (trunk)
-function RootNode({
-  cx, cy, label, count,
-}: {
-  cx: number; cy: number; label: string; count: number
-}) {
-  const w = ROOT_W, h = NODE_H + 6
-  return (
-    <g transform={`translate(${cx}, ${cy})`}>
-      {/* glow halo */}
-      <rect
-        x={-w / 2 - 3} y={-h / 2 - 3}
-        width={w + 6} height={h + 6}
-        rx={11} fill="rgba(245,158,11,0.08)"
-      />
-      {/* main rect */}
-      <rect
-        x={-w / 2} y={-h / 2}
-        width={w} height={h}
-        rx={8}
-        fill="#f59e0b"
-        stroke="rgba(245,158,11,0.6)"
-        strokeWidth={1}
-      />
-      <text
-        x={0} y={-2}
-        textAnchor="middle"
-        fill="#1a0e00"
-        fontSize={11}
-        fontWeight={700}
-        fontFamily="JetBrains Mono, monospace"
-      >
-        {trunc(label, 20)}
-      </text>
-      <text
-        x={0} y={10}
-        textAnchor="middle"
-        fill="rgba(0,0,0,0.5)"
-        fontSize={8}
-      >
-        {count} ep
-      </text>
-    </g>
-  )
-}
-
-// Segment (branch) node
-function SegmentNode({
-  cx, cy, label, count, isCollapsed, isHovered,
-  onClick,
-}: {
-  cx: number; cy: number
-  label: string; count: number
-  isCollapsed: boolean
-  isHovered: boolean
-  onClick: () => void
-}) {
-  const w = SEG_W, h = NODE_H
-  const hasChildren = count > 0
-
-  return (
-    <g
-      transform={`translate(${cx}, ${cy})`}
-      onClick={onClick}
-      style={{ cursor: hasChildren ? 'pointer' : 'default' }}
-    >
-      {/* hit area */}
-      <rect x={-w / 2 - 3} y={-h / 2 - 3} width={w + 6} height={h + 6} rx={8} fill="transparent" />
-      {/* body */}
-      <rect
-        x={-w / 2} y={-h / 2}
-        width={w} height={h}
-        rx={5}
-        fill={isHovered ? '#242121' : '#1c1a1a'}
-        stroke={isHovered ? 'rgba(245,158,11,0.5)' : '#2e2b2b'}
-        strokeWidth={1}
-      />
-      {/* left accent bar */}
-      <rect
-        x={-w / 2} y={-h / 2}
-        width={3} height={h}
-        rx={1}
-        fill="rgba(245,158,11,0.35)"
-      />
-
-      {/* collapse chevron */}
-      {hasChildren && (
-        <text x={-w / 2 + 8} y={3} fill="rgba(245,158,11,0.7)" fontSize={8} fontWeight={700}>
-          {isCollapsed ? '▶' : '▼'}
-        </text>
-      )}
-
-      {/* segment label */}
-      <text
-        x={hasChildren ? -w / 2 + 20 : -w / 2 + 8}
-        y={3}
-        fill="#e2e8f0"
-        fontSize={10}
-        fontFamily="JetBrains Mono, monospace"
-      >
-        {trunc('/' + label, hasChildren ? 10 : 13)}
-      </text>
-
-      {/* endpoint count badge */}
-      {count > 0 && (
-        <>
-          <rect
-            x={w / 2 - 24} y={-7}
-            width={20} height={14}
-            rx={7}
-            fill="rgba(245,158,11,0.12)"
-            stroke="rgba(245,158,11,0.25)"
-            strokeWidth={1}
-          />
-          <text
-            x={w / 2 - 14} y={3}
-            textAnchor="middle"
-            fill="#f59e0b"
-            fontSize={8}
-            fontWeight={600}
-          >
-            {count > 99 ? '99+' : count}
-          </text>
-        </>
-      )}
-    </g>
-  )
-}
-
-// Endpoint leaf node
-function LeafNode({
-  cx, cy, endpoint, isSelected, isHovered, isDimmed,
-  onClick,
-}: {
-  cx: number; cy: number
-  endpoint: EndpointItem
-  isSelected: boolean
-  isHovered: boolean
-  isDimmed: boolean
-  onClick: () => void
-}) {
-  const w = LEAF_W, h = NODE_H
-  const mc = methodClr(endpoint.method)
-  const sc = statusClr(endpoint.status_code)
-  const method = (endpoint.method || 'GET').toUpperCase().slice(0, 6)
-  const methodW = Math.max(method.length * 6 + 8, 30)
-
-  let pathname = '/'
-  try { pathname = new URL(endpoint.url).pathname } catch {}
-  const pathLabel = trunc(pathname, 18)
-
-  return (
-    <g
-      transform={`translate(${cx}, ${cy})`}
-      onClick={onClick}
-      style={{ cursor: 'pointer', opacity: isDimmed ? 0.3 : 1 }}
-    >
-      {/* hit area */}
-      <rect x={-w / 2 - 2} y={-h / 2 - 2} width={w + 4} height={h + 4} rx={13} fill="transparent" />
-
-      {/* body */}
-      <rect
-        x={-w / 2} y={-h / 2}
-        width={w} height={h}
-        rx={11}
-        fill={isSelected ? 'rgba(245,158,11,0.12)' : isHovered ? '#242121' : '#1c1a1a'}
-        stroke={isSelected ? '#f59e0b' : isHovered ? 'rgba(245,158,11,0.35)' : '#2e2b2b'}
-        strokeWidth={isSelected ? 1.5 : 1}
-      />
-
-      {/* method badge */}
-      <rect
-        x={-w / 2 + 4} y={-h / 2 + 3}
-        width={methodW} height={h - 6}
-        rx={7}
-        fill={mc.fill}
-      />
-      <text
-        x={-w / 2 + 4 + methodW / 2}
-        y={3}
-        textAnchor="middle"
-        fill={mc.text}
-        fontSize={8}
-        fontWeight={700}
-        fontFamily="JetBrains Mono, monospace"
-      >
-        {method}
-      </text>
-
-      {/* path */}
-      <text
-        x={-w / 2 + methodW + 10}
-        y={3}
-        fill="#cbd5e1"
-        fontSize={9}
-        fontFamily="JetBrains Mono, monospace"
-      >
-        {pathLabel}
-      </text>
-
-      {/* status dot + code */}
-      {endpoint.status_code > 0 && (
-        <>
-          <circle cx={w / 2 - 20} cy={0} r={2.5} fill={sc} />
-          <text
-            x={w / 2 - 15}
-            y={3}
-            textAnchor="start"
-            fill={sc}
-            fontSize={8}
-            fontFamily="JetBrains Mono, monospace"
-          >
-            {endpoint.status_code}
-          </text>
-        </>
-      )}
-    </g>
-  )
+/** Cubic-bezier branch curve between two nodes in polar layout */
+function radialPath(
+  sa: number, sr: number,   // source angle, radius
+  ta: number, tr: number,   // target angle, radius
+): string {
+  const s  = polar(sa, sr)
+  const t  = polar(ta, tr)
+  // Control points at the midpoint radius, each aimed along its own radial
+  const mr = (sr + tr) / 2
+  const c1 = polar(sa, mr)
+  const c2 = polar(ta, mr)
+  return `M ${s.x},${s.y} C ${c1.x},${c1.y} ${c2.x},${c2.y} ${t.x},${t.y}`
 }
 
 // ── Detail panel ──────────────────────────────────────────────────────────────
 
-function DetailPanel({
-  endpoint,
-  onClose,
-}: {
-  endpoint: EndpointItem
-  onClose: () => void
-}) {
+function DetailPanel({ endpoint, onClose }: { endpoint: EndpointItem; onClose: () => void }) {
   const mc = methodClr(endpoint.method)
-  const sc = statusClr(endpoint.status_code)
-
   return (
-    <div className="w-72 shrink-0 border-l border-briar-border bg-briar-surface flex flex-col overflow-hidden">
-      {/* header */}
+    <div className="w-72 shrink-0 border-l border-briar-border bg-briar-surface flex flex-col">
       <div className="flex items-center justify-between px-4 py-3 border-b border-briar-border shrink-0">
-        <span className="text-xs font-semibold text-slate-300 uppercase tracking-wide">
-          Endpoint
-        </span>
-        <button onClick={onClose} className="text-slate-500 hover:text-slate-300 p-0.5 rounded">
+        <span className="text-xs font-semibold text-slate-300 uppercase tracking-wide">Endpoint</span>
+        <button onClick={onClose} className="text-slate-500 hover:text-slate-300">
           <X size={14} />
         </button>
       </div>
-
       <div className="flex-1 overflow-y-auto p-4 space-y-4 text-xs">
-        {/* URL */}
         <div>
           <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">URL</p>
-          <a
-            href={endpoint.url}
-            target="_blank"
-            rel="noreferrer"
-            className="flex items-start gap-1 text-briar-accent hover:underline break-all font-mono leading-snug"
-          >
+          <a href={endpoint.url} target="_blank" rel="noreferrer"
+            className="flex items-start gap-1 text-briar-accent hover:underline break-all font-mono leading-snug">
             {endpoint.url}
             <ExternalLink size={10} className="shrink-0 mt-0.5" />
           </a>
         </div>
-
-        {/* method + status */}
         <div className="flex gap-3">
           <div>
             <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">Method</p>
-            <span
-              className="px-2 py-0.5 rounded text-xs font-mono font-bold"
-              style={{ color: mc.text, background: mc.fill }}
-            >
+            <span className="px-2 py-0.5 rounded text-xs font-mono font-bold"
+              style={{ color: mc.fill, background: mc.stroke }}>
               {endpoint.method || 'GET'}
             </span>
           </div>
           {endpoint.status_code > 0 && (
             <div>
               <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">Status</p>
-              <span className="font-mono font-bold" style={{ color: sc }}>
+              <span className="font-mono font-bold"
+                style={{ color: endpoint.status_code < 300 ? '#10b981' : endpoint.status_code < 400 ? '#eab308' : '#ef4444' }}>
                 {endpoint.status_code}
               </span>
             </div>
           )}
         </div>
-
-        {/* title */}
         {endpoint.title && (
           <div>
             <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">Page title</p>
             <p className="text-slate-300">{endpoint.title}</p>
           </div>
         )}
-
-        {/* tool */}
         <div>
           <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">Discovered by</p>
-          <span className="px-2 py-0.5 rounded bg-briar-surface-2 text-slate-300 font-mono">
-            {endpoint.tool}
-          </span>
+          <span className="px-2 py-0.5 rounded bg-briar-surface-2 text-slate-300 font-mono">{endpoint.tool}</span>
         </div>
-
-        {/* content type */}
         {endpoint.content_type && (
           <div>
             <p className="text-slate-500 mb-1 uppercase tracking-wide text-[10px]">Content-Type</p>
             <p className="text-slate-400 font-mono">{endpoint.content_type}</p>
           </div>
         )}
-
-        {/* params */}
         {endpoint.has_params && endpoint.param_names?.length > 0 && (
           <div>
             <p className="text-slate-500 mb-1.5 uppercase tracking-wide text-[10px]">
@@ -467,11 +197,8 @@ function DetailPanel({
             </p>
             <div className="flex flex-wrap gap-1">
               {endpoint.param_names.map(p => (
-                <span
-                  key={p}
-                  className="px-2 py-0.5 rounded-full text-[10px] font-mono
-                             bg-purple-500/15 text-purple-300 border border-purple-500/25"
-                >
+                <span key={p}
+                  className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-purple-500/15 text-purple-300 border border-purple-500/25">
                   {p}
                 </span>
               ))}
@@ -483,12 +210,93 @@ function DetailPanel({
   )
 }
 
+// ── SVG Node components ───────────────────────────────────────────────────────
+
+function RootCircle({ count, label }: { count: number; label: string }) {
+  return (
+    <g>
+      {/* outer glow ring */}
+      <circle r={ROOT_R + 6} fill="none" stroke="rgba(245,158,11,0.12)" strokeWidth={8} />
+      <circle r={ROOT_R + 2} fill="none" stroke="rgba(245,158,11,0.25)" strokeWidth={2} />
+      {/* body */}
+      <circle r={ROOT_R} fill="#f59e0b" />
+      <text y={-7} textAnchor="middle" fill="#1a0e00"
+        fontSize={10} fontWeight={700} fontFamily="JetBrains Mono, monospace">
+        {trunc(label, 18)}
+      </text>
+      <text y={6} textAnchor="middle" fill="rgba(0,0,0,0.55)" fontSize={8}>
+        {count} endpoints
+      </text>
+    </g>
+  )
+}
+
+function SegmentCircle({
+  label, count, isCollapsed, isHovered, angle,
+}: {
+  label: string; count: number
+  isCollapsed: boolean; isHovered: boolean; angle: number
+}) {
+  // Determine which side label goes on
+  const cosA = Math.cos(angle - Math.PI / 2)
+  const textDir = cosA >= 0 ? 1 : -1
+  const labelOffset = (SEG_R + 6) * textDir
+  const anchor = cosA >= 0 ? 'start' : 'end'
+
+  return (
+    <g>
+      <circle r={SEG_R}
+        fill={isHovered ? '#242121' : '#1c1a1a'}
+        stroke={isHovered ? 'rgba(245,158,11,0.6)' : '#3a3636'}
+        strokeWidth={1.5}
+      />
+      {/* collapse indicator */}
+      {count > 0 && (
+        <text x={isCollapsed ? -1 : 0} y={3.5} textAnchor="middle"
+          fill="rgba(245,158,11,0.8)" fontSize={7} fontWeight={700}>
+          {isCollapsed ? '▶' : '●'}
+        </text>
+      )}
+      {/* path label */}
+      <text x={labelOffset} y={3}
+        textAnchor={anchor}
+        fill="#e2e8f0" fontSize={9}
+        fontFamily="JetBrains Mono, monospace">
+        /{trunc(label, 14)}
+      </text>
+      {/* count badge on collapsed nodes */}
+      {isCollapsed && count > 0 && (
+        <text x={labelOffset + (textDir * (label.length * 5.5 + 6))}
+          y={3} textAnchor={anchor}
+          fill="#f59e0b" fontSize={8}>
+          ({count})
+        </text>
+      )}
+    </g>
+  )
+}
+
+function LeafDot({
+  endpoint, isSelected, isHovered, isDimmed,
+}: {
+  endpoint: EndpointItem; isSelected: boolean; isHovered: boolean; isDimmed: boolean
+}) {
+  const mc = methodClr(endpoint.method)
+  const r  = isSelected ? LEAF_R + 2 : isHovered ? LEAF_R + 1 : LEAF_R
+
+  return (
+    <g style={{ opacity: isDimmed ? 0.2 : 1 }}>
+      {isSelected && (
+        <circle r={r + 4} fill="none" stroke="#f59e0b" strokeWidth={1.5} opacity={0.6} />
+      )}
+      <circle r={r} fill={mc.fill} stroke={mc.stroke} strokeWidth={1} />
+    </g>
+  )
+}
+
 // ── Main component ────────────────────────────────────────────────────────────
 
-interface Props {
-  endpoints:  EndpointItem[]
-  isLoading:  boolean
-}
+interface Props { endpoints: EndpointItem[]; isLoading: boolean }
 
 export default function EndpointTree({ endpoints, isLoading }: Props) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -496,90 +304,120 @@ export default function EndpointTree({ endpoints, isLoading }: Props) {
   const [hovered,   setHovered]   = useState<string | null>(null)
   const [search,    setSearch]    = useState('')
 
+  // Pan / zoom state
+  const [tx, setTx] = useState(0)
+  const [ty, setTy] = useState(0)
+  const [k,  setK]  = useState(0.9)
+  const dragRef = useRef<{ startX: number; startY: number; tx: number; ty: number } | null>(null)
+  const svgRef  = useRef<SVGSVGElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
 
-  // ── Filter endpoints by search ────────────────────────────────────────────
-  const filtered = useMemo(() => {
-    if (!search.trim()) return endpoints
-    const q = search.toLowerCase()
-    return endpoints.filter(
-      ep => ep.url.toLowerCase().includes(q) || ep.method?.toLowerCase().includes(q),
-    )
-  }, [endpoints, search])
-
-  const hasSearch = search.trim().length > 0
-  const filteredIds = useMemo(() => new Set(filtered.map(e => e.url + ':' + e.method)), [filtered])
-
-  // ── Build tree ────────────────────────────────────────────────────────────
-  const rawTree = useMemo(() => {
-    // derive domain from first endpoint
-    let domain = 'target'
-    if (endpoints.length > 0) {
-      try { domain = new URL(endpoints[0].url).hostname } catch {}
+  // ── Filter ──────────────────────────────────────────────────────────────────
+  const q = search.trim().toLowerCase()
+  const filteredIds = useMemo(() => {
+    if (!q) return null
+    const ids = new Set<string>()
+    for (const ep of endpoints) {
+      if (ep.url.toLowerCase().includes(q) || ep.method?.toLowerCase().includes(q))
+        ids.add(`ep:${ep.method}:${ep.url}`)
     }
-    // Build tree from ALL endpoints (search dims nodes, not removes them)
+    return ids
+  }, [endpoints, q])
+
+  // ── Build tree ──────────────────────────────────────────────────────────────
+  const rawTree = useMemo(() => {
+    let domain = 'target'
+    if (endpoints.length > 0) try { domain = new URL(endpoints[0].url).hostname } catch { /**/ }
     return buildTree(endpoints, domain)
   }, [endpoints])
 
-  const visibleTree = useMemo(
-    () => applyCollapse(rawTree, collapsed),
-    [rawTree, collapsed],
-  )
+  const visibleTree = useMemo(() => applyCollapse(rawTree, collapsed), [rawTree, collapsed])
 
-  // ── d3-hierarchy layout ───────────────────────────────────────────────────
-  const layout = useMemo(() => {
-    const root = hierarchy<TreeNode>(visibleTree, n => n.children)
-    // treeLayout() mutates root and returns HierarchyPointNode with x/y filled in
-    const treeLayout = d3tree<TreeNode>().nodeSize([NODE_SEP, LEVEL_H])
-    const pointRoot = treeLayout(root)   // HierarchyPointNode<TreeNode>
+  // ── Radial layout ───────────────────────────────────────────────────────────
+  const { nodes, links, maxRadius } = useMemo(() => {
+    const root  = hierarchy<TreeNode>(visibleTree, n => n.children)
+    const depth = Math.max(root.height, 1)
+    const mr    = depth * LEVEL_R
 
-    // bounding box
-    let minX = Infinity, maxX = -Infinity, maxY = 0
-    pointRoot.each(n => {
-      if (n.x < minX) minX = n.x
-      if (n.x > maxX) maxX = n.x
-      if (n.y > maxY) maxY = n.y
-    })
-
-    const treeWidth = maxX - minX
-    const svgW = treeWidth + PAD_X * 2 + NODE_SEP
-    const svgH = maxY + PAD_BOTTOM + PAD_TOP + NODE_H
-
-    // xCenter: offset so the tree is horizontally centred in the SVG
-    const xCenter = (maxX + minX) / 2
+    d3tree<TreeNode>()
+      .size([2 * Math.PI, mr])
+      .separation((a, b) => (a.parent === b.parent ? 1 : 2) / Math.max(a.depth, 1))(root)
 
     return {
-      nodes:   pointRoot.descendants(),
-      links:   pointRoot.links(),
-      svgW:    Math.max(svgW, 600),
-      svgH:    Math.max(svgH, 300),
-      maxY,
-      xCenter,
+      nodes:     root.descendants() as HierarchyPointNode<TreeNode>[],
+      links:     root.links(),
+      maxRadius: mr,
     }
   }, [visibleTree])
 
-  const toggleCollapse = useCallback((nodeId: string) => {
+  // ── Centre the view on mount / tree change ──────────────────────────────────
+  useEffect(() => {
+    if (!containerRef.current) return
+    const { width, height } = containerRef.current.getBoundingClientRect()
+    setTx(width  / 2)
+    setTy(height / 2)
+    // auto-fit: choose scale so the whole tree fits with 40px padding
+    const fitScale = Math.min(
+      (width  - 80) / (maxRadius * 2),
+      (height - 80) / (maxRadius * 2),
+      1,           // never zoom IN beyond 100% on load
+    )
+    setK(Math.max(fitScale, MIN_ZOOM))
+  }, [maxRadius])
+
+  // ── Zoom helpers ─────────────────────────────────────────────────────────────
+  const zoomBy = useCallback((factor: number) => {
+    setK(prev => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev * factor)))
+  }, [])
+
+  const resetView = useCallback(() => {
+    if (!containerRef.current) return
+    const { width, height } = containerRef.current.getBoundingClientRect()
+    setTx(width / 2); setTy(height / 2)
+    const fitScale = Math.min((width - 80) / (maxRadius * 2), (height - 80) / (maxRadius * 2), 1)
+    setK(Math.max(fitScale, MIN_ZOOM))
+  }, [maxRadius])
+
+  // Wheel zoom toward cursor
+  const onWheel = useCallback((e: React.WheelEvent) => {
+    e.preventDefault()
+    const factor = e.deltaY < 0 ? 1.12 : 0.89
+    const rect = svgRef.current?.getBoundingClientRect()
+    if (!rect) return
+    const cx = e.clientX - rect.left
+    const cy = e.clientY - rect.top
+    setK(prev => {
+      const nk = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, prev * factor))
+      // zoom toward cursor
+      setTx(t => cx - (cx - t) * (nk / prev))
+      setTy(t => cy - (cy - t) * (nk / prev))
+      return nk
+    })
+  }, [])
+
+  // Drag pan
+  const onMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return
+    dragRef.current = { startX: e.clientX, startY: e.clientY, tx, ty }
+  }, [tx, ty])
+
+  const onMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!dragRef.current) return
+    setTx(dragRef.current.tx + e.clientX - dragRef.current.startX)
+    setTy(dragRef.current.ty + e.clientY - dragRef.current.startY)
+  }, [])
+
+  const onMouseUp = useCallback(() => { dragRef.current = null }, [])
+
+  const toggleCollapse = useCallback((id: string) => {
     setCollapsed(prev => {
       const next = new Set(prev)
-      if (next.has(nodeId)) next.delete(nodeId)
-      else next.add(nodeId)
+      next.has(id) ? next.delete(id) : next.add(id)
       return next
     })
   }, [])
 
-  // SVG group origin: root lives at (svgW/2, svgH - PAD_BOTTOM)
-  // Each node is rendered at (node.x - xCenter,  -node.y) relative to origin
-  // → root (y=0):    absolute y = svgH - PAD_BOTTOM  ✓ (bottom)
-  // → leaf (y=maxY): absolute y = svgH - PAD_BOTTOM - maxY ✓ (top)
-
-  const originX = layout.svgW / 2
-  const originY = layout.svgH - PAD_BOTTOM
-
-  const nx = (n: HierarchyPointNode<TreeNode>) => n.x - layout.xCenter
-  const ny = (n: HierarchyPointNode<TreeNode>) => -(n.y)
-
-  // ── Render ─────────────────────────────────────────────────────────────────
-
+  // ── Empty states ─────────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-full text-slate-500 text-sm">
@@ -587,7 +425,6 @@ export default function EndpointTree({ endpoints, isLoading }: Props) {
       </div>
     )
   }
-
   if (endpoints.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full text-slate-500 gap-2 text-sm">
@@ -597,140 +434,142 @@ export default function EndpointTree({ endpoints, isLoading }: Props) {
     )
   }
 
+  // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <div className="flex h-full overflow-hidden bg-briar-bg">
 
-      {/* ── Tree canvas ── */}
-      <div ref={containerRef} className="flex-1 flex flex-col overflow-hidden">
+      {/* ── Canvas ── */}
+      <div ref={containerRef} className="flex-1 flex flex-col overflow-hidden relative">
 
-        {/* Search bar */}
+        {/* Search + controls bar */}
         <div className="shrink-0 px-4 py-2 border-b border-briar-border bg-briar-bg flex items-center gap-3">
           <Search size={13} className="text-slate-500 shrink-0" />
-          <input
-            value={search}
-            onChange={e => setSearch(e.target.value)}
+          <input value={search} onChange={e => setSearch(e.target.value)}
             placeholder="Filter by URL or method…"
-            className="flex-1 bg-transparent text-xs text-slate-200 outline-none placeholder-slate-600"
-          />
+            className="flex-1 bg-transparent text-xs text-slate-200 outline-none placeholder-slate-600" />
           {search && (
-            <button
-              onClick={() => setSearch('')}
-              className="text-slate-500 hover:text-slate-300 transition-colors"
-            >
+            <button onClick={() => setSearch('')} className="text-slate-500 hover:text-slate-300">
               <X size={12} />
             </button>
           )}
-          <span className="text-xs text-slate-600 shrink-0 font-mono">
-            {hasSearch ? `${filtered.length} / ` : ''}{endpoints.length}
-          </span>
+          <span className="text-xs text-slate-600 font-mono shrink-0">{endpoints.length} ep</span>
+          {/* zoom controls */}
+          <div className="flex items-center gap-1 ml-2">
+            <button onClick={() => zoomBy(1.25)} className="btn-ghost p-1" title="Zoom in"><ZoomIn size={13} /></button>
+            <button onClick={() => zoomBy(0.8)}  className="btn-ghost p-1" title="Zoom out"><ZoomOut size={13} /></button>
+            <button onClick={resetView}           className="btn-ghost p-1" title="Fit"><Maximize2 size={13} /></button>
+          </div>
         </div>
 
-        {/* SVG scroll area */}
-        <div className="flex-1 overflow-auto">
+        {/* SVG */}
+        <div className="flex-1 overflow-hidden">
           <svg
-            width={layout.svgW}
-            height={layout.svgH}
-            style={{ display: 'block', minWidth: '100%' }}
+            ref={svgRef}
+            width="100%" height="100%"
+            style={{ cursor: dragRef.current ? 'grabbing' : 'grab', display: 'block' }}
+            onWheel={onWheel}
+            onMouseDown={onMouseDown}
+            onMouseMove={onMouseMove}
+            onMouseUp={onMouseUp}
+            onMouseLeave={onMouseUp}
           >
-            {/* subtle radial ambient behind the root trunk */}
-            <defs>
-              <radialGradient id="trunk-glow" cx="50%" cy="100%" r="40%">
-                <stop offset="0%"   stopColor="rgba(245,158,11,0.08)" />
-                <stop offset="100%" stopColor="rgba(245,158,11,0)" />
-              </radialGradient>
-            </defs>
-            <rect
-              x={originX - 200} y={originY - 100}
-              width={400} height={200}
-              fill="url(#trunk-glow)"
-            />
-
-            <g transform={`translate(${originX}, ${originY})`}>
+            {/* subtle radial grid rings for depth reference */}
+            <g transform={`translate(${tx},${ty}) scale(${k})`} style={{ userSelect: 'none' }}>
+              {Array.from({ length: Math.ceil(maxRadius / LEVEL_R) }, (_, i) => (
+                <circle key={i} r={(i + 1) * LEVEL_R}
+                  fill="none" stroke="rgba(46,43,43,0.6)" strokeWidth={1} strokeDasharray="3,5" />
+              ))}
 
               {/* ── Branch curves ── */}
-              {layout.links.map((link, i) => {
-                const src = link.target
-                const dst = link.source
-                // stroke weight by descendant count — trunk is thicker
-                const weight = Math.max(
-                  1,
-                  Math.log2((dst.data.endpointCount ?? 1) + 1) * 1.4,
-                )
+              {links.map((lnk, i) => {
+                const src = lnk.source as HierarchyPointNode<TreeNode>
+                const tgt = lnk.target as HierarchyPointNode<TreeNode>
+                const isLeafLink = tgt.data.type === 'endpoint'
+                const weight = isLeafLink
+                  ? 1
+                  : Math.max(1, Math.log2((src.data.endpointCount ?? 1) + 1) * 1.2)
+                const opacity = isLeafLink ? 0.22 : Math.min(0.5, 0.25 + (src.data.endpointCount ?? 1) / 60)
                 return (
-                  <BranchCurve
-                    key={i}
-                    src={{ x: nx(src), y: ny(src) }}
-                    dst={{ x: nx(dst), y: ny(dst) }}
-                    weight={weight}
+                  <path key={i}
+                    d={radialPath(src.x, src.y, tgt.x, tgt.y)}
+                    fill="none"
+                    stroke={`rgba(245,158,11,${opacity})`}
+                    strokeWidth={weight}
+                    strokeLinecap="round"
                   />
                 )
               })}
 
               {/* ── Nodes ── */}
-              {layout.nodes.map(n => {
-                const x = nx(n)
-                const y = ny(n)
-                const { id, type, endpoint, label, endpointCount } = n.data
-                const isCollapsed = collapsed.has(id)
+              {nodes.map(n => {
+                const { id, type, label, endpoint, endpointCount } = n.data
+                const pos = polar(n.x, n.y)
+                const isDimmed = !!filteredIds && type === 'endpoint' && !filteredIds.has(id)
+                const isSelected = type === 'endpoint' && !!endpoint &&
+                  selected?.url === endpoint.url && selected?.method === endpoint.method
 
                 if (type === 'root') {
                   return (
-                    <RootNode
-                      key={id}
-                      cx={x} cy={y}
-                      label={label}
-                      count={endpointCount}
-                    />
+                    <g key={id} transform={`translate(0,0)`}>
+                      <RootCircle label={label} count={endpointCount} />
+                    </g>
                   )
                 }
 
                 if (type === 'segment') {
                   return (
-                    <SegmentNode
-                      key={id}
-                      cx={x} cy={y}
-                      label={label}
-                      count={endpointCount}
-                      isCollapsed={isCollapsed}
-                      isHovered={hovered === id}
-                      onClick={() => toggleCollapse(id)}
-                    />
+                    <g key={id}
+                      transform={`translate(${pos.x},${pos.y})`}
+                      style={{ cursor: 'pointer' }}
+                      onClick={e => { e.stopPropagation(); toggleCollapse(id) }}
+                      onMouseEnter={() => setHovered(id)}
+                      onMouseLeave={() => setHovered(null)}
+                    >
+                      <SegmentCircle
+                        label={label}
+                        count={endpointCount}
+                        isCollapsed={collapsed.has(id)}
+                        isHovered={hovered === id}
+                        angle={n.x}
+                      />
+                    </g>
                   )
                 }
 
                 if (type === 'endpoint' && endpoint) {
-                  const epKey = endpoint.url + ':' + endpoint.method
-                  const isDimmed = hasSearch && !filteredIds.has(epKey)
-                  const isSelected = selected?.url === endpoint.url && selected?.method === endpoint.method
                   return (
-                    <LeafNode
-                      key={id}
-                      cx={x} cy={y}
-                      endpoint={endpoint}
-                      isSelected={isSelected}
-                      isHovered={hovered === id}
-                      isDimmed={isDimmed}
-                      onClick={() => setSelected(isSelected ? null : endpoint)}
-                    />
+                    <g key={id}
+                      transform={`translate(${pos.x},${pos.y})`}
+                      style={{ cursor: 'pointer' }}
+                      onClick={e => { e.stopPropagation(); setSelected(isSelected ? null : endpoint) }}
+                      onMouseEnter={() => setHovered(id)}
+                      onMouseLeave={() => setHovered(null)}
+                    >
+                      <LeafDot
+                        endpoint={endpoint}
+                        isSelected={isSelected}
+                        isHovered={hovered === id}
+                        isDimmed={isDimmed}
+                      />
+                    </g>
                   )
                 }
-
                 return null
               })}
-
             </g>
           </svg>
         </div>
 
         {/* Legend */}
         <div className="shrink-0 flex items-center gap-4 px-4 py-2 border-t border-briar-border text-xs text-slate-500">
-          <span className="font-mono text-amber-500/70">⬡ trunk</span>
-          <span>Click segment to collapse/expand</span>
-          <span>Click endpoint for details</span>
+          <span>Drag to pan · Scroll to zoom</span>
+          <span>Click branch to collapse</span>
+          <span>Click dot to inspect</span>
           <div className="ml-auto flex items-center gap-3">
             {Object.entries(METHOD_CLR).slice(0, 5).map(([m, c]) => (
-              <span key={m} style={{ color: c.text }} className="font-mono font-bold text-[10px]">
-                {m}
+              <span key={m} className="flex items-center gap-1">
+                <svg width="8" height="8"><circle cx="4" cy="4" r="4" fill={c.fill} /></svg>
+                <span style={{ color: c.fill }} className="font-mono text-[10px] font-bold">{m}</span>
               </span>
             ))}
           </div>
