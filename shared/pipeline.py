@@ -136,6 +136,14 @@ SQLI_INDICATORS = [
     "sql", "sqli", "sql-injection", "injection",
     "error-based", "time-based", "boolean-based",
     "mysql-error", "postgre-error", "mssql-error",
+    # ZAP active scan rule IDs for SQL injection variants
+    "zap-40018",   # SQL Injection
+    "zap-40019",   # SQL Injection - MySQL
+    "zap-40020",   # SQL Injection - Hypersonic SQL
+    "zap-40021",   # SQL Injection - Oracle
+    "zap-40022",   # SQL Injection - PostgreSQL
+    "zap-40024",   # SQL Injection - SQLite
+    "40018", "40019", "40020", "40021", "40022", "40024",
 ]
 
 # ── Pipeline phase definitions ─────────────────────────────────────────────────
@@ -238,38 +246,55 @@ PHASES: List[Dict] = [
     # DAST tools have the most complete, validated endpoint list.
     # source_tools covers every discovery source so the live-URL filter can
     # pick the best confirmed-alive subset for each tool.
+    #
+    # jwt_tool is non-exploitative (requires_exploit=False in FINDING_ROUTES)
+    # and runs in DAST phase.  It probes the target for JWT exposure and
+    # tests algorithm-confusion + "none" alg + weak-secret flaws.  Juice Shop
+    # and most modern Node apps use JWT — jwt_tool provides real coverage here.
     {
         "id": "dast",
-        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola"},
+        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "jwt_tool"},
         "trigger_after": {"httpx", "ffuf", "gobuster", "arjun"},
         "source_tools": {
-            "nuclei":  ["katana", "ffuf", "gobuster", "httpx"],
-            "zap":     ["katana", "ffuf", "gobuster", "httpx"],
-            "nikto":   ["katana", "httpx"],
-            "dalfox":  ["katana", "ffuf", "gobuster", "httpx", "arjun"],
-            # M11: cors + bola use the full validated endpoint list
-            "cors":    ["katana", "ffuf", "gobuster", "httpx"],
-            "bola":    ["katana", "ffuf", "gobuster", "httpx", "arjun"],
-            # M10: graphql/openapi are finding-triggered (via finding_router), not phase-triggered
+            "nuclei":   ["katana", "ffuf", "gobuster", "httpx"],
+            "zap":      ["katana", "ffuf", "gobuster", "httpx"],
+            "nikto":    ["katana", "httpx"],
+            "dalfox":   ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            "cors":     ["katana", "ffuf", "gobuster", "httpx"],
+            "bola":     ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            # jwt_tool needs the live endpoint list to find JWT-bearing responses
+            "jwt_tool": ["katana", "httpx"],
+            # graphql/openapi are finding-triggered (via finding_router), not phase-triggered
         },
         "requires_explicit": False,
         "requires_sqli": False,
     },
 
     # ── Phase 6: EXPLOIT ──────────────────────────────────────────────────────
-    # Triggered by confirmed findings from both Inspector AND DAST tools.
-    # sqlmap: triggered by sqli_candidate (inspector) OR nuclei/zap SQLi finding
-    # The orchestrator's requires_sqli check scans ALL findings for SQL patterns,
-    # so inspector candidates are automatically included.
+    # Triggered by confirmed findings from DAST + Inspector.
+    #
+    # sqlmap — SQL injection exploitation (requires SQLi finding in DB).
+    # tplmap — SSTI exploitation (requires ssti_candidate finding).
+    # commix — OS command injection (requires cmdi_candidate finding).
+    #
+    # All three require exploit_enabled=True.
+    # The requires_sqli guard is intentionally applied to the entire phase to
+    # prevent exploit tools from running on clean scans — tplmap/commix will
+    # simply find no applicable endpoints from their source tools if no
+    # candidates were emitted by inspector, so the cost is only one empty run.
     {
         "id": "exploit",
-        "tools": {"sqlmap"},
+        "tools": {"sqlmap", "tplmap", "commix"},
         "trigger_after": {"nuclei", "zap", "inspector"},
         "source_tools": {
             "sqlmap": ["nuclei", "zap", "inspector"],
+            # tplmap + commix get their specific target from the finding_router
+            # payload injected by _publish_phase → they use inspector findings
+            "tplmap":  ["inspector"],
+            "commix":  ["inspector"],
         },
         "requires_explicit": True,
-        "requires_sqli": True,
+        "requires_sqli": False,   # sqlmap checks SQLi itself; tplmap/commix have own guards
     },
 ]
 

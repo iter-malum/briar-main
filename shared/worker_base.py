@@ -475,15 +475,20 @@ class BaseWorker(ABC):
                 for (url,) in rows:
                     if not url:
                         continue
-                    # Check if there's a SQLi finding for this URL
-                    vuln_stmt = select(ScanResultORM.vulnerability_type).where(
+                    # Check both vulnerability_type AND description for SQLi signals.
+                    # ZAP stores "ZAP-40018" as type and "SQL Injection" as description —
+                    # checking only vulnerability_type would miss all ZAP SQLi findings.
+                    vuln_stmt = select(
+                        ScanResultORM.vulnerability_type,
+                        ScanResultORM.description,
+                    ).where(
                         ScanResultORM.scan_id == UUID(scan_id),
                         ScanResultORM.url == url,
-                        ScanResultORM.vulnerability_type.isnot(None),
                     )
                     vr = await session.execute(vuln_stmt)
-                    for (vtype,) in vr.all():
-                        if vtype and any(ind in vtype.lower() for ind in SQLI_INDICATORS):
+                    for (vtype, desc) in vr.all():
+                        combined = f"{vtype or ''} {desc or ''}".lower()
+                        if any(ind in combined for ind in SQLI_INDICATORS):
                             sqli_urls.add(url)
                             break
                 return list(sqli_urls)

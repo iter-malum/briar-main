@@ -365,14 +365,23 @@ class PipelineManager:
 
     @staticmethod
     async def _has_sqli_findings(scan_id: str, session: AsyncSession) -> bool:
+        """
+        Return True if any finding for this scan looks like a SQL injection.
+
+        Checks BOTH vulnerability_type AND description so we catch:
+          - Inspector/nuclei native format:  type="sqli_candidate" / "sql-injection"
+          - ZAP format:  type="ZAP-40018",  description="SQL Injection"
+          - Nikto format: description contains "SQL"
+        """
         from shared.models import ScanResultORM
-        stmt = select(ScanResultORM.vulnerability_type).where(
-            ScanResultORM.scan_id == UUID(scan_id),
-            ScanResultORM.vulnerability_type.isnot(None),
-        )
+        stmt = select(
+            ScanResultORM.vulnerability_type,
+            ScanResultORM.description,
+        ).where(ScanResultORM.scan_id == UUID(scan_id))
         result = await session.execute(stmt)
-        for (vtype,) in result.all():
-            if vtype and any(ind in vtype.lower() for ind in SQLI_INDICATORS):
+        for (vtype, desc) in result.all():
+            combined = f"{vtype or ''} {desc or ''}".lower()
+            if any(ind in combined for ind in SQLI_INDICATORS):
                 return True
         return False
 
