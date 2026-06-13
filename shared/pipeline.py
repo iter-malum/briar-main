@@ -356,6 +356,14 @@ APP_TYPE_SIGNATURES: Dict[str, Dict] = {
     "drupal":         {"app_type": "cms", "is_spa": False, "framework": "Drupal"},
     "magento":        {"app_type": "cms", "is_spa": False, "framework": "Magento"},
     "shopify":        {"app_type": "cms", "is_spa": False, "framework": "Shopify"},
+    # Node.js / Express ecosystem — treat as SPA+API target
+    # Juice Shop and many modern apps expose Express + Angular together.
+    # Detecting Express as `app_type=spa` ensures headless AJAX crawling,
+    # correct nuclei tags (nodejs/express), and no traditional-spider explosions.
+    "express":        {"app_type": "spa", "is_spa": True,  "framework": "Express"},
+    "node.js":        {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "socket.io":      {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "connect.sid":    {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     # Traditional MVC — server-rendered, good for standard DAST
     "php":            {"app_type": "traditional", "is_spa": False, "lang": "PHP"},
     "laravel":        {"app_type": "traditional", "is_spa": False, "framework": "Laravel"},

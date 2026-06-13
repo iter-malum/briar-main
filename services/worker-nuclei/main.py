@@ -55,10 +55,26 @@ class NucleiWorker(BaseWorker):
         endpoints: List[str] = task_payload.get("endpoints", [target])
         scan_id: str = task_payload.get("scan_id", "")
 
-        # De-duplicate and write to targets file
+        # Always include the base URL (scheme://host) in the target list.
+        # Most exposure/misconfiguration templates probe well-known paths
+        # (/ftp/, /.git/, /swagger.json, /phpinfo.php, etc.) FROM the root —
+        # they don't activate when given a deep endpoint like /rest/users/42.
+        base_url = ""
+        try:
+            from urllib.parse import urlparse as _up
+            _p = _up(target)
+            if _p.scheme and _p.netloc:
+                base_url = f"{_p.scheme}://{_p.netloc}"
+        except Exception:
+            pass
+
         unique_endpoints = list(dict.fromkeys(ep for ep in endpoints if ep.startswith("http")))
         if not unique_endpoints:
             unique_endpoints = [target]
+
+        # Prepend the base URL so exposure templates always run from root
+        if base_url and base_url not in unique_endpoints:
+            unique_endpoints = [base_url] + unique_endpoints
 
         work_dir = "/tmp/nuclei"
         os.makedirs(work_dir, exist_ok=True)
@@ -110,24 +126,22 @@ class NucleiWorker(BaseWorker):
                 db_tags = await self.get_tech_tags(scan_id)
                 tech_tags.update(db_tags)
 
-            # Always include broad detection categories regardless of app type.
-            # 'exposure' catches sensitive file/directory disclosures (e.g. /ftp/,
-            # backup files, .env).  'misconfig' catches header/TLS issues.
-            # Without these, Juice Shop's directory traversal and file-exposure
-            # challenges are invisible to nuclei.
+            # Always include broad detection categories regardless of app type:
+            # 'exposure' → /ftp/, /.git/, backup files, swagger.json, etc.
+            # 'misconfig' → security headers, TLS, CORS
             tech_tags.update({"exposure", "misconfig"})
 
-            # When app_type is unknown and WhatWeb found nothing, running with a
-            # narrow tag filter produces zero results — nuclei silently skips
-            # all templates that don't match the tiny tag set.
-            # Strategy: omit -tags entirely for unknown apps so nuclei runs its
-            # full template library.  This is slower but finds real issues.
-            if app_type == "unknown" and len(tech_tags) <= 3:
+            if app_type == "unknown":
+                # Drop the tag filter entirely for unknown apps.
+                # A narrow tag set produces zero results because nuclei
+                # skips templates that don't match.  Without -tags, nuclei
+                # runs its complete template library (slower but thorough).
                 logger.info(
-                    f"[nuclei] app_type='unknown' — running without tag filter "
-                    f"for maximum coverage (ignoring computed tags: {sorted(tech_tags)})"
+                    f"[nuclei] app_type='unknown' — running WITHOUT tag filter "
+                    f"for maximum coverage ({len(unique_endpoints)} targets)"
                 )
             else:
+                # Known app type — use targeted tags to keep the scan fast.
                 cmd.extend(["-tags", ",".join(sorted(tech_tags))])
                 logger.info(
                     f"[nuclei] Template tags "

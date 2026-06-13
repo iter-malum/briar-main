@@ -265,6 +265,12 @@ class FFUFWorker(BaseWorker):
             "-mc", mc,
             "-s",          # silent mode — no progress bar to stdout
             "-maxtime", str(self.strategy_timeout),  # hard wall-clock limit
+            # Auto-calibration: ffuf probes the target with random values, learns
+            # the "baseline" (soft-404) response size/words, and filters out results
+            # matching that baseline.  Critical for SPAs (Angular, React) that return
+            # HTTP 200 + identical index.html for every path — without -ac, ffuf
+            # would report every wordlist entry as a "found" path.
+            "-ac",
         ]
 
         # Auth headers

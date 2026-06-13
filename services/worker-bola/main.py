@@ -363,6 +363,20 @@ def _extract_id_templates(endpoints: List[str]) -> List[Dict[str, Any]]:
             if not parts:
                 continue
 
+            # Skip URLs that contain repeated path segments — these are artefacts
+            # of the katana JS-extraction URL-doubling bug and produce false-positive
+            # "unauthenticated access" findings on JavaScript bundle files.
+            # A real resource path never has the same segment appear consecutively
+            # more than once (e.g. /assets/public/assets/public/chunk.js).
+            path_lower = p.path.lower()
+            if "assets/public/assets" in path_lower or "node_modules" in path_lower:
+                continue
+            # Generic check: any segment that appears 3+ times in the path
+            from collections import Counter
+            seg_counts = Counter(parts)
+            if max(seg_counts.values()) >= 3:
+                continue
+
             for i, seg in enumerate(parts):
                 id_type = None
                 if _INT_SEG_RE.match(seg):

@@ -487,34 +487,41 @@ class ZAPWorker(BaseWorker):
 
     # ── Exclusion patterns ────────────────────────────────────────────────────
 
-    # Regex patterns excluded from ZAP active scan.
-    # Covers static assets (.js, .css, images, fonts) and deeply-nested paths
-    # that SPAs generate by resolving relative links on Angular/React routes.
-    _ASCAN_EXCLUDES = [
-        r".*\.js(\?.*)?$",             # JavaScript bundles
-        r".*\.css(\?.*)?$",            # Stylesheets
-        r".*\.map(\?.*)?$",            # Source maps
-        r".*\.(png|jpg|jpeg|gif|svg|ico|webp|bmp|avif)(\?.*)?$",
-        r".*\.(woff2?|ttf|eot|otf)(\?.*)?$",
-        r".*\.(mp3|mp4|webm|ogg|wav)(\?.*)?$",
-        # Paths with repeated segments — signature of SPA link-following explosion
+    # Patterns for URLs that should NOT be active-scanned.
+    # ZAP 2.12+ accepts these via core/action/excludeFromProxy/ which removes
+    # the URL from ZAP's proxy tree entirely — the active scanner never sees them.
+    #
+    # Why excludeFromProxy and not ascan/action/addExcludedURL/:
+    #   The addExcludedURL endpoint returns 400 in ZAP ≥2.12 (renamed/removed).
+    #   excludeFromProxy is stable across all ZAP 2.x versions.
+    _PROXY_EXCLUDES = [
+        # Static asset extensions — no injection surface
+        r".*\.(css|map|woff2?|ttf|eot|otf|ico|png|jpg|jpeg|gif|svg|webp|mp4|webm)(\?.*)?$",
+        # socket.io long-polling — creates many "Session ID in URL" noise findings
+        r".*/socket\.io/.*",
+        # SPA nested paths created by traditional spider recursion
         r".*/assets/public/assets/.*",
         r".*/node_modules/.*",
         r".*/build/routes/.*",
-        # Stack-trace leak patterns (serve-index / express router line refs)
+        # Stack-trace lines leaked as URLs (serve-index / express router)
         r".*\.js:\d+:\d+$",
     ]
 
     async def _add_ascan_exclusions(self, client: httpx.AsyncClient):
-        """Register exclusion patterns with ZAP before active scanning."""
-        for pattern in self._ASCAN_EXCLUDES:
+        """
+        Exclude static/noisy URLs from ZAP's proxy tree so the active scanner
+        focuses on real application endpoints.
+
+        Uses core/action/excludeFromProxy/ (ZAP 2.x stable API).
+        """
+        ok = 0
+        for pattern in self._PROXY_EXCLUDES:
             try:
-                await self._zap(
-                    client, "ascan/action/addExcludedURL/", regex=pattern,
-                )
+                await self._zap(client, "core/action/excludeFromProxy/", regex=pattern)
+                ok += 1
             except Exception as exc:
-                logger.debug(f"[zap] Could not add exclusion {pattern!r}: {exc}")
-        logger.info(f"[zap] Registered {len(self._ASCAN_EXCLUDES)} ascan exclusion patterns")
+                logger.debug(f"[zap] Exclusion failed for {pattern!r}: {exc}")
+        logger.info(f"[zap] Registered {ok}/{len(self._PROXY_EXCLUDES)} proxy exclusion patterns")
 
     # ── Active scan ────────────────────────────────────────────────────────────
 

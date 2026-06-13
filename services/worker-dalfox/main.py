@@ -56,8 +56,6 @@ class DalfoxWorker(BaseWorker):
             logger.info("[dalfox] No endpoints provided — skipping")
             return []
 
-        # XSS scanning only makes sense on URLs with query parameters or POST
-        # bodies. Filter out parameter-less URLs and static assets up front.
         _STATIC_EXTS = frozenset({
             ".css", ".js", ".mjs", ".map",
             ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp", ".bmp",
@@ -73,22 +71,48 @@ class DalfoxWorker(BaseWorker):
             except Exception:
                 return False
 
-        endpoints = [ep for ep in endpoints if _has_params(ep)]
-        if not endpoints:
-            logger.info("[dalfox] No parameterized endpoints found — XSS scan skipped")
+        # Primary targets: GET URLs with query params (reflected XSS candidates)
+        get_targets = [ep for ep in endpoints if _has_params(ep)]
+
+        # Secondary targets: API endpoints without GET params but which likely
+        # reflect input in JSON responses.  Dalfox with --mining-dict will
+        # discover hidden GET/POST parameters automatically.
+        # We add endpoints that look like REST/API paths (no static extension,
+        # no query string) so parameter-less API paths also get tested.
+        def _is_api_endpoint(url: str) -> bool:
+            try:
+                p = urlparse(url)
+                ext = os.path.splitext(p.path.lower())[1]
+                if ext in _STATIC_EXTS:
+                    return False
+                # Focus on REST/API paths that are likely to reflect input
+                api_prefixes = ("/rest/", "/api/", "/graphql", "/v1/", "/v2/")
+                return any(p.path.startswith(pf) for pf in api_prefixes)
+            except Exception:
+                return False
+
+        api_targets = [ep for ep in endpoints if not _has_params(ep) and _is_api_endpoint(ep)]
+        all_targets = list(dict.fromkeys(get_targets + api_targets[:20]))  # cap API targets
+
+        if not all_targets:
+            logger.info("[dalfox] No testable endpoints found — XSS scan skipped")
             return []
 
         waf_bypass   = task_payload.get("waf_bypass", False)
-        mining_dict  = task_payload.get("mining_dict", False)
+        # Enable parameter mining by default — dalfox probes common GET/POST
+        # parameter names, discovering hidden inputs not visible in the URL.
+        # This is especially effective on REST APIs that accept undocumented params.
+        mining_dict  = task_payload.get("mining_dict", True)
         blind_url    = task_payload.get("blind_url", DALFOX_BLIND_URL)
 
         os.makedirs(WORK_DIR, exist_ok=True)
 
         # Write endpoints to targets file
         with open(TARGETS_FILE, "w") as f:
-            f.write("\n".join(endpoints) + "\n")
+            f.write("\n".join(all_targets) + "\n")
 
-        logger.info(f"[dalfox] Scanning {len(endpoints)} endpoint(s)")
+        logger.info(f"[dalfox] Scanning {len(all_targets)} endpoint(s) "
+                    f"({len(get_targets)} GET-param + {len(api_targets[:20])} API)")
 
         # Build command
         cmd = [
