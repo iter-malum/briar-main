@@ -52,9 +52,12 @@ class GobusterWorker(BaseWorker):
         self.default_mode = os.getenv("GOBUSTER_MODE", "dir")
         self.threads = int(os.getenv("GOBUSTER_THREADS", "20"))
         self.timeout = int(os.getenv("GOBUSTER_TIMEOUT", "10"))
+        # raft-medium-words covers both classic paths and REST API segments.
+        # common.txt is web-page oriented and misses most /api/* REST paths.
+        # Override with GOBUSTER_WORDLIST env if a different list is needed.
         self.wordlist = os.getenv(
             "GOBUSTER_WORDLIST",
-            "/usr/share/seclists/Discovery/Web-Content/common.txt",
+            "/usr/share/seclists/Discovery/Web-Content/raft-medium-words.txt",
         )
         self.extensions = os.getenv("GOBUSTER_EXTENSIONS", "php,html,js,txt")
 

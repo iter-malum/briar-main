@@ -75,7 +75,37 @@ MAX_ID_TEMPLATES    = int(os.getenv("BOLA_MAX_TEMPLATES",   "50"))
 REQUEST_TIMEOUT     = float(os.getenv("BOLA_REQUEST_TIMEOUT", "12"))
 CONCURRENCY         = int(os.getenv("BOLA_CONCURRENCY",       "15"))
 TOTAL_TIMEOUT       = int(os.getenv("BOLA_TOTAL_TIMEOUT",    "900"))   # 15 min
-SEQ_PROBE_COUNT     = int(os.getenv("BOLA_SEQ_PROBE_COUNT",    "5"))   # how many IDs to probe
+SEQ_PROBE_COUNT     = int(os.getenv("BOLA_SEQ_PROBE_COUNT",   "20"))   # IDs per template
+# Proactive mode: when crawl yields no integer-bearing URLs, probe these seed paths
+# with ID=1 to discover live REST resources. Covers Juice Shop + common REST patterns.
+SEED_PROBE_IDS      = int(os.getenv("BOLA_SEED_PROBE_IDS",   "20"))
+
+_SEED_RESOURCE_PATHS = [
+    # Juice Shop REST API
+    "/api/Users/{id}",
+    "/api/Products/{id}",
+    "/api/Feedbacks/{id}",
+    "/api/Complaints/{id}",
+    "/api/BasketItems/{id}",
+    "/api/Challenges/{id}",
+    "/api/Quantitys/{id}",
+    "/api/Recycles/{id}",
+    "/api/SecurityAnswers/{id}",
+    "/rest/basket/{id}",
+    # Generic REST conventions
+    "/api/users/{id}",
+    "/api/items/{id}",
+    "/api/orders/{id}",
+    "/api/accounts/{id}",
+    "/api/v1/users/{id}",
+    "/api/v1/items/{id}",
+    "/api/v1/orders/{id}",
+    "/api/v2/users/{id}",
+    "/users/{id}",
+    "/orders/{id}",
+    "/products/{id}",
+    "/accounts/{id}",
+]
 
 # Matches integer path segments that look like DB primary keys (1 – 9_999_999)
 _INT_SEG_RE   = re.compile(r"^\d{1,7}$")
@@ -107,9 +137,42 @@ class BOLAWorker(BaseWorker):
         # Optional second user context for cross-user BOLA test
         second_auth: Optional[Dict[str, Any]] = task_payload.get("second_auth_context")
 
-        # Extract ID-bearing URL templates
+        # Extract ID-bearing URL templates from crawl results
         templates = _extract_id_templates(endpoints)
         templates = templates[:MAX_ID_TEMPLATES]
+
+        # Proactive seed enumeration: when the crawl produced few/no integer-bearing
+        # URLs (common when scanning unauthenticated — Juice Shop returns 401 for most
+        # /api/* paths), probe well-known REST resource patterns directly.
+        # This ensures BOLA tests run even without prior authenticated crawl coverage.
+        if len(templates) < 3:
+            try:
+                from urllib.parse import urlparse as _up
+                _p = _up(target)
+                base_url = f"{_p.scheme}://{_p.netloc}" if _p.scheme and _p.netloc else target
+            except Exception:
+                base_url = target
+
+            auth_headers_tmp = _build_headers(auth_context)
+            async with httpx.AsyncClient(
+                verify=False, follow_redirects=False,
+                timeout=httpx.Timeout(REQUEST_TIMEOUT),
+            ) as probe_client:
+                seed_templates = await _probe_seed_resources(
+                    probe_client, base_url, auth_headers_tmp
+                )
+
+            # Merge: seed templates that aren't already covered by crawl templates
+            seen = {t["template"] for t in templates}
+            for st in seed_templates:
+                if st["template"] not in seen:
+                    templates.append(st)
+                    seen.add(st["template"])
+
+            if seed_templates:
+                logger.info(
+                    f"[bola] Seed probing added {len(seed_templates)} resource template(s)"
+                )
 
         if not templates:
             logger.info("[bola] No ID-bearing endpoints found — skipping")
@@ -341,6 +404,44 @@ class BOLAWorker(BaseWorker):
                 logger.debug(f"[bola] Cross-user test failed for {resource_url}: {exc}")
 
         return findings
+
+
+# ── Proactive seed resource discovery ─────────────────────────────────────────
+
+async def _probe_seed_resources(
+    client: httpx.AsyncClient,
+    base_url: str,
+    auth_headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Probe well-known REST resource paths with ID=1.
+    Any path that returns 200/201 becomes a template for full enumeration.
+    Runs only when the crawl produced too few integer-bearing URLs.
+    """
+    discovered: List[Dict[str, Any]] = []
+    semaphore = asyncio.Semaphore(8)
+
+    async def _check(path_template: str):
+        url = base_url.rstrip("/") + path_template.replace("{id}", "1")
+        async with semaphore:
+            try:
+                resp = await client.get(url, headers=auth_headers)
+                if resp.status_code in (200, 201) and len(resp.content) > 10:
+                    template_path = path_template
+                    discovered.append({
+                        "template": base_url.rstrip("/") + template_path,
+                        "original": url,
+                        "host":     base_url,
+                        "id_type":  "integer",
+                        "id_pos":   template_path.strip("/").split("/").index("{id}") if "{id}" in template_path else 0,
+                        "orig_id":  1,
+                    })
+                    logger.info(f"[bola/seed] Live resource found: {url} → HTTP {resp.status_code}")
+            except Exception:
+                pass
+
+    await asyncio.gather(*[_check(p) for p in _SEED_RESOURCE_PATHS])
+    return discovered
 
 
 # ── URL template extraction ────────────────────────────────────────────────────

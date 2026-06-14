@@ -254,7 +254,7 @@ PHASES: List[Dict] = [
     {
         "id": "dast",
         "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "jwt_tool"},
-        "trigger_after": {"httpx", "ffuf", "gobuster", "arjun"},
+        "trigger_after": {"httpx", "ffuf", "gobuster"},
         "source_tools": {
             "nuclei":   ["katana", "ffuf", "gobuster", "httpx"],
             "zap":      ["katana", "ffuf", "gobuster", "httpx"],
