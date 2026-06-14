@@ -241,10 +241,12 @@ class BOLAWorker(BaseWorker):
         try:
             auth_resp = await client.get(anon_url, headers=auth_headers)
             anon_resp = await client.get(anon_url, headers=anon_headers)
+            anon_ct = anon_resp.headers.get("content-type", "")
             if (
                 auth_resp.status_code in (200, 201)
                 and anon_resp.status_code in (200, 201)
                 and len(anon_resp.content) > 20
+                and "text/html" not in anon_ct  # SPA wildcard routes return HTML — not real REST resources
             ):
                 findings.append({
                     "url":         anon_url,
@@ -426,17 +428,27 @@ async def _probe_seed_resources(
         async with semaphore:
             try:
                 resp = await client.get(url, headers=auth_headers)
-                if resp.status_code in (200, 201) and len(resp.content) > 10:
-                    template_path = path_template
-                    discovered.append({
-                        "template": base_url.rstrip("/") + template_path,
-                        "original": url,
-                        "host":     base_url,
-                        "id_type":  "integer",
-                        "id_pos":   template_path.strip("/").split("/").index("{id}") if "{id}" in template_path else 0,
-                        "orig_id":  1,
-                    })
-                    logger.info(f"[bola/seed] Live resource found: {url} → HTTP {resp.status_code}")
+                if resp.status_code not in (200, 201):
+                    return
+                # Skip SPA wildcard responses: SPAs (Angular, React, Vue) return
+                # HTTP 200 + index.html (text/html) for every unknown route.
+                # Real REST API endpoints return application/json.
+                ct = resp.headers.get("content-type", "")
+                if "text/html" in ct:
+                    logger.debug(f"[bola/seed] Skipping SPA route (HTML): {url}")
+                    return
+                if len(resp.content) < 10:
+                    return
+                template_path = path_template
+                discovered.append({
+                    "template": base_url.rstrip("/") + template_path,
+                    "original": url,
+                    "host":     base_url,
+                    "id_type":  "integer",
+                    "id_pos":   template_path.strip("/").split("/").index("{id}") if "{id}" in template_path else 0,
+                    "orig_id":  1,
+                })
+                logger.info(f"[bola/seed] Live resource found: {url} → HTTP {resp.status_code}")
             except Exception:
                 pass
 

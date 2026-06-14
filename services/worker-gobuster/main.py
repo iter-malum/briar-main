@@ -16,8 +16,11 @@ import logging
 import os
 import re
 import sys
-from typing import Any, Dict, List
+import uuid
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+import httpx as _httpx
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
 
@@ -121,6 +124,27 @@ class GobusterWorker(BaseWorker):
         threads = int(task_payload.get("threads", self.threads))
         timeout = int(task_payload.get("timeout", self.timeout))
 
+        # Build auth headers dict for wildcard probe and gobuster -H flags
+        auth_headers: Dict[str, str] = dict(auth_context.get("headers", {}))
+        cookies = auth_context.get("cookies", [])
+        if cookies:
+            auth_headers["Cookie"] = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+        # Detect wildcard response length.
+        # SPAs (Juice Shop, React, Angular, Vue) return HTTP 200 + index.html for
+        # every unknown path.  Gobuster 3.5+ detects this and exits with error 1
+        # unless we explicitly pass --exclude-length <size> to filter out the
+        # wildcard response.  Probe a random UUID path to discover the size.
+        exclude_lengths: Optional[str] = None
+        wildcard_size = await _probe_wildcard_size(url, auth_headers)
+        if wildcard_size is not None:
+            exclude_lengths = str(wildcard_size)
+            logger.info(
+                f"[gobuster] Wildcard detected at {url}: "
+                f"all unknown paths → {wildcard_size} bytes. "
+                f"Adding --exclude-length {wildcard_size}"
+            )
+
         cmd = [
             "gobuster", "dir",
             "-u", url,
@@ -130,24 +154,19 @@ class GobusterWorker(BaseWorker):
             "--timeout", f"{timeout}s",
             "--no-progress",
             "--output", OUTPUT_FILE,
-            # NOTE: --wildcard was removed in gobuster ≥3.5; wildcard detection is
-            # now always-on.  The flag causes "flag provided but not defined" crash
-            # on the installed version, so it must NOT be here.
             # Use -b (blacklist) instead of -s (whitelist) — they cannot coexist.
             # Blacklist: hide 404 (not found), 429 (rate-limited), 500/503 (overloaded).
             # Everything else (200, 301, 302, 401, 403, 405) is shown.
             "-b", "404,429,500,503",
         ]
 
-        # Inject auth headers
-        for key, value in auth_context.get("headers", {}).items():
-            cmd.extend(["-H", f"{key}: {value}"])
+        # Exclude the wildcard response length so gobuster doesn't bail out
+        if exclude_lengths:
+            cmd.extend(["--exclude-length", exclude_lengths])
 
-        # Inject cookies as a Cookie header
-        cookies = auth_context.get("cookies", [])
-        if cookies:
-            cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
-            cmd.extend(["-H", f"Cookie: {cookie_str}"])
+        # Inject auth headers
+        for key, value in auth_headers.items():
+            cmd.extend(["-H", f"{key}: {value}"])
 
         logger.info(f"[gobuster] dir mode → {url}")
         await self._run_gobuster(cmd, timeout)
@@ -265,6 +284,31 @@ class GobusterWorker(BaseWorker):
 
         except FileNotFoundError:
             logger.error("[gobuster] 'gobuster' binary not found in PATH")
+
+
+# ── Wildcard detection ────────────────────────────────────────────────────────
+
+async def _probe_wildcard_size(
+    base_url: str,
+    headers: Dict[str, str],
+) -> Optional[int]:
+    """
+    Probe a random UUID path.  If the server returns 200, we have a wildcard
+    handler (SPA routing) — return the response body size so gobuster can
+    filter it via --exclude-length.  Return None if the server correctly 404s.
+    """
+    probe_path = f"/{uuid.uuid4()}"
+    probe_url  = base_url.rstrip("/") + probe_path
+    try:
+        async with _httpx.AsyncClient(
+            verify=False, follow_redirects=False, timeout=8.0
+        ) as client:
+            resp = await client.get(probe_url, headers=headers)
+            if resp.status_code == 200:
+                return len(resp.content)
+    except Exception:
+        pass
+    return None
 
 
 # ── Output parsers ─────────────────────────────────────────────────────────────

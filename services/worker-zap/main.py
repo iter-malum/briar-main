@@ -124,6 +124,19 @@ class ZAPWorker(BaseWorker):
         resp.raise_for_status()
         return resp.json()
 
+    async def _zap_post(self, client: httpx.AsyncClient, path: str, **params) -> dict:
+        """POST variant of _zap — use when params may exceed GET URL length limits.
+        JWT tokens are 500-1000+ chars; ZAP's Jetty returns 400 on long query strings.
+        ZAP action endpoints accept POST with application/x-www-form-urlencoded body.
+        """
+        resp = await client.post(
+            f"{self._base}/JSON/{path}",
+            data={"apikey": self.api_key, **params},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ── Tool entry point ───────────────────────────────────────────────────────
 
     async def execute_tool(
@@ -357,7 +370,9 @@ class ZAPWorker(BaseWorker):
 
         for name, value in auth_context.get("headers", {}).items():
             try:
-                await self._zap(
+                # Use POST: JWT Bearer tokens are 500-1000+ chars and exceed
+                # ZAP's Jetty URL length limit when passed as GET query params.
+                await self._zap_post(
                     client,
                     "replacer/action/addRule/",
                     description=f"briar-header-{name}",
