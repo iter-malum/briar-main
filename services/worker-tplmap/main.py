@@ -151,7 +151,7 @@ class TplmapWorker(BaseWorker):
         if not scan_id:
             return []
         try:
-            async with self.db_session() as session:
+            async with self.session_factory() as session:
                 from shared.models import ScanResultORM
                 from sqlalchemy import select
                 from uuid import UUID

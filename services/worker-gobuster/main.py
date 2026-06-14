@@ -130,10 +130,10 @@ class GobusterWorker(BaseWorker):
             # NOTE: --wildcard was removed in gobuster ≥3.5; wildcard detection is
             # now always-on.  The flag causes "flag provided but not defined" crash
             # on the installed version, so it must NOT be here.
-            # Positive status codes — we want to see 200/30x/401/403/405.
-            # 503 is explicitly excluded: it means the host is overloaded and
-            # would flood results with false positives.
-            "-s", "200,204,301,302,307,308,401,403,405",
+            # Use -b (blacklist) instead of -s (whitelist) — they cannot coexist.
+            # Blacklist: hide 404 (not found), 429 (rate-limited), 500/503 (overloaded).
+            # Everything else (200, 301, 302, 401, 403, 405) is shown.
+            "-b", "404,429,500,503",
         ]
 
         # Inject auth headers

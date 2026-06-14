@@ -98,14 +98,14 @@ class ZAPWorker(BaseWorker):
         self.api_key             = os.getenv("ZAP_API_KEY",                 "briar-zap-api-key-2024")
         # Max total active-scan duration in MINUTES (ZAP -config scanner.maxDuration).
         # Keep well below RabbitMQ consumer_timeout (now 4 h) and WORKER_TIMEOUT.
-        self.max_duration        = int(os.getenv("ZAP_MAX_DURATION",        "20"))    # minutes
+        self.max_duration        = int(os.getenv("ZAP_MAX_DURATION",        "40"))    # minutes
         # Max duration for a single active-scan rule in MINUTES.
         # Without this, one broken rule can stall the entire scan indefinitely.
-        self.max_rule_duration   = int(os.getenv("ZAP_MAX_RULE_DURATION",   "2"))     # minutes
-        self.ajax_timeout        = int(os.getenv("ZAP_AJAX_TIMEOUT",        "120"))   # seconds
+        self.max_rule_duration   = int(os.getenv("ZAP_MAX_RULE_DURATION",   "5"))     # minutes
+        self.ajax_timeout        = int(os.getenv("ZAP_AJAX_TIMEOUT",        "180"))   # seconds
         # Python-side deadline for the ascan poll loop (seconds).
-        # Must be > max_duration*60 to let ZAP stop itself first; 25 min gives buffer.
-        self.ascan_deadline      = int(os.getenv("ZAP_ASCAN_DEADLINE",      "1500"))  # seconds
+        # Must be > max_duration*60 to let ZAP stop itself first; 45 min gives buffer.
+        self.ascan_deadline      = int(os.getenv("ZAP_ASCAN_DEADLINE",      "2700"))  # seconds
         self.install_addons  = os.getenv("ZAP_INSTALL_ADDONS", "true").lower() not in ("false", "0", "no")
 
     # ── ZAP base URL ───────────────────────────────────────────────────────────
@@ -152,7 +152,10 @@ class ZAPWorker(BaseWorker):
         # The AJAX spider (Chromium-based) provides superior SPA coverage anyway.
         run_ajax_spider        = strategy.get("run_ajax_spider",        True)
         run_traditional_spider = strategy.get("run_traditional_spider", False)
-        run_openapi_import     = strategy.get("run_openapi_import",     False)
+        # OpenAPI import is always attempted — the method checks well-known paths
+        # and does nothing if no spec is found.  Costs ~1 s; gains full API coverage
+        # on targets like Juice Shop that expose /openapi.json without any tech hint.
+        run_openapi_import     = strategy.get("run_openapi_import",     True)
         ajax_timeout_strat     = strategy.get("ajax_timeout")
 
         # SPA: extend AJAX timeout if strategy or is_spa flag says so

@@ -97,6 +97,9 @@ class NucleiWorker(BaseWorker):
                 "-c", str(self.concurrency),
                 "-timeout", "30",
                 "-retries", "1",
+                "-no-interactsh",         # don't depend on external interactsh.com — works offline
+                "-duc",                   # skip update check — faster startup, templates managed in image
+                "-stats",                 # periodic progress log so we know it's running
             ]
 
             # Auth
@@ -177,11 +180,11 @@ class NucleiWorker(BaseWorker):
             stdout_task = asyncio.create_task(
                 self._read_jsonl(process.stdout, results)
             )
-            _, stderr_data = await asyncio.wait_for(
-                asyncio.gather(
-                    stdout_task,
-                    process.wait(),
-                ),
+            stderr_task = asyncio.create_task(
+                self._log_stderr(process.stderr)
+            )
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task, process.wait()),
                 timeout=self.timeout,
             )
 
@@ -207,6 +210,16 @@ class NucleiWorker(BaseWorker):
         finally:
             if os.path.exists(targets_file):
                 os.unlink(targets_file)
+
+    async def _log_stderr(self, stream):
+        """Forward nuclei stderr to our logger so issues are visible."""
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="ignore").strip()
+            if text:
+                logger.debug(f"[nuclei] stderr: {text}")
 
     async def _read_jsonl(self, stream, results: List[Dict[str, Any]]):
         while True:

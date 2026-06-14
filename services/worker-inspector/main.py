@@ -366,12 +366,16 @@ async def _request(
     url: str,
     data: Optional[Dict] = None,
     timeout: float = REQUEST_TIMEOUT,
+    json_body: bool = False,
 ) -> Optional[Tuple[int, str, float]]:
     """Returns (status, body, elapsed_seconds) or None on error."""
     try:
         t0 = time.monotonic()
         if method.upper() == "POST" and data:
-            resp = await client.post(url, data=data, timeout=timeout)
+            if json_body:
+                resp = await client.post(url, json=data, timeout=timeout)
+            else:
+                resp = await client.post(url, data=data, timeout=timeout)
         else:
             resp = await client.get(url, timeout=timeout)
         elapsed = time.monotonic() - t0
@@ -715,7 +719,15 @@ def _extract_targets(
             qs_params = {k: qs_params[k] for k in sorted_names}
 
         score, vuln_types = score_endpoint(url, qs_params)
-        method = "GET"  # TODO: POST endpoints from arjun in future
+
+        # If arjun found params on this endpoint via POST, test as POST.
+        # REST APIs accept JSON bodies — GET-only misses most injection surfaces.
+        arjun_method = None
+        for r in arjun_raw:
+            if r.get("url") == url and r.get("method", "GET").upper() == "POST":
+                arjun_method = "POST"
+                break
+        method = arjun_method or "GET"
 
         # Canonical URL without query string (for dedup)
         base_url = urlunparse(p._replace(query=""))

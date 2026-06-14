@@ -152,7 +152,6 @@ class ArjunWorker(BaseWorker):
             "python3", "-m", "arjun",
             "-i", targets_file,
             "-o", output_file,
-            "-q",
             "-T", str(self.arjun_timeout),  # -T (capital) = per-request timeout
             "-t", "5",                       # parallel threads
             "--stable",                      # slower but handles unstable/rate-limited targets
@@ -161,6 +160,10 @@ class ArjunWorker(BaseWorker):
 
         if headers_dict:
             cmd.extend(["--headers", json.dumps(headers_dict)])
+
+        # For POST method, also test JSON body (REST APIs use JSON, not form params)
+        if method == "POST":
+            cmd.extend(["--include", "application/json"])
 
         logger.info(f"Arjun command ({method}): {' '.join(cmd)}")
 
@@ -178,12 +181,17 @@ class ArjunWorker(BaseWorker):
                 timeout=self.timeout,
             )
 
+            stdout_text = stdout_data.decode('utf-8', errors='ignore').strip()
+            stderr_text = stderr_data.decode('utf-8', errors='ignore').strip()
+
             if process.returncode not in [0, None]:
-                stderr_output = stderr_data.decode('utf-8', errors='ignore').strip()
-                if stderr_output:
-                    logger.warning(f"arjun exited {process.returncode} ({method}): {stderr_output[:300]}")
+                if stderr_text:
+                    logger.warning(f"arjun exited {process.returncode} ({method}): {stderr_text[:500]}")
             else:
-                logger.debug(f"arjun stdout ({method}): {stdout_data.decode('utf-8', errors='ignore')[:200]}")
+                if stdout_text:
+                    logger.debug(f"arjun stdout ({method}): {stdout_text[:500]}")
+                if stderr_text:
+                    logger.debug(f"arjun stderr ({method}): {stderr_text[:300]}")
 
             return self._parse_output(output_file, method)
 
