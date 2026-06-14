@@ -110,11 +110,11 @@ def _base_origin(url: str) -> str:
 class KatanaWorker(BaseWorker):
     def __init__(self):
         super().__init__(tool_name="katana", queue_name="scan.crawl.katana")
-        # Default timeout is 1 hour — quality over speed.
-        # Juice Shop / Angular / React SPAs need 10-30 min of headless crawling
-        # to surface all routes. Set KATANA_TIMEOUT=600 in docker-compose to
-        # trade coverage for speed on lightweight targets.
-        self.timeout          = int(os.getenv("KATANA_TIMEOUT",        "3600"))
+        # Default timeout is 30 min — sufficient for most SPAs with saturation detection.
+        # Juice Shop / Angular / React SPAs are fully explored in 10-20 min; remaining
+        # time discovers only SPA route permutations returning the same HTML shell.
+        # Set KATANA_TIMEOUT=3600 in docker-compose for very large targets.
+        self.timeout          = int(os.getenv("KATANA_TIMEOUT",        "1800"))
         self.depth            = int(os.getenv("KATANA_DEPTH",          "3"))
         self.headless_depth   = int(os.getenv("KATANA_HEADLESS_DEPTH", "5"))
         self.concurrency      = int(os.getenv("KATANA_CONCURRENCY",    "10"))
@@ -230,6 +230,7 @@ class KatanaWorker(BaseWorker):
         logger.info(f"[katana] Starting crawl: {' '.join(cmd)}")
 
         results: List[Dict[str, Any]] = []
+        spa_saturated = asyncio.Event()
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -240,14 +241,35 @@ class KatanaWorker(BaseWorker):
                 cwd=work_dir,
             )
 
-            await asyncio.wait_for(
-                asyncio.gather(
-                    self._read_stream(process.stdout, results, is_stderr=False),
-                    self._read_stream(process.stderr, None, is_stderr=True),
-                    process.wait(),
-                ),
-                timeout=self.timeout,
-            )
+            async def _kill_on_saturation():
+                await spa_saturated.wait()
+                logger.info(
+                    "[katana] SPA saturation: 100+ consecutive non-API HTML routes "
+                    "with no parameters — stopping crawl early to save time"
+                )
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+            sat_task = asyncio.create_task(_kill_on_saturation())
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        self._read_stream(process.stdout, results, is_stderr=False,
+                                         saturation_event=spa_saturated),
+                        self._read_stream(process.stderr, None, is_stderr=True),
+                        process.wait(),
+                    ),
+                    timeout=self.timeout,
+                )
+            finally:
+                # Cancel the saturation monitor (no-op if it already completed)
+                sat_task.cancel()
+                try:
+                    await sat_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
             if process.returncode not in (0, None):
                 logger.warning(f"[katana] Exited with code {process.returncode}")
@@ -298,7 +320,15 @@ class KatanaWorker(BaseWorker):
         stream,
         results_list: Optional[List],
         is_stderr: bool = False,
+        saturation_event: Optional[asyncio.Event] = None,
     ):
+        # SPA saturation: count consecutive URLs with no params and no API path.
+        # Angular SPAs serve the same index.html shell for every client-side route;
+        # after ~100 such results in a row we are just cycling through route permutations.
+        _spa_streak = 0
+        _SPA_SAT_LIMIT = 100
+        _API_PREFIXES = ("/api/", "/rest/", "/graphql", "/socket.io/", "/v1/", "/v2/", "/v3/")
+
         while True:
             try:
                 line = await stream.readuntil(b"\n")
@@ -338,16 +368,30 @@ class KatanaWorker(BaseWorker):
                 # Extract GET params from URL
                 get_params = _extract_params_from_url(endpoint_url)
 
-                # Extract POST body params (application/x-www-form-urlencoded)
+                # Extract POST body params — form-encoded or JSON
                 post_params: Dict[str, List[str]] = {}
-                if body and "=" in body and not body.strip().startswith("{"):
-                    try:
-                        post_params = parse_qs(body)
-                    except Exception:
-                        pass
+                json_params: Dict[str, Any] = {}
+                if body:
+                    stripped = body.strip()
+                    if stripped.startswith("{"):
+                        try:
+                            parsed = json.loads(stripped)
+                            if isinstance(parsed, dict):
+                                json_params = parsed
+                        except Exception:
+                            pass
+                    elif "=" in stripped:
+                        try:
+                            post_params = parse_qs(stripped)
+                        except Exception:
+                            pass
 
                 # Combine all known parameter names
-                all_param_names = list(get_params.keys()) + list(post_params.keys())
+                all_param_names = (
+                    list(get_params.keys())
+                    + list(post_params.keys())
+                    + list(json_params.keys())
+                )
 
                 results_list.append({
                     "url": endpoint_url,          # Full URL WITH query string
@@ -360,6 +404,7 @@ class KatanaWorker(BaseWorker):
                     "body":        body,
                     "get_params":  get_params,
                     "post_params": post_params,
+                    "json_params": json_params,   # JSON REST body fields (if POST with JSON)
                     "has_params":  bool(all_param_names),
                     "param_names": all_param_names,
 
@@ -372,10 +417,26 @@ class KatanaWorker(BaseWorker):
                         "params": {
                             "get":  get_params,
                             "post": post_params,
+                            "json": json_params,
                             "all":  all_param_names,
                         },
                     },
                 })
+
+                # ── SPA saturation detection ───────────────────────────────
+                # If we see many consecutive non-API, no-param URLs it means
+                # the headless crawler is cycling through Angular client-side
+                # route permutations and returning the same SPA shell each time.
+                if saturation_event is not None and not saturation_event.is_set():
+                    parsed_path = urlparse(endpoint_url).path
+                    is_api = any(parsed_path.startswith(p) for p in _API_PREFIXES)
+                    has_ext = "." in (parsed_path.rsplit("/", 1)[-1] or "")
+                    if not all_param_names and not is_api and not has_ext:
+                        _spa_streak += 1
+                        if _spa_streak >= _SPA_SAT_LIMIT:
+                            saturation_event.set()
+                    else:
+                        _spa_streak = 0
 
             except asyncio.LimitOverrunError:
                 logger.warning("[katana] Output line exceeded 10 MB limit, skipping…")

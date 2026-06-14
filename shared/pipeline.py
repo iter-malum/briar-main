@@ -429,6 +429,21 @@ def detect_app_type(whatweb_raw_outputs: List[Dict]) -> Dict:
                         if isinstance(v, str):
                             tech_stack.append(v.lower())
 
+            # New WhatWebWorker format stores categorized tech in a nested structure.
+            # Read language, frontend library, and server names from it so that
+            # Node.js / Angular / Express detected there are visible to the keyword matcher.
+            categorized = result.get("categorized")
+            if isinstance(categorized, dict):
+                for section in ("languages", "frontend_libs", "server"):
+                    for entry in categorized.get(section, []):
+                        if isinstance(entry, dict):
+                            name = entry.get("name", "")
+                            if name:
+                                tech_stack.append(name.lower())
+                title = categorized.get("title")
+                if isinstance(title, str) and title:
+                    tech_stack.append(title.lower())
+
     tech_text = " ".join(tech_stack)
 
     # Highest-priority match wins

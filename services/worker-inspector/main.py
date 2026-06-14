@@ -269,7 +269,8 @@ class Baseline:
 class EndpointTarget:
     url:        str
     method:     str
-    params:     Dict[str, List[str]]   # name → [current value]
+    params:     Dict[str, List[str]]   # name → [current value] for query/form params
+    json_body:  Dict[str, Any] = field(default_factory=dict)  # JSON body template for REST API
     score:      int = 0
     vuln_types: List[str] = field(default_factory=list)
 
@@ -358,6 +359,17 @@ def _inject_param(
         return new_url, None
     else:
         return url, {k: v[0] for k, v in modified.items()}
+
+
+def _inject_json_field(
+    body: Dict[str, Any],
+    field_name: str,
+    payload: str,
+) -> Dict[str, Any]:
+    """Return a copy of JSON body with payload injected into field_name."""
+    modified = dict(body)
+    modified[field_name] = payload
+    return modified
 
 
 async def _request(
@@ -666,6 +678,7 @@ def _extract_targets(
     endpoints: List[str],
     arjun_results: List[Dict[str, Any]],
     target: str,
+    json_endpoint_map: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> List[EndpointTarget]:
     """
     Build EndpointTarget list from raw endpoints + arjun discoveries.
@@ -740,6 +753,25 @@ def _extract_targets(
             vuln_types=vuln_types,
         ))
 
+    def _process_json_endpoint(url: str, json_body: Dict[str, Any], method: str):
+        """Register a REST API POST endpoint with JSON body for injection testing."""
+        if url in seen:
+            return
+        seen.add(url)
+        if not json_body:
+            return
+        p = urlparse(url)
+        base_url = urlunparse(p._replace(query=""))
+        score, vuln_types = score_endpoint(url, {k: [str(v)] for k, v in json_body.items()})
+        targets.append(EndpointTarget(
+            url=base_url,
+            method=method,
+            params={},
+            json_body=json_body,
+            score=score + 2,  # boost: REST JSON endpoints are high-value
+            vuln_types=vuln_types,
+        ))
+
     # Process all endpoints
     for ep in endpoints:
         _process(ep)
@@ -747,6 +779,11 @@ def _extract_targets(
     # Also process arjun-discovered params on URLs that might not be in endpoints
     for arjun_url in arjun_map:
         _process(arjun_url)
+
+    # Process JSON body endpoints from katana (REST API POST requests with JSON body)
+    if json_endpoint_map:
+        for json_url, json_body in json_endpoint_map.items():
+            _process_json_endpoint(json_url, json_body, "POST")
 
     # Sort by score descending — test most promising targets first
     targets.sort(key=lambda t: t.score, reverse=True)
@@ -825,6 +862,117 @@ def _build_finding(
             "route_context": {
                 "param":   param_name,
                 "method":  ep.method,
+                "payload": detection_detail.get("payload", ""),
+            },
+        },
+    }
+
+
+# ── JSON body injection helpers ───────────────────────────────────────────────
+
+
+async def _detect_sqli_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """SQLi detection via JSON body injection — tests error-based and time-based."""
+    for payload in ("'", '"', "')", "'))", "';--", '";--'):
+        modified = _inject_json_field(json_body, field_name, payload)
+        result = await _request(client, "POST", url, data=modified, json_body=True)
+        if result is None:
+            continue
+        _, body, _ = result
+        if _SQL_ERROR_RE.search(body):
+            m = _SQL_ERROR_RE.search(body)
+            return {
+                "detection": "error-based",
+                "payload": payload,
+                "evidence": f"DB error in JSON response: {(m.group(0) if m else '')[:60]}",
+            }
+
+    for payload in SQL_TIME_CANARIES:
+        modified = _inject_json_field(json_body, field_name, payload)
+        result = await _request(
+            client, "POST", url, data=modified, json_body=True,
+            timeout=REQUEST_TIMEOUT + 5,
+        )
+        if result is None:
+            continue
+        _, _, elapsed = result
+        delay = elapsed - (baseline.time_ms / 1000.0)
+        if delay >= TIMING_THRESHOLD:
+            return {
+                "detection": "time-based",
+                "payload": payload,
+                "evidence": (
+                    f"JSON body injection delayed response by {delay:.2f}s "
+                    f"(baseline: {baseline.time_ms:.0f}ms)"
+                ),
+            }
+    return None
+
+
+async def _detect_xss_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """XSS surface detection via JSON body field — checks if input reflects unescaped."""
+    marker = "briar_xss_" + "".join(random.choices(string.ascii_lowercase, k=6))
+    payload = f"<{marker}>"
+    modified = _inject_json_field(json_body, field_name, payload)
+    result = await _request(client, "POST", url, data=modified, json_body=True)
+    if result is None:
+        return None
+    _, body, _ = result
+    if payload in body and payload not in baseline.body:
+        return {
+            "detection": "html-reflection",
+            "payload": payload,
+            "evidence": (
+                f"Tag {payload!r} reflected unescaped in JSON response — "
+                f"XSS surface in JSON body field"
+            ),
+        }
+    return None
+
+
+def _build_json_finding(
+    ep: EndpointTarget,
+    field_name: str,
+    finding_type: str,
+    detection_detail: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a finding dict for JSON body injection discoveries."""
+    meta = _FINDING_TYPE_META[finding_type]
+    return {
+        "url":      ep.url,
+        "type":     finding_type,
+        "severity": meta["severity"],
+        "description": (
+            f"[inspector] {finding_type.upper()} (JSON body) — field '{field_name}' "
+            f"on {ep.url} | Method: {detection_detail['detection']} | "
+            f"{detection_detail['evidence']}"
+        ),
+        "raw_output": {
+            "url":          ep.url,
+            "parameter":    field_name,
+            "method":       "POST",
+            "payload":      detection_detail.get("payload", ""),
+            "evidence":     detection_detail.get("evidence", ""),
+            "detection":    detection_detail.get("detection", ""),
+            "finding_type": finding_type,
+            "route_to":     meta["route_to"],
+            "owasp":        meta["owasp"],
+            "inject_mode":  "json_body",
+            "route_context": {
+                "param":   field_name,
+                "method":  "POST",
                 "payload": detection_detail.get("payload", ""),
             },
         },
@@ -988,7 +1136,42 @@ class InspectorWorker(BaseWorker):
                 f"(app_type={app_type!r}): {forced_vuln_types}"
             )
 
-        targets = _extract_targets(endpoints, arjun_raw, target)
+        # Load JSON body context from katana's captured POST requests.
+        # Katana with -aff and -xhr captures XHR/fetch calls including JSON bodies.
+        # These are stored in scan_results.raw_output.params.json for tool=katana.
+        # The inspector uses them to test REST API JSON body parameters for injection.
+        scan_id: str = task_payload.get("scan_id", "")
+        json_endpoint_map: Dict[str, Dict[str, Any]] = {}
+        if scan_id:
+            try:
+                from shared.models import ScanResultORM
+                from sqlalchemy import select
+                from uuid import UUID as _UUID
+                async with self.session_factory() as _s:
+                    stmt = (
+                        select(ScanResultORM.url, ScanResultORM.raw_output)
+                        .where(
+                            ScanResultORM.scan_id == _UUID(scan_id),
+                            ScanResultORM.tool == "katana",
+                            ScanResultORM.vulnerability_type == "endpoint",
+                        )
+                    )
+                    rows = await _s.execute(stmt)
+                    for row_url, row_raw in rows:
+                        if not row_url or not isinstance(row_raw, dict):
+                            continue
+                        params = row_raw.get("params", {})
+                        json_body = params.get("json", {}) if isinstance(params, dict) else {}
+                        if isinstance(json_body, dict) and json_body:
+                            json_endpoint_map[row_url] = json_body
+                logger.info(
+                    f"[inspector] Found {len(json_endpoint_map)} katana endpoint(s) "
+                    f"with JSON body context for injection testing"
+                )
+            except Exception as exc:
+                logger.debug(f"[inspector] JSON endpoint query failed: {exc}")
+
+        targets = _extract_targets(endpoints, arjun_raw, target, json_endpoint_map)
         if not targets:
             logger.warning("[inspector] No testable endpoints found (no parameters)")
             return []
@@ -1137,6 +1320,55 @@ class InspectorWorker(BaseWorker):
                     )
                     if result:
                         findings.append(_build_finding(ep, param_name, "xss_candidate", result))
+
+            # ── JSON body injection pass (REST API endpoints) ──────────────────
+            # When katana captured a POST request with a JSON body, test each
+            # JSON field for injection vulnerabilities.  Uses the same detection
+            # strategies as query-param injection but sends payloads inside
+            # application/json bodies — covering REST API surfaces that form-based
+            # injection misses entirely.
+            if ep.json_body:
+                json_baseline = await _request(
+                    client, "POST", ep.url,
+                    data=ep.json_body, json_body=True,
+                )
+                if json_baseline is not None:
+                    jbl_status, jbl_body, jbl_time = json_baseline
+                    jbaseline = Baseline(
+                        status=jbl_status,
+                        body=jbl_body,
+                        size=len(jbl_body),
+                        time_ms=jbl_time * 1000,
+                    )
+
+                    for field_name, field_val in ep.json_body.items():
+                        if not isinstance(field_val, str):
+                            continue  # only inject into string fields
+                        # Build params-like structure for scoring
+                        json_params_as_qs = {field_name: [str(field_val)]}
+                        _, field_vuln_types = score_endpoint(ep.url, json_params_as_qs)
+                        if not field_vuln_types:
+                            field_vuln_types = ["sqli", "xss"]
+
+                        # Test SQLi via JSON body
+                        sqli_det = await _detect_sqli_json(
+                            client, ep.url, ep.json_body, field_name, jbaseline
+                        )
+                        if sqli_det:
+                            findings.append(
+                                _build_json_finding(ep, field_name, "sqli_candidate", sqli_det)
+                            )
+                            continue
+
+                        # Test XSS via JSON body
+                        if "xss" in field_vuln_types:
+                            xss_det = await _detect_xss_json(
+                                client, ep.url, ep.json_body, field_name, jbaseline
+                            )
+                            if xss_det:
+                                findings.append(
+                                    _build_json_finding(ep, field_name, "xss_candidate", xss_det)
+                                )
 
         return findings
 
