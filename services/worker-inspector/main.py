@@ -163,31 +163,53 @@ _JWT_JSON_KEYS = frozenset({
 
 _SQL_ERROR_RE = re.compile(
     r"(?:"
+    # MySQL / MariaDB
     r"you have an error in your sql syntax"
     r"|warning:\s*mysql"
+    r"|mariadb server version for the right syntax"
+    r"|com\.mysql\.jdbc\."
+    r"|operationalerror.*mysql"
+    r"|hy000.*1064"
+    # PostgreSQL
     r"|unclosed quotation mark"
     r"|quoted string not properly terminated"
     r"|pg::syntaxerror"
     r"|pg::undefinedcolumn"
-    r"|ora-\d{4,5}"
+    r"|org\.postgresql\.util\.psqlexception"
+    r"|psql.*error"
+    r"|operationalerror.*psycopg"
+    # MSSQL
     r"|microsoft ole db provider for sql server"
     r"|incorrect syntax near"
-    r"|unexpected end of sql command"
-    r"|sqlite.*(?:error|exception)"
-    r"|psql.*error"
-    r"|mariadb server version for the right syntax"
-    r"|com\.mysql\.jdbc\."
-    r"|org\.postgresql\.util\.psqlexception"
     r"|system\.data\.sqlclient"
+    r"|sql server.*error"
+    r"|unclosed quotation mark after"
+    # Oracle
+    r"|ora-\d{4,5}"
+    # SQLite (native + Python)
+    r"|sqlite.*(?:error|exception)"
+    r"|operationalerror.*sqlite"
+    r"|sqlite_error"
+    r"|incomplete input"         # SQLite: unmatched quote → "incomplete input"
+    r"|unrecognized token"       # SQLite: invalid token in expression
+    r"|no such column"           # SQLite: column name injection artifact
+    # Node.js / Sequelize ORM (wraps SQLite, MySQL, Postgres)
+    r"|sequelizedatabaseerror"
+    r"|sequelizevalidationerror"
+    r"|sequelizeuniqueconstrainterror"
+    r"|sequelizeeagerloadingerror"
+    r"|sequelizeforeignkeyconstrainterror"
+    # Generic ORM / framework errors
+    r"|unexpected end of sql command"
     r"|odbc.*(?:driver|error)"
     r"|jdbc.*exception"
     r"|sqlsyntaxerrorexception"
     r"|pdo.*sqlstate"
     r"|db2 sql error"
-    r"|sql server.*error"
-    r"|operationalerror.*sqlite"
-    r"|operationalerror.*mysql"
-    r"|hy000.*1064"
+    # Python ORMs (SQLAlchemy, Django ORM)
+    r"|django\.db\.utils"
+    r"|sqlalchemy.*error"
+    r"|operationalerror"         # broad Python DB-API catch
     r")",
     re.IGNORECASE,
 )
@@ -197,19 +219,32 @@ _SQL_ERROR_RE = re.compile(
 # Each entry: (payload, expected_result, engine_hint)
 # We inject the payload and look for expected_result in the response body.
 SSTI_CANARIES: List[Tuple[str, str, str]] = [
-    ("{{7*7}}",           "49",  "Jinja2/Twig"),
-    ("${7*7}",            "49",  "FreeMarker/Groovy"),
-    ("#{7*7}",            "49",  "Ruby/Thymeleaf"),
-    ("<%= 7*7 %>",        "49",  "ERB"),
-    ("${{7*7}}",          "49",  "Spring EL"),
-    ("{{7*'7'}}",         "7777777", "Jinja2"),          # Jinja2: '7'*7 = '7777777'
-    ("{#7*7}",            "49",  "Smarty3"),
-    ("{$smarty.version}", "Smarty", "Smarty"),
+    # Python template engines
+    ("{{7*7}}",           "49",       "Jinja2/Twig/Nunjucks"),
+    ("{{7*'7'}}",         "7777777",  "Jinja2"),          # Jinja2: '7'*7 = '7777777'
+    ("{#7*7}",            "49",       "Smarty3"),
+    ("{$smarty.version}", "Smarty",   "Smarty"),
+    # Java template engines
+    ("${7*7}",            "49",       "FreeMarker/Groovy/Spring EL"),
+    ("${{7*7}}",          "49",       "Spring EL"),
+    # Ruby
+    ("#{7*7}",            "49",       "Ruby ERB/Slim"),
+    ("<%= 7*7 %>",        "49",       "ERB"),
+    # Node.js / Express template engines (Pug, EJS, Handlebars, Lodash)
+    ("#{7*7}",            "49",       "Pug/Jade"),        # Pug: #{expr} evaluates JS
+    ("<%= 7*7 %>",        "49",       "EJS"),             # EJS: <%= expr %>
+    ("{{= 7*7}}",         "49",       "Lodash/Underscore"),  # _.template with {{= }}
+    # Generic math to catch unknown engines
+    ("%{7*7}",            "49",       "Generic"),
+    ("*{7*7}",            "49",       "Thymeleaf"),
 ]
 
 _SSTI_ENGINE_RE = re.compile(
-    r"(?:jinja2|twig|freemarker|smarty|erb|thymeleaf|velocity|pebble|"
-    r"TemplateEngine|TemplateNotFound|TemplateSyntaxError)",
+    r"(?:jinja2|twig|freemarker|smarty|erb|thymeleaf|velocity|pebble|nunjucks|"
+    r"pug|jade|handlebars|mustache|ejs|lodash|"
+    r"TemplateEngine|TemplateNotFound|TemplateSyntaxError|"
+    r"SyntaxError.*unexpected|ReferenceError.*not defined|"     # Node.js template errors
+    r"TypeError.*Cannot read|EvalError)",
     re.IGNORECASE,
 )
 
@@ -232,26 +267,54 @@ _PATH_TRAVERSAL_RE = re.compile(
 )
 
 # ── SQL boolean canaries ───────────────────────────────────────────────────────
+#
+# Payloads are PREFIXED to the original value so the query context is preserved.
+# e.g. original q=apple →
+#   TRUE:  q=apple' AND '1'='1    → WHERE name LIKE '%apple' AND '1'='1%' → results
+#   FALSE: q=apple' AND '1'='2    → WHERE name LIKE '%apple' AND '1'='2%' → empty
+#
+# For numeric params (id=1):
+#   TRUE:  id=1 AND 1=1           → same result as baseline
+#   FALSE: id=1 AND 1=2           → no result (integer out of range or filtered)
 
-# True/false condition pairs.  The first injected value should give a response
-# similar to the baseline (true condition); the second should differ (false).
-# We use AND-based conditions so the WHERE clause becomes: original AND 1=1 (same)
-# vs original AND 1=2 (different result set).
-SQL_BOOL_TRUE  = "' AND '1'='1"
-SQL_BOOL_FALSE = "' AND '1'='2"
+def _make_bool_payloads(original_val: str) -> Tuple[str, str]:
+    """Return (true_payload, false_payload) for boolean-based SQLi detection."""
+    is_numeric = original_val.lstrip("-").isdigit()
+    if is_numeric:
+        return (
+            f"{original_val} AND 1=1",
+            f"{original_val} AND 1=2",
+        )
+    else:
+        return (
+            f"{original_val}' AND '1'='1",
+            f"{original_val}' AND '1'='2",
+        )
 
-# For numeric parameters
-SQL_BOOL_TRUE_NUM  = " AND 1=1"
-SQL_BOOL_FALSE_NUM = " AND 1=2"
+
+# ── SQL error-trigger canaries ─────────────────────────────────────────────────
+# Single-character probes that trigger DB errors on most backends.
+SQL_ERROR_PROBES = ("'", '"', "')", "'))", "';--", '";--', "\\", "%27")
 
 # ── SQL time-based canaries ────────────────────────────────────────────────────
-# These inject a 1-second delay — short enough to be reliable, long enough to detect.
+# Inject delays across all common DB backends.
+# SQLite doesn't have SLEEP() — use heavy randomblob() computation instead.
 SQL_TIME_CANARIES = [
-    "1 AND SLEEP(1)--",          # MySQL
-    "1; WAITFOR DELAY '0:0:1'--",# MSSQL
-    "1 AND pg_sleep(1)--",       # PostgreSQL
-    "1 OR SLEEP(1)--",           # MySQL alternate
-    "1' AND SLEEP(1)--",
+    # MySQL / MariaDB
+    "1 AND SLEEP(1)--",
+    "1 OR SLEEP(1)--",
+    "' AND SLEEP(1)--",
+    "' OR SLEEP(1)--",
+    # MSSQL
+    "1; WAITFOR DELAY '0:0:1'--",
+    "'; WAITFOR DELAY '0:0:1'--",
+    # PostgreSQL
+    "1 AND pg_sleep(1)--",
+    "' AND pg_sleep(1)--",
+    # SQLite — randomblob generates enough work to cause measurable delay
+    # without needing SLEEP (which SQLite doesn't support).
+    "1 AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))--",
+    "' AND 1=LIKE('ABCDEFG',UPPER(HEX(RANDOMBLOB(100000000/2))))--",
 ]
 
 
@@ -424,31 +487,45 @@ async def _detect_sqli(
     baseline: Baseline,
 ) -> Optional[Dict[str, Any]]:
     """
-    SQL injection detection (error-based, boolean-based, time-based).
-    Returns a finding dict or None.
+    SQL injection detection: error-based (body + status), boolean-based, time-based.
     """
     original_val = (params.get(param_name) or ["1"])[0]
-    is_numeric = original_val.lstrip("-").isdigit()
 
-    # ── Error-based ────────────────────────────────────────────────────────
-    for payload in ("'", '"', "')", "'))", "';--", '";--'):
+    # ── Error-based: body + status ─────────────────────────────────────────
+    for payload in SQL_ERROR_PROBES:
         inject_url, post_data = _inject_param(url, params, param_name, payload, method)
         result = await _request(client, method, inject_url, post_data)
         if result is None:
             continue
         status, body, _ = result
+
+        # 1. SQL error string in response body
         if _SQL_ERROR_RE.search(body):
             m = _SQL_ERROR_RE.search(body)
-            engine = m.group(0)[:60] if m else "unknown"
+            engine = m.group(0)[:80] if m else "unknown"
             return {
                 "detection": "error-based",
                 "payload": payload,
-                "evidence": f"DB error: {engine}",
+                "evidence": f"DB error keyword in response: {engine!r}",
+            }
+
+        # 2. Status changed from success to server error — strong injection signal
+        # (Sequelize/ORM swallows the SQL error but still returns 500)
+        if baseline.status in (200, 201) and status >= 500:
+            return {
+                "detection": "error-based-status",
+                "payload": payload,
+                "evidence": (
+                    f"HTTP {baseline.status}→{status}: server error triggered by "
+                    f"injection payload {payload!r} — likely unhandled DB exception"
+                ),
             }
 
     # ── Boolean-based ──────────────────────────────────────────────────────
-    true_payload  = (SQL_BOOL_TRUE_NUM  if is_numeric else SQL_BOOL_TRUE)  + original_val
-    false_payload = (SQL_BOOL_FALSE_NUM if is_numeric else SQL_BOOL_FALSE) + original_val
+    # Payload is PREPENDED to the original value so the DB receives:
+    #   WHERE col LIKE '%<original>' AND '1'='1%'   (true  → same result)
+    #   WHERE col LIKE '%<original>' AND '1'='2%'   (false → empty result)
+    true_payload, false_payload = _make_bool_payloads(original_val)
 
     r_true  = await _request(client, method, *_inject_param(url, params, param_name, true_payload,  method)[0:2])
     r_false = await _request(client, method, *_inject_param(url, params, param_name, false_payload, method)[0:2])
@@ -461,7 +538,7 @@ async def _detect_sqli(
         false_vs_base = _body_diff_ratio(baseline.body, body_false)
         true_vs_false = _body_diff_ratio(body_true, body_false)
 
-        # True condition ≈ baseline AND False condition ≠ baseline
+        # Classic boolean: true ≈ baseline, false ≠ baseline, true ≠ false
         if (true_vs_base < BOOL_DIFF_RATIO
                 and false_vs_base >= BOOL_DIFF_RATIO
                 and true_vs_false >= BOOL_DIFF_RATIO):
@@ -469,8 +546,22 @@ async def _detect_sqli(
                 "detection": "boolean-based",
                 "payload": f"TRUE={true_payload!r} vs FALSE={false_payload!r}",
                 "evidence": (
-                    f"True diff={true_vs_base:.2f}, False diff={false_vs_base:.2f} "
-                    f"vs baseline — significant content difference detected"
+                    f"True≈baseline (diff={true_vs_base:.2f}), "
+                    f"False≠baseline (diff={false_vs_base:.2f}) — "
+                    f"content diverges on boolean condition change"
+                ),
+            }
+
+        # Alternate: both differ from baseline but significantly differ from each other
+        # Catches cases where true returns MORE data (e.g. OR 1=1 returning all rows)
+        if (true_vs_false >= BOOL_DIFF_RATIO * 2
+                and false_vs_base >= BOOL_DIFF_RATIO):
+            return {
+                "detection": "boolean-based-alt",
+                "payload": f"TRUE={true_payload!r} vs FALSE={false_payload!r}",
+                "evidence": (
+                    f"Significant response difference between boolean conditions "
+                    f"(true vs false diff={true_vs_false:.2f}) — consistent with SQLi"
                 ),
             }
 
@@ -479,7 +570,7 @@ async def _detect_sqli(
         inject_url, post_data = _inject_param(url, params, param_name, payload, method)
         result = await _request(
             client, method, inject_url, post_data,
-            timeout=REQUEST_TIMEOUT + 5,  # extra buffer for intentional delay
+            timeout=REQUEST_TIMEOUT + 6,  # extra buffer for intentional delay
         )
         if result is None:
             continue
@@ -715,7 +806,16 @@ def _extract_targets(
             # If URL has integer path segments it's still IDOR/SQLi candidate
             parts = [s for s in p.path.split("/") if s]
             has_int = any(s.isdigit() for s in parts)
-            if not has_int:
+            if has_int:
+                pass  # path-param endpoint, continue below
+            elif any(p.path.startswith(pfx) for pfx in ("/rest/", "/api/", "/v1/", "/v2/", "/v3/")):
+                # REST API endpoint with no discovered params — seed with common
+                # high-value param names as fallback injection candidates.
+                # These are the most frequently exploitable params on REST APIs.
+                for fallback in ("q", "search", "id", "email", "name", "comment",
+                                 "couponCode", "quantity", "userId"):
+                    qs_params[fallback] = ["1"]
+            else:
                 return  # No params + no IDs → not interesting for injection
 
         # Cap params per endpoint
@@ -736,7 +836,7 @@ def _extract_targets(
         # If arjun found params on this endpoint via POST, test as POST.
         # REST APIs accept JSON bodies — GET-only misses most injection surfaces.
         arjun_method = None
-        for r in arjun_raw:
+        for r in arjun_results:
             if r.get("url") == url and r.get("method", "GET").upper() == "POST":
                 arjun_method = "POST"
                 break
@@ -939,6 +1039,40 @@ async def _detect_xss_json(
                 f"XSS surface in JSON body field"
             ),
         }
+    return None
+
+
+async def _detect_ssti_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+) -> Optional[Dict[str, Any]]:
+    """SSTI detection via JSON body field injection."""
+    for payload, expected, engine in SSTI_CANARIES:
+        modified = _inject_json_field(json_body, field_name, payload)
+        result = await _request(client, "POST", url, data=modified, json_body=True)
+        if result is None:
+            continue
+        _, body, _ = result
+        if expected in body:
+            return {
+                "detection": "math-eval",
+                "payload": payload,
+                "evidence": (
+                    f"Expression {payload!r} evaluated to {expected!r} in JSON response — "
+                    f"indicates {engine} template engine execution in JSON field"
+                ),
+                "engine": engine,
+            }
+        if _SSTI_ENGINE_RE.search(body):
+            m = _SSTI_ENGINE_RE.search(body)
+            return {
+                "detection": "engine-error",
+                "payload": payload,
+                "evidence": f"Template engine error leaked in JSON response: {m.group(0)!r}",
+                "engine": engine,
+            }
     return None
 
 
@@ -1171,6 +1305,50 @@ class InspectorWorker(BaseWorker):
             except Exception as exc:
                 logger.debug(f"[inspector] JSON endpoint query failed: {exc}")
 
+        # Load OpenAPI-schema parameters from api_endpoint findings saved by katana.
+        # This feeds injection testing even when arjun finds nothing — the spec
+        # tells us exactly what params exist on every documented endpoint.
+        openapi_param_map: Dict[str, List[str]] = {}
+        if scan_id:
+            try:
+                from shared.models import ScanResultORM
+                from sqlalchemy import select, or_
+                from uuid import UUID as _UUID
+                async with self.session_factory() as _s:
+                    stmt = (
+                        select(ScanResultORM.url, ScanResultORM.raw_output)
+                        .where(
+                            ScanResultORM.scan_id == _UUID(scan_id),
+                            or_(
+                                ScanResultORM.vulnerability_type == "api_endpoint",
+                                ScanResultORM.vulnerability_type == "graphql_field",
+                            ),
+                        )
+                    )
+                    rows = await _s.execute(stmt)
+                    for row_url, row_raw in rows:
+                        if not row_url or not isinstance(row_raw, dict):
+                            continue
+                        params_all = row_raw.get("params", {}).get("all", [])
+                        if isinstance(params_all, list) and params_all:
+                            existing = openapi_param_map.get(row_url, [])
+                            openapi_param_map[row_url] = list(set(existing + params_all))
+                if openapi_param_map:
+                    logger.info(
+                        f"[inspector] Loaded OpenAPI/GraphQL params for "
+                        f"{len(openapi_param_map)} endpoint(s) from spec"
+                    )
+                    # Merge openapi params into arjun_raw so _extract_targets sees them
+                    for ep_url, param_names in openapi_param_map.items():
+                        arjun_raw.append({
+                            "url":        ep_url,
+                            "parameters": param_names,
+                            "method":     "GET",
+                            "source":     "openapi_spec",
+                        })
+            except Exception as exc:
+                logger.debug(f"[inspector] OpenAPI param query failed: {exc}")
+
         targets = _extract_targets(endpoints, arjun_raw, target, json_endpoint_map)
         if not targets:
             logger.warning("[inspector] No testable endpoints found (no parameters)")
@@ -1368,6 +1546,17 @@ class InspectorWorker(BaseWorker):
                             if xss_det:
                                 findings.append(
                                     _build_json_finding(ep, field_name, "xss_candidate", xss_det)
+                                )
+                                continue
+
+                        # Test SSTI via JSON body
+                        if "ssti" in field_vuln_types or "ssti" in forced_vuln_types:
+                            ssti_det = await _detect_ssti_json(
+                                client, ep.url, ep.json_body, field_name
+                            )
+                            if ssti_det:
+                                findings.append(
+                                    _build_json_finding(ep, field_name, "ssti_candidate", ssti_det)
                                 )
 
         return findings

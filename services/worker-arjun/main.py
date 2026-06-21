@@ -159,13 +159,11 @@ class ArjunWorker(BaseWorker):
         ]
 
         if headers_dict:
+            # Arjun --headers accepts a JSON string.  Pass as a single list item
+            # (no shell involved) so JWT token characters are never misinterpreted.
             cmd.extend(["--headers", json.dumps(headers_dict)])
 
-        # For POST method, also test JSON body (REST APIs use JSON, not form params)
-        if method == "POST":
-            cmd.extend(["--include", "application/json"])
-
-        logger.info(f"Arjun command ({method}): {' '.join(cmd)}")
+        logger.info(f"Arjun command ({method}): {' '.join(cmd[:8])}…")
 
         process = None
         try:
@@ -184,14 +182,13 @@ class ArjunWorker(BaseWorker):
             stdout_text = stdout_data.decode('utf-8', errors='ignore').strip()
             stderr_text = stderr_data.decode('utf-8', errors='ignore').strip()
 
+            if stdout_text:
+                logger.info(f"[arjun] stdout ({method}): {stdout_text[:1000]}")
+            if stderr_text:
+                logger.info(f"[arjun] stderr ({method}): {stderr_text[:500]}")
+
             if process.returncode not in [0, None]:
-                if stderr_text:
-                    logger.warning(f"arjun exited {process.returncode} ({method}): {stderr_text[:500]}")
-            else:
-                if stdout_text:
-                    logger.debug(f"arjun stdout ({method}): {stdout_text[:500]}")
-                if stderr_text:
-                    logger.debug(f"arjun stderr ({method}): {stderr_text[:300]}")
+                logger.warning(f"[arjun] exited {process.returncode} ({method})")
 
             return self._parse_output(output_file, method)
 
@@ -207,7 +204,8 @@ class ArjunWorker(BaseWorker):
 
     def _parse_output(self, output_file: str, method: str) -> List[Dict[str, Any]]:
         if not os.path.exists(output_file):
-            logger.warning(f"Arjun output file not found: {output_file}")
+            # Expected when arjun finds 0 hidden parameters — not an error
+            logger.info(f"[arjun] No output file ({method}) — arjun found 0 hidden parameters")
             return []
 
         try:

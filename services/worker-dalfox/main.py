@@ -74,25 +74,31 @@ class DalfoxWorker(BaseWorker):
         # Primary targets: GET URLs with query params (reflected XSS candidates)
         get_targets = [ep for ep in endpoints if _has_params(ep)]
 
-        # Secondary targets: API endpoints without GET params but which likely
-        # reflect input in JSON responses.  Dalfox with --mining-dict will
-        # discover hidden GET/POST parameters automatically.
-        # We add endpoints that look like REST/API paths (no static extension,
-        # no query string) so parameter-less API paths also get tested.
+        # Secondary targets: API/non-static endpoints without GET params.
+        # Dalfox with --mining-dict probes common GET/POST parameter names,
+        # discovering hidden inputs on REST endpoints that have no query string.
         def _is_api_endpoint(url: str) -> bool:
             try:
                 p = urlparse(url)
                 ext = os.path.splitext(p.path.lower())[1]
+                # Skip known static files
                 if ext in _STATIC_EXTS:
                     return False
-                # Focus on REST/API paths that are likely to reflect input
-                api_prefixes = ("/rest/", "/api/", "/graphql", "/v1/", "/v2/")
-                return any(p.path.startswith(pf) for pf in api_prefixes)
+                # Skip root and common navigation paths that serve SPA shells
+                if p.path in ("/", "") or p.path in ("/login", "/register", "/home"):
+                    return False
+                # Include all non-static, non-SPA-shell endpoints:
+                # REST/API paths, numeric ID paths (/product/42), search paths, etc.
+                _SPA_ONLY_EXTS = frozenset({".html", ".htm", ".xml", ".txt", ".json", ".yaml"})
+                if ext in _SPA_ONLY_EXTS:
+                    return False
+                return True
             except Exception:
                 return False
 
         api_targets = [ep for ep in endpoints if not _has_params(ep) and _is_api_endpoint(ep)]
-        all_targets = list(dict.fromkeys(get_targets + api_targets[:20]))  # cap API targets
+        # Increased cap: was 20, now 150 — Juice Shop has 100+ REST endpoints worth testing
+        all_targets = list(dict.fromkeys(get_targets + api_targets[:150]))
 
         if not all_targets:
             logger.info("[dalfox] No testable endpoints found — XSS scan skipped")
@@ -112,7 +118,7 @@ class DalfoxWorker(BaseWorker):
             f.write("\n".join(all_targets) + "\n")
 
         logger.info(f"[dalfox] Scanning {len(all_targets)} endpoint(s) "
-                    f"({len(get_targets)} GET-param + {len(api_targets[:20])} API)")
+                    f"({len(get_targets)} GET-param + {min(len(api_targets), 150)} API)")
 
         # Build command
         cmd = [

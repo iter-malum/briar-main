@@ -46,7 +46,7 @@ import math
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -55,6 +55,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from shared.worker_base import BaseWorker
 from shared.models import SeverityLevel
+from shared.js_fingerprint import fingerprint_js, aggregate_tech_stack, LibraryMatch  # type: ignore[attr-defined]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -154,27 +155,36 @@ class JsScannerWorker(BaseWorker):
 
         endpoints: List[str] = task_payload.get("endpoints", [])
 
-        # Collect .js URLs
-        js_urls = list(dict.fromkeys(
-            u for u in endpoints
-            if ".js" in u.lower() and not _is_static_vendor(u)
+        # Collect .js URLs — include vendor files for fingerprinting (but skip for secrets)
+        all_js_urls = list(dict.fromkeys(
+            u for u in endpoints if ".js" in u.lower()
         ))
+        non_vendor_urls = [u for u in all_js_urls if not _is_static_vendor(u)]
 
-        if not js_urls:
-            # Try to probe well-known JS paths from the target
-            js_urls = await self._collect_js_urls_from_target(target, auth_context)
+        if not all_js_urls:
+            all_js_urls = await self._collect_js_urls_from_target(target, auth_context)
+            non_vendor_urls = [u for u in all_js_urls if not _is_static_vendor(u)]
 
-        if not js_urls:
+        if not all_js_urls:
             logger.info("[jsscanner] No JS files found — skipping")
             return []
 
-        js_urls = js_urls[:MAX_JS_FILES]
-        logger.info(f"[jsscanner] Scanning {len(js_urls)} JS file(s) for secrets")
+        # Fingerprinting covers all JS including vendor CDN files (version detection
+        # needs e.g. jquery-3.6.0.min.js from cdnjs).  Secrets scanning skips vendor.
+        fingerprint_urls = all_js_urls[:MAX_JS_FILES]
+        secrets_urls = non_vendor_urls[:MAX_JS_FILES]
+
+        logger.info(
+            f"[jsscanner] {len(fingerprint_urls)} JS file(s) for fingerprinting, "
+            f"{len(secrets_urls)} for secrets scanning"
+        )
 
         headers = _build_headers(auth_context)
         semaphore = asyncio.Semaphore(CONCURRENCY)
         findings: List[Dict[str, Any]] = []
+        lib_matches: List[LibraryMatch] = []
         findings_lock = asyncio.Lock()
+        lib_lock = asyncio.Lock()
         start = asyncio.get_event_loop().time()
 
         async with httpx.AsyncClient(
@@ -184,18 +194,61 @@ class JsScannerWorker(BaseWorker):
             timeout=httpx.Timeout(FETCH_TIMEOUT),
         ) as client:
 
-            async def scan_one(js_url: str):
+            async def process_one(js_url: str):
                 if asyncio.get_event_loop().time() - start > TOTAL_TIMEOUT:
                     return
                 async with semaphore:
-                    partial = await self._scan_js_file(client, js_url)
-                    if partial:
-                        async with findings_lock:
-                            findings.extend(partial)
+                    content = await self._fetch_js(client, js_url)
+                    if content is None:
+                        return
 
-            await asyncio.gather(*[scan_one(u) for u in js_urls])
+                    # Library fingerprinting — runs on all JS files
+                    matches = fingerprint_js(js_url, content)
+                    if matches:
+                        async with lib_lock:
+                            lib_matches.extend(matches)
 
-        logger.info(f"[jsscanner] Secrets scan complete: {len(findings)} finding(s)")
+                    # Secrets scanning — skip vendor/CDN files
+                    if js_url in secrets_urls:
+                        secrets = self._scan_content(js_url, content)
+                        if secrets:
+                            async with findings_lock:
+                                findings.extend(secrets)
+
+            await asyncio.gather(*[process_one(u) for u in fingerprint_urls])
+
+        # Convert library matches to findings
+        lib_findings = _build_library_findings(lib_matches, target)
+        findings.extend(lib_findings)
+
+        # Emit a single tech_stack_detected finding that aggregates all libraries —
+        # consumers can use this to enrich app_type context without iterating findings.
+        if lib_matches:
+            tech_stack = aggregate_tech_stack(lib_matches)
+            findings.append({
+                "url":      target,
+                "type":     "tech_stack_detected",
+                "severity": SeverityLevel.info,
+                "description": (
+                    f"[jsscanner] JS library fingerprinting detected {len(tech_stack)} "
+                    f"libraries: "
+                    + ", ".join(f"{k} {v}" for k, v in sorted(tech_stack.items()))
+                ),
+                "raw_output": {
+                    "source":     "js_fingerprint",
+                    "tech_stack": tech_stack,
+                    "js_files_scanned": len(fingerprint_urls),
+                },
+            })
+            logger.info(
+                f"[jsscanner] Library fingerprinting: "
+                + ", ".join(f"{k}={v}" for k, v in sorted(tech_stack.items()))
+            )
+
+        logger.info(
+            f"[jsscanner] Complete — {len(findings)} finding(s) total "
+            f"({len(lib_findings)} library, {len(findings) - len(lib_findings) - (1 if lib_matches else 0)} secrets)"
+        )
         return findings
 
     async def _collect_js_urls_from_target(
@@ -228,45 +281,43 @@ class JsScannerWorker(BaseWorker):
             logger.debug(f"[jsscanner] Target JS collect failed: {exc}")
             return []
 
-    async def _scan_js_file(
+    async def _fetch_js(
         self,
         client: httpx.AsyncClient,
         js_url: str,
-    ) -> List[Dict[str, Any]]:
-        """Download a JS file and scan for secrets."""
+    ) -> Optional[str]:
+        """Download a JS file and return its text content, or None on failure."""
         try:
             resp = await client.get(js_url)
             if resp.status_code != 200:
-                return []
+                return None
             if len(resp.content) > MAX_FILE_SIZE:
                 logger.debug(f"[jsscanner] File too large ({len(resp.content)} bytes): {js_url}")
-                return []
-            content = resp.text
+                return None
+            return resp.text
         except Exception as exc:
             logger.debug(f"[jsscanner] Fetch failed for {js_url}: {exc}")
-            return []
+            return None
 
+    def _scan_content(
+        self,
+        js_url: str,
+        content: str,
+    ) -> List[Dict[str, Any]]:
+        """Scan already-fetched JS content for hard-coded secrets."""
         findings: List[Dict[str, Any]] = []
 
         for name, pattern, severity, desc_template in _PATTERNS:
             if len(findings) >= MAX_PER_FILE:
                 break
             for m in pattern.finditer(content):
-                # Extract the matched value — group 1 if capturing group, else full match
                 matched_value = (m.group(1) if m.lastindex else m.group(0)).strip()
-
-                # Skip obvious placeholders / low-entropy values
                 if not _is_likely_real(matched_value):
                     continue
-
-                # Context: up to 120 chars around the match for the report
                 start_pos = max(0, m.start() - 40)
                 end_pos   = min(len(content), m.end() + 40)
                 context   = content[start_pos:end_pos].replace("\n", " ").strip()
-
-                # Redact: show only first 8 chars of the actual secret
-                redacted = matched_value[:8] + "…" if len(matched_value) > 8 else matched_value
-
+                redacted  = matched_value[:8] + "…" if len(matched_value) > 8 else matched_value
                 findings.append({
                     "url":         js_url,
                     "type":        f"secret-{name}",
@@ -277,20 +328,76 @@ class JsScannerWorker(BaseWorker):
                         f"Context: {context[:120]!r}"
                     ),
                     "raw_output": {
-                        "url":           js_url,
-                        "secret_type":   name,
+                        "url":            js_url,
+                        "secret_type":    name,
                         "value_redacted": redacted,
-                        "context":       context[:200],
-                        "pattern":       pattern.pattern[:80],
+                        "context":        context[:200],
+                        "pattern":        pattern.pattern[:80],
                     },
                 })
-
                 if len(findings) >= MAX_PER_FILE:
                     break
 
         if findings:
             logger.info(f"[jsscanner] {js_url}: {len(findings)} secret(s) found")
         return findings
+
+
+# ── Library finding builder ───────────────────────────────────────────────────
+
+def _build_library_findings(
+    matches: List[LibraryMatch],
+    target: str,
+) -> List[Dict[str, Any]]:
+    """Convert LibraryMatch objects to informational js_library findings.
+
+    One finding per unique library (deduped by key — best detection method wins).
+    These are purely informational: they enrich the app tech-stack report.
+    CVE analysis is delegated to worker-retirejs.
+    """
+    # Prefer detections with a real version string over "unknown"/"detected"
+    _method_rank = {"filename": 3, "banner": 2, "version_var": 2}
+    _has_version = lambda m: m.version not in ("unknown", "detected")
+
+    best: Dict[str, LibraryMatch] = {}
+    for m in matches:
+        existing = best.get(m.library_key)
+        if existing is None:
+            best[m.library_key] = m
+        elif _has_version(m) and not _has_version(existing):
+            best[m.library_key] = m
+        elif _method_rank.get(m.detection_method, 0) > _method_rank.get(existing.detection_method, 0):
+            best[m.library_key] = m
+
+    findings: List[Dict[str, Any]] = []
+    for lib_key in sorted(best):
+        m = best[lib_key]
+        ver_display = m.version if m.version not in ("unknown",) else "version unknown"
+        findings.append({
+            "url":      m.js_url,
+            "type":     "js_library",
+            "severity": SeverityLevel.info,
+            "description": (
+                f"[jsscanner] {m.display_name} {ver_display} detected in {m.js_url} "
+                f"(via {m.detection_method})"
+            ),
+            "raw_output": {
+                "source":           "js_fingerprint",
+                "library":          m.library_key,
+                "display_name":     m.display_name,
+                "version":          m.version,
+                "detection_method": m.detection_method,
+                "js_url":           m.js_url,
+                "nuclei_tags":      m.nuclei_tags,
+                "target":           target,
+            },
+        })
+        logger.info(
+            f"[jsscanner/fingerprint] {m.display_name} {ver_display} "
+            f"via {m.detection_method} in {m.js_url}"
+        )
+
+    return findings
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -250,10 +250,6 @@ class JWTToolWorker(BaseWorker):
         else:
             cmd.extend(["-rh", f"{inject_param}: {token}"])
 
-        # Use the request method
-        if method.upper() == "POST":
-            cmd.extend(["-pd", ""])  # empty POST data (jwt_tool will inject token)
-
         # Brute-force weak HMAC secret if wordlist exists
         if os.path.exists(WORDLIST):
             cmd.extend(["-C", "-d", WORDLIST])
@@ -286,7 +282,10 @@ class JWTToolWorker(BaseWorker):
                 return []
 
             output = stdout_data.decode("utf-8", errors="ignore")
-            logger.debug(f"[jwt_tool] Output length: {len(output)} chars")
+            logger.info(f"[jwt_tool] Output ({len(output)} chars) for {url}")
+            if output:
+                # Log first 2000 chars so we can see test results in the scan logs
+                logger.info(f"[jwt_tool] Output preview:\n{output[:2000]}")
             return _parse_jwt_tool_output(output, token, url, inject_param)
 
         except FileNotFoundError:

@@ -51,11 +51,17 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {
             "wordlist_override":     None,
         },
         "nuclei": {
-            "extra_tags":      ["xss", "cors", "csp", "clickjacking", "dom"],
+            # SPA + REST API combo (Juice Shop, React/Express, Angular/Node):
+            # - jwt/auth: token manipulation, missing auth headers, weak JWT
+            # - nodejs/express: Node.js CVEs, prototype pollution, path traversal
+            # - api: REST API misconfigurations, undocumented endpoints
+            # - injection: broad injection category (SQL, SSTI, cmdi templates)
+            "extra_tags":      ["xss", "cors", "csp", "clickjacking", "dom",
+                                "jwt", "auth", "token", "nodejs", "api", "injection"],
             "template_paths":  [],
         },
         "inspector": {
-            "priority_types":  ["xss_candidate", "open_redirect"],
+            "priority_types":  ["xss_candidate", "open_redirect", "sqli_candidate"],
         },
         "gobuster": {
             "extensions": "html,js,json",

@@ -46,6 +46,7 @@ TOOL_QUEUES: Dict[str, str] = {
     "graphql":    "scan.dast.graphql",
     "openapi":    "scan.dast.openapi",
     "jsscanner":  "scan.probe.jsscanner",
+    "retirejs":   "scan.probe.retirejs",
     # ── M11: Access control testing ────────────────────────────────────────────
     "cors":       "scan.dast.cors",
     "bola":       "scan.dast.bola",
@@ -66,10 +67,13 @@ TOOL_QUEUES: Dict[str, str] = {
 
 FINDING_ROUTES: Dict[str, Dict] = {
     # ── Inspector / DAST candidates → exploitation ───────────────────────────
+    # sqli_candidate: requires_exploit=False — sqlmap confirms (not just exploits).
+    # Without this, confirmed injection surfaces are never validated by sqlmap
+    # even in DAST-only scans, and the scan reports 0 confirmed vulnerabilities.
     "sqli_candidate": {
         "tool":             "sqlmap",
-        "requires_exploit": True,
-        "description":      "SQL injection surface → sqlmap exploitation",
+        "requires_exploit": False,
+        "description":      "SQL injection surface → sqlmap confirmation + exploitation",
     },
     # ── Inspector candidates → verification (non-exploitative) ───────────────
     "xss_candidate": {
@@ -80,12 +84,12 @@ FINDING_ROUTES: Dict[str, Dict] = {
     # ── M9: SSTI + CMDi exploitation ─────────────────────────────────────────
     "ssti_candidate": {
         "tool":             "tplmap",
-        "requires_exploit": True,
+        "requires_exploit": False,
         "description":      "SSTI surface → tplmap engine detection + RCE confirmation",
     },
     "cmdi_candidate": {
         "tool":             "commix",
-        "requires_exploit": True,
+        "requires_exploit": False,
         "description":      "Command injection surface → commix confirmation",
     },
     # ── M9: JWT security testing (non-exploitative) ───────────────────────────
@@ -124,7 +128,8 @@ TECH_TO_NUCLEI_TAGS: Dict[str, List[str]] = {
     "django":      ["django", "python"],
     "laravel":     ["laravel", "php"],
     "spring":      ["spring", "java"],
-    "nodejs":      ["nodejs", "javascript"],
+    "nodejs":      ["nodejs", "javascript", "injection", "jwt"],
+    "express":     ["nodejs", "injection"],
     "react":       ["xss", "javascript"],
     "angular":     ["xss", "javascript"],
     "jquery":      ["jquery", "javascript"],
@@ -180,13 +185,15 @@ PHASES: List[Dict] = [
     # it works against the base host).
     {
         "id": "probe",
-        "tools": {"httpx", "gobuster", "jsscanner"},
+        "tools": {"httpx", "gobuster", "jsscanner", "retirejs"},
         "trigger_after": {"katana"},
         "source_tools": {
             "httpx":     ["katana"],
             "gobuster":  ["katana"],
-            # M10: jsscanner gets .js URLs from katana for secret detection
             "jsscanner": ["katana"],
+            # retirejs gets the same JS URL list as jsscanner but runs retire.js CLI
+            # for CVE detection; jsscanner handles secrets + info fingerprinting
+            "retirejs":  ["katana"],
         },
         "requires_explicit": False,
         "requires_sqli": False,
@@ -387,8 +394,23 @@ APP_TYPE_SIGNATURES: Dict[str, Dict] = {
     # correct nuclei tags (nodejs/express), and no traditional-spider explosions.
     "express":        {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     "node.js":        {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "nodejs":         {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "node":           {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
     "socket.io":      {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
     "connect.sid":    {"app_type": "spa", "is_spa": True,  "framework": "Express"},
+    # OWASP Juice Shop — explicitly detected by title / X-Powered-By header
+    "juice":          {"app_type": "spa", "is_spa": True,  "framework": "Express"},
+    "owasp":          {"app_type": "spa", "is_spa": True,  "framework": "Express"},
+    # Webpack / TypeScript / ES modules → bundled SPA
+    "webpack":        {"app_type": "spa", "is_spa": True,  "framework": None},
+    "typescript":     {"app_type": "spa", "is_spa": True,  "framework": None},
+    # Angular detection: ng-version attribute, @angular, zone.js
+    "angularjs":      {"app_type": "spa", "is_spa": True,  "framework": "Angular"},
+    "ng-version":     {"app_type": "spa", "is_spa": True,  "framework": "Angular"},
+    "@angular":       {"app_type": "spa", "is_spa": True,  "framework": "Angular"},
+    "zone.js":        {"app_type": "spa", "is_spa": True,  "framework": "Angular"},
+    # X-Powered-By header value variants (WhatWeb X-PoweredBy plugin)
+    "x-powered-by":   {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     # Traditional MVC — server-rendered, good for standard DAST
     "php":            {"app_type": "traditional", "is_spa": False, "lang": "PHP"},
     "laravel":        {"app_type": "traditional", "is_spa": False, "framework": "Laravel"},
@@ -428,6 +450,13 @@ def detect_app_type(whatweb_raw_outputs: List[Dict]) -> Dict:
                     for v in val:
                         if isinstance(v, str):
                             tech_stack.append(v.lower())
+                elif isinstance(val, dict):
+                    # e.g. tech_with_versions: {"X-Powered-By": "Express", "jQuery": "3.6"}
+                    # Reading values surfaces "express", "node.js", etc.
+                    for k2, v2 in val.items():
+                        tech_stack.append(k2.lower())
+                        if isinstance(v2, str):
+                            tech_stack.append(v2.lower())
 
             # New WhatWebWorker format stores categorized tech in a nested structure.
             # Read language, frontend library, and server names from it so that
@@ -443,6 +472,12 @@ def detect_app_type(whatweb_raw_outputs: List[Dict]) -> Dict:
                 title = categorized.get("title")
                 if isinstance(title, str) and title:
                     tech_stack.append(title.lower())
+                # interesting_headers values often contain framework names
+                # e.g. {"x-powered-by": "Express"} → add "express" to tech_stack
+                for hdr_name, hdr_val in categorized.get("interesting_headers", {}).items():
+                    tech_stack.append(hdr_name.lower())
+                    if isinstance(hdr_val, str):
+                        tech_stack.append(hdr_val.lower())
 
     tech_text = " ".join(tech_stack)
 
@@ -456,6 +491,17 @@ def detect_app_type(whatweb_raw_outputs: List[Dict]) -> Dict:
                 "framework": classification.get("framework") or classification.get("lang"),
                 "tech_stack": list(set(tech_stack))[:30],  # cap for payload size
             }
+
+    # Fallback: if we detected any JavaScript / generic Script entry, treat as SPA.
+    # Many modern apps (Juice Shop, Create React App, Vite) only show "JavaScript"
+    # in WhatWeb output because the framework is bundled and fingerprint-invisible.
+    if "javascript" in tech_text or "script" in tech_text:
+        return {
+            "app_type":  "spa",
+            "is_spa":    True,
+            "framework": None,
+            "tech_stack": list(set(tech_stack))[:30],
+        }
 
     return {
         "app_type":  "unknown",

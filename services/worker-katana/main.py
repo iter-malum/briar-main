@@ -27,6 +27,7 @@ import logging
 import os
 import re
 import sys
+from collections import Counter
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 
@@ -48,15 +49,11 @@ logger = logging.getLogger("katana-worker")
 # ── Well-known API spec paths to probe ────────────────────────────────────────
 
 API_SPEC_PATHS = [
-    # OpenAPI / Swagger
+    # OpenAPI / Swagger JSON
     "/openapi.json",
-    "/openapi.yaml",
     "/swagger.json",
-    "/swagger.yaml",
     "/api/swagger.json",
-    "/api/swagger.yaml",
     "/api/openapi.json",
-    "/api/openapi.yaml",
     "/api/v1/openapi.json",
     "/api/v2/openapi.json",
     "/api/v3/openapi.json",
@@ -64,12 +61,17 @@ API_SPEC_PATHS = [
     "/v1/openapi.json",
     "/v2/openapi.json",
     "/docs/openapi.json",
-    # Swagger UI endpoint hints
-    "/swagger-ui.html",
-    "/swagger-ui/index.html",
+    # OpenAPI / Swagger YAML
+    "/openapi.yaml",
+    "/swagger.yaml",
+    "/api/swagger.yaml",
+    "/api/openapi.yaml",
+    # Swagger UI / API Docs pages (also probed with Accept:application/json)
     "/api-docs",
     "/api-docs/",
     "/swagger",
+    "/swagger-ui.html",
+    "/swagger-ui/index.html",
     "/docs",
     "/redoc",
     # Spring Boot / Actuator
@@ -86,6 +88,44 @@ API_SPEC_PATHS = [
     "/?wsdl",
     "/service?wsdl",
 ]
+
+# Sensitive paths probed directly — not spec endpoints but high-value findings.
+# These supplement katana's crawl on common targets (Juice Shop, Laravel, etc.)
+SENSITIVE_PROBE_PATHS = [
+    # Exposed data directories
+    "/ftp/",
+    "/ftp",
+    "/.git/",
+    "/.env",
+    "/.env.production",
+    "/.env.local",
+    "/config.json",
+    "/config.yml",
+    "/config.yaml",
+    "/secrets.json",
+    "/backup.zip",
+    "/dump.sql",
+    # Admin / management interfaces
+    "/administration",
+    "/admin",
+    "/admin/",
+    "/manage",
+    "/dashboard",
+    "/private",
+    # Juice Shop specific well-known paths
+    "/rest/user/whoami",
+    "/rest/products/search?q=test",
+    "/api/Users",
+    "/api/Users/1",
+    "/metrics",
+    "/robot.txt",
+    "/security.txt",
+    "/.well-known/security.txt",
+]
+
+# Paths that may return Swagger JSON when requested with Accept: application/json
+# (e.g. OWASP Juice Shop /api-docs serves HTML by default but JSON when asked)
+_API_DOCS_JSON_PROBE = frozenset({"/api-docs", "/api-docs/", "/swagger", "/docs"})
 
 
 def _build_cookie_header(cookies: List[Dict[str, str]]) -> str:
@@ -297,10 +337,21 @@ class KatanaWorker(BaseWorker):
 
         # ── API schema discovery ───────────────────────────────────────────────
         schema_results = await self._probe_api_schemas(target, headers, cookies)
+        # Finding-type results (swagger_found, graphql_found) must NOT be deduped
+        # by URL — they share the same URL as the spec endpoint record but carry
+        # routing information the finding_router needs.  Only skip true endpoint
+        # duplicates (things that describe a crawlable URL, not a detection event).
+        _ENDPOINT_TYPES = frozenset({
+            "endpoint", "api_endpoint", "js_extracted_endpoint",
+            "openapi_spec", "api_schema_endpoint", "graphql_endpoint", "graphql_field",
+        })
         for r in schema_results:
-            if r["url"] not in existing_urls:
-                results.append(r)
+            r_type = r.get("type", "")
+            if r_type in _ENDPOINT_TYPES:
+                if r["url"] in existing_urls:
+                    continue
                 existing_urls.add(r["url"])
+            results.append(r)
 
         # ── M8: JS endpoint extraction ─────────────────────────────────────────
         if self.js_extract:
@@ -309,6 +360,11 @@ class KatanaWorker(BaseWorker):
                 if r["url"] not in existing_urls:
                     results.append(r)
                     existing_urls.add(r["url"])
+
+        # ── Sensitive path probing ─────────────────────────────────────────────
+        sensitive_results = await self._probe_sensitive_paths(target, headers, cookies)
+        for r in sensitive_results:
+            results.append(r)
 
         logger.info(f"[katana] Total unique endpoints: {len(results)}")
         return results
@@ -744,6 +800,17 @@ class KatanaWorker(BaseWorker):
                         if not abs_url.startswith(origin):
                             continue
 
+                        # Rule 5: path segment doubling — catches JS extraction artifacts
+                        # where urljoin(js_url, relative_path) doubles the JS file's
+                        # directory prefix into the resolved URL.
+                        # e.g. js_url=/address/assets/public/chunk.js, raw_path=assets/public/chunk.js
+                        # → urljoin → /address/assets/public/assets/public/chunk.js
+                        # Detect: any meaningful path segment (len>3) that appears ≥2 times.
+                        _abs_parts = [s for s in urlparse(abs_url).path.split("/") if s]
+                        _seg_counts = Counter(s for s in _abs_parts if len(s) > 3)
+                        if _seg_counts and max(_seg_counts.values()) >= 2:
+                            continue
+
                         # Deduplicate
                         norm = abs_url.split("?")[0].rstrip("/")
                         if norm in found_paths:
@@ -818,7 +885,27 @@ class KatanaWorker(BaseWorker):
 
                 url = urljoin(origin, path)
                 try:
-                    resp = await client.get(url)
+                    # For Swagger UI pages, probe with Accept: application/json first —
+                    # frameworks like swagger-ui-express serve JSON when explicitly asked.
+                    if path in _API_DOCS_JSON_PROBE:
+                        json_resp = await client.get(
+                            url, headers={"Accept": "application/json"}
+                        )
+                        if json_resp.status_code == 200:
+                            json_preview = json_resp.text[:3000]
+                            if (
+                                '"openapi"' in json_preview
+                                or '"swagger"' in json_preview
+                                or ('"paths"' in json_preview and '"info"' in json_preview)
+                            ):
+                                # Treat this as a discovered JSON spec
+                                resp = json_resp
+                            else:
+                                resp = await client.get(url)
+                        else:
+                            resp = await client.get(url)
+                    else:
+                        resp = await client.get(url)
 
                     if resp.status_code >= 500:
                         consecutive_5xx += 1
@@ -834,58 +921,126 @@ class KatanaWorker(BaseWorker):
 
                     # ── OpenAPI / Swagger JSON ─────────────────────────────────
                     if ("json" in ct or url.endswith(".json")) and resp.content:
-                        try:
-                            spec = resp.json()
-                            api_paths = self._extract_openapi_paths(spec, origin)
-                            for ep in api_paths:
-                                results.append({
-                                    "url": ep["url"],
-                                    "type": "api_endpoint",
-                                    "description": f"API endpoint from {path}: [{ep['method']}] {ep['path']}",
-                                    "severity": SeverityLevel.info,
-                                    "method": ep["method"],
-                                    "has_params": ep["has_params"],
-                                    "param_names": ep["param_names"],
-                                    "raw_output": {
-                                        "source": "openapi_spec",
-                                        "spec_url": url,
-                                        "operation": ep.get("operation", {}),
-                                        "params": {
-                                            "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
-                                            "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
-                                            "all":  ep["param_names"],
-                                        },
-                                    },
-                                })
-                            if api_paths:
-                                logger.info(f"[katana] OpenAPI spec at {url}: extracted {len(api_paths)} endpoints")
-                            # Save the spec endpoint itself
+                        # Guard: confirm the body is actually an OpenAPI/Swagger spec,
+                        # not the SPA shell (Angular returns 200 + HTML for any path).
+                        raw_preview = resp.text[:3000]
+                        is_openapi_json = (
+                            '"openapi"' in raw_preview
+                            or '"swagger"' in raw_preview
+                            or ('"paths"' in raw_preview and '"info"' in raw_preview)
+                        )
+                        if is_openapi_json:
+                            # Emit swagger_found BEFORE any parsing that might raise.
+                            # finding_router needs this even if endpoint extraction fails.
                             results.append(self._make_spec_result(url, "openapi_spec"))
-                            # M10: emit routing finding so finding_router triggers worker-openapi
                             results.append({
                                 "url":      url,
                                 "type":     "swagger_found",
                                 "severity": SeverityLevel.info,
                                 "description": (
-                                    f"OpenAPI/Swagger spec discovered at {url} — "
-                                    f"{len(api_paths)} endpoint(s) defined. "
+                                    f"OpenAPI/Swagger JSON spec discovered at {url}. "
                                     f"Route to worker-openapi for spec-driven testing."
                                 ),
                                 "raw_output": {
-                                    "spec_url":       url,
-                                    "endpoint_count": len(api_paths),
-                                    "finding_type":   "swagger_found",
-                                    "route_to":       "openapi",
-                                    "route_context":  {
+                                    "spec_url":     url,
+                                    "finding_type": "swagger_found",
+                                    "route_to":     "openapi",
+                                    "route_context": {
                                         "param":   "spec_url",
                                         "method":  "GET",
                                         "payload": url,
                                     },
                                 },
                             })
+                            # Best-effort: extract individual endpoints from the spec.
+                            # Failure here is non-fatal — swagger_found is already saved.
+                            try:
+                                spec = resp.json()
+                                api_paths = self._extract_openapi_paths(spec, origin)
+                                for ep in api_paths:
+                                    results.append({
+                                        "url":         ep["url"],
+                                        "type":        "api_endpoint",
+                                        "description": f"OpenAPI endpoint [{ep['method']}] {ep['path']}",
+                                        "severity":    SeverityLevel.info,
+                                        "method":      ep["method"],
+                                        "has_params":  ep["has_params"],
+                                        "param_names": ep["param_names"],
+                                        "raw_output": {
+                                            "source":    "openapi_spec",
+                                            "spec_url":  url,
+                                            "operation": ep.get("operation", {}),
+                                            "params": {
+                                                "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
+                                                "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
+                                                "all":  ep["param_names"],
+                                            },
+                                        },
+                                    })
+                                if api_paths:
+                                    logger.info(f"[katana] OpenAPI JSON spec at {url}: extracted {len(api_paths)} endpoints")
+                            except Exception as exc:
+                                logger.debug(f"[katana] OpenAPI JSON spec parsing failed for {url}: {exc}")
                             continue
-                        except Exception:
-                            pass
+
+                    # ── OpenAPI / Swagger YAML ─────────────────────────────────
+                    if ("yaml" in ct or url.endswith((".yaml", ".yml"))) and resp.content:
+                        raw_preview = resp.text[:3000]
+                        is_openapi_yaml = (
+                            "openapi:" in raw_preview
+                            or "swagger:" in raw_preview
+                            or ("paths:" in raw_preview and "info:" in raw_preview)
+                        )
+                        if is_openapi_yaml:
+                            results.append(self._make_spec_result(url, "openapi_spec"))
+                            results.append({
+                                "url":      url,
+                                "type":     "swagger_found",
+                                "severity": SeverityLevel.info,
+                                "description": (
+                                    f"OpenAPI/Swagger YAML spec discovered at {url}. "
+                                    f"Route to worker-openapi for spec-driven testing."
+                                ),
+                                "raw_output": {
+                                    "spec_url":     url,
+                                    "finding_type": "swagger_found",
+                                    "route_to":     "openapi",
+                                    "route_context": {
+                                        "param":   "spec_url",
+                                        "method":  "GET",
+                                        "payload": url,
+                                    },
+                                },
+                            })
+                            try:
+                                import yaml as _yaml
+                                spec = _yaml.safe_load(resp.text)
+                                api_paths = self._extract_openapi_paths(spec, origin)
+                                for ep in api_paths:
+                                    results.append({
+                                        "url":         ep["url"],
+                                        "type":        "api_endpoint",
+                                        "description": f"OpenAPI endpoint [{ep['method']}] {ep['path']}",
+                                        "severity":    SeverityLevel.info,
+                                        "method":      ep["method"],
+                                        "has_params":  ep["has_params"],
+                                        "param_names": ep["param_names"],
+                                        "raw_output": {
+                                            "source":    "openapi_spec",
+                                            "spec_url":  url,
+                                            "operation": ep.get("operation", {}),
+                                            "params": {
+                                                "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
+                                                "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
+                                                "all":  ep["param_names"],
+                                            },
+                                        },
+                                    })
+                                if api_paths:
+                                    logger.info(f"[katana] OpenAPI YAML spec at {url}: extracted {len(api_paths)} endpoints")
+                            except Exception as exc:
+                                logger.debug(f"[katana] OpenAPI YAML spec parsing failed for {url}: {exc}")
+                            continue
 
                     # ── GraphQL endpoint ───────────────────────────────────────
                     if "graphql" in path.lower():
@@ -931,6 +1086,109 @@ class KatanaWorker(BaseWorker):
 
         if results:
             logger.info(f"[katana] API schema discovery found {len(results)} additional endpoints")
+        return results
+
+    async def _probe_sensitive_paths(
+        self,
+        target: str,
+        headers: Dict[str, str],
+        cookies: List[Dict],
+    ) -> List[Dict[str, Any]]:
+        """Probe well-known sensitive paths and emit findings for accessible ones."""
+        parsed = urlparse(target)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        request_headers = dict(headers)
+        if cookies:
+            cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            request_headers["Cookie"] = cookie_str
+
+        results: List[Dict[str, Any]] = []
+
+        # SPA baseline: Angular / React apps return 200+HTML for every unknown path.
+        # If the baseline for a non-existent path is also 200+HTML we skip that signal.
+        spa_baseline_is_html = False
+        try:
+            async with _httpx.AsyncClient(
+                headers=request_headers, follow_redirects=True, timeout=8.0, verify=False
+            ) as client:
+                canary = await client.get(urljoin(origin, "/briar-canary-path-xyz-does-not-exist"))
+                if canary.status_code == 200 and "html" in canary.headers.get("content-type", "").lower():
+                    spa_baseline_is_html = True
+        except Exception:
+            pass
+
+        async with _httpx.AsyncClient(
+            headers=request_headers, follow_redirects=True, timeout=10.0, verify=False
+        ) as client:
+            for path in SENSITIVE_PROBE_PATHS:
+                url = urljoin(origin, path)
+                try:
+                    resp = await client.get(url)
+                except (_httpx.TimeoutException, _httpx.ConnectError):
+                    continue
+                except Exception as exc:
+                    logger.debug(f"[katana/sensitive] {url}: {exc}")
+                    continue
+
+                if resp.status_code not in (200, 201, 206):
+                    continue
+
+                ct = resp.headers.get("content-type", "").lower()
+                body_preview = resp.text[:500]
+
+                # Skip SPA shell responses (HTML when we expect directory/JSON/text)
+                is_html_response = "html" in ct
+                if spa_baseline_is_html and is_html_response:
+                    # Extra check: real sensitive HTML pages often contain directory
+                    # listings, login forms, or structured content — not Angular root app
+                    if not any(kw in body_preview.lower() for kw in (
+                        "index of", "directory", "<table", "href=", "parent directory",
+                        '"users"', '"email"', '"password"', 'administration', 'login'
+                    )):
+                        continue
+
+                # Classify the finding
+                severity = SeverityLevel.info
+                finding_type = "sensitive_path"
+                description = f"Sensitive path accessible: {url} (HTTP {resp.status_code})"
+
+                # FTP / backup / data exposure
+                if any(kw in path for kw in ("/ftp", ".env", ".git", "backup", "dump", "secrets", "config")):
+                    severity = SeverityLevel.high
+                    finding_type = "exposed_resource"
+                    description = f"Exposed sensitive resource at {url} — file/directory accessible without auth"
+                elif path in ("/api/Users", "/api/Users/1"):
+                    severity = SeverityLevel.high
+                    finding_type = "idor_candidate"
+                    description = f"User enumeration endpoint accessible: {url} — may expose PII without auth"
+                elif path in ("/administration", "/admin", "/admin/"):
+                    severity = SeverityLevel.high
+                    finding_type = "admin_panel"
+                    description = f"Admin panel accessible at {url}"
+                elif "json" in ct or '"' in body_preview:
+                    severity = SeverityLevel.medium
+                    finding_type = "api_endpoint"
+                    description = f"API endpoint responding at {url} (HTTP {resp.status_code})"
+                else:
+                    finding_type = "endpoint"
+
+                results.append({
+                    "url":         url,
+                    "type":        finding_type,
+                    "severity":    severity,
+                    "description": description,
+                    "raw_output": {
+                        "source":       "sensitive_probe",
+                        "status_code":  resp.status_code,
+                        "content_type": ct,
+                        "body_preview": body_preview,
+                    },
+                })
+                logger.info(f"[katana/sensitive] FOUND {finding_type} at {url} ({resp.status_code})")
+
+        if results:
+            logger.info(f"[katana/sensitive] {len(results)} sensitive paths accessible")
         return results
 
     def _make_spec_result(self, url: str, type_: str) -> Dict[str, Any]:

@@ -314,7 +314,12 @@ class BOLAWorker(BaseWorker):
                 boundary_url = template.replace("{id}", str(bid))
                 try:
                     resp = await client.get(boundary_url, headers=auth_headers)
-                    if resp.status_code in (200, 201) and len(resp.content) > 20:
+                    resp_ct = resp.headers.get("content-type", "")
+                    if (
+                        resp.status_code in (200, 201)
+                        and len(resp.content) > 20
+                        and "text/html" not in resp_ct  # SPA wildcard routes return HTML for any path
+                    ):
                         findings.append({
                             "url":         boundary_url,
                             "type":        "bola-boundary-id",
@@ -476,18 +481,16 @@ def _extract_id_templates(endpoints: List[str]) -> List[Dict[str, Any]]:
             if not parts:
                 continue
 
-            # Skip URLs that contain repeated path segments — these are artefacts
-            # of the katana JS-extraction URL-doubling bug and produce false-positive
-            # "unauthenticated access" findings on JavaScript bundle files.
-            # A real resource path never has the same segment appear consecutively
-            # more than once (e.g. /assets/public/assets/public/chunk.js).
+            # Skip URLs with repeated non-trivial path segments — artefacts of the
+            # katana JS-extraction URL-doubling bug (e.g. /assets/public/assets/public/chunk.js
+            # or /.well-known/csaf/0/.well-known/csaf/chunk.js).  Real resource paths
+            # never repeat the same meaningful segment.
             path_lower = p.path.lower()
             if "assets/public/assets" in path_lower or "node_modules" in path_lower:
                 continue
-            # Generic check: any segment that appears 3+ times in the path
             from collections import Counter
-            seg_counts = Counter(parts)
-            if max(seg_counts.values()) >= 3:
+            seg_counts = Counter(s for s in parts if len(s) > 3)
+            if seg_counts and max(seg_counts.values()) >= 2:
                 continue
 
             for i, seg in enumerate(parts):

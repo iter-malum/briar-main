@@ -613,6 +613,34 @@ services:
       - briar-net
     restart: unless-stopped
 
+  worker-retirejs:
+    build:
+      context: .
+      dockerfile: services/worker-retirejs/Dockerfile
+    container_name: briar-worker-retirejs
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      RETIREJS_MAX_FILES: "150"
+      RETIREJS_CONCURRENCY: "10"
+      RETIREJS_FETCH_TIMEOUT: "15"
+      RETIREJS_RETIRE_TIMEOUT: "120"
+      RETIREJS_WORKER_TIMEOUT: "600"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
   # === M11 DAST WORKERS ===
 
   worker-cors:
