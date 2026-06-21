@@ -51,6 +51,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import string
 import sys
 import time
@@ -93,57 +94,8 @@ BOOL_DIFF_RATIO    = float(os.getenv("INSPECTOR_BOOL_DIFF",    "0.15"))  # ≥15
 # Each set assigns a vulnerability-type score weight to a parameter name.
 # A parameter can be in multiple sets (e.g. "id" → SQL + IDOR).
 
-SQL_PARAM_NAMES: Set[str] = {
-    "id", "uid", "user_id", "userid", "item_id", "product_id", "post_id",
-    "order_id", "cat_id", "category_id", "thread_id", "parent_id",
-    "search", "q", "query", "keyword", "keywords", "kw", "s", "term",
-    "filter", "where", "having", "group", "sort", "orderby", "order_by",
-    "column", "col", "field", "fields", "select",
-    "category", "cat", "type", "kind", "class", "tag", "genre",
-    "from", "to", "start", "end", "date", "year", "month", "day",
-    "page", "limit", "offset", "per_page", "count", "num", "rows",
-    "user", "username", "email", "login", "account", "member",
-    "name", "title", "description", "text", "content", "message",
-    "parent", "ref", "reference", "code", "sku", "slug",
-}
-
-SSTI_PARAM_NAMES: Set[str] = {
-    "template", "render", "view", "page", "content", "layout",
-    "message", "email_body", "body", "subject", "html", "tpl", "tmpl",
-    "format", "output", "theme", "header", "footer", "section",
-    "block", "widget", "component", "partial", "include",
-    "notification", "greeting", "signature",
-}
-
-CMDI_PARAM_NAMES: Set[str] = {
-    "cmd", "exec", "command", "run", "shell", "process", "execute",
-    "ping", "host", "ip", "addr", "address", "server", "domain",
-    "url", "uri", "link", "href", "src", "endpoint",
-    "path", "file", "filename", "filepath", "dir", "folder",
-    "program", "binary", "script", "tool", "util", "action",
-    "debug", "trace", "log", "import", "export",
-}
-
-REDIRECT_PARAM_NAMES: Set[str] = {
-    "redirect", "redirect_uri", "redirect_url", "return", "return_url",
-    "returnurl", "next", "goto", "url", "uri", "target", "dest",
-    "destination", "forward", "redir", "back", "callback", "continue",
-    "location", "referer", "href", "link", "go",
-}
-
-PATH_TRAVERSAL_PARAM_NAMES: Set[str] = {
-    "file", "filename", "path", "filepath", "dir", "folder", "directory",
-    "include", "require", "load", "read", "page", "template", "tpl",
-    "lang", "language", "locale", "module", "resource", "asset",
-    "config", "conf", "cfg", "data",
-}
-
-XSS_PARAM_NAMES: Set[str] = {
-    "name", "q", "search", "query", "keyword", "message", "comment",
-    "text", "content", "title", "description", "subject", "body",
-    "username", "email", "url", "ref", "callback", "redirect",
-    "error", "info", "msg", "alert", "notice", "status",
-}
+# Parameter name dictionaries removed — vulnerability type is now determined
+# by behavioral probe signals, not by parameter names. See universal_probe().
 
 # ── JWT detection pattern ─────────────────────────────────────────────────────
 # Three base64url segments: header.payload.signature
@@ -342,50 +294,38 @@ class EndpointTarget:
 
 def score_endpoint(url: str, params: Dict[str, List[str]]) -> Tuple[int, List[str]]:
     """
-    Score an (endpoint, params) pair for injection potential.
-    Returns (score, [vuln_type, ...]) where higher score = test first.
+    Priority score for scheduling — higher = test first.
+    Vulnerability types are no longer pre-assigned from param names;
+    universal_probe() determines them from application behavior at runtime.
     """
     score = 0
-    vuln_types: Set[str] = set()
     path = urlparse(url).path.lower()
 
-    # URL path signals
-    for pattern in ("/search", "/find", "/filter", "/query", "/list", "/get",
-                    "/fetch", "/execute", "/run", "/render", "/template",
-                    "\.php", "\.asp", "\.aspx", "\.jsp", "\.cfm"):
-        if re.search(pattern, path):
-            score += 1
+    _HIGH_VALUE = (
+        "/api/", "/rest/", "/v1/", "/v2/", "/v3/", "/v4/",
+        "/admin", "/user", "/auth", "/login", "/search",
+        "/upload", "/import", "/export", "/eval", "/exec",
+        "/render", "/template", "/run", "/debug",
+    )
+    for prefix in _HIGH_VALUE:
+        if prefix in path:
+            score += 3
             break
 
-    for name in params:
-        n = name.lower().strip()
+    # Legacy/interpreted path extensions
+    if re.search(r"\.(php|asp|aspx|jsp|cfm|cgi)$", path):
+        score += 2
 
-        if n in SQL_PARAM_NAMES:
-            score += 3
-            vuln_types.add("sqli")
-        if n in SSTI_PARAM_NAMES:
-            score += 3
-            vuln_types.add("ssti")
-        if n in CMDI_PARAM_NAMES:
-            score += 3
-            vuln_types.add("cmdi")
-        if n in PATH_TRAVERSAL_PARAM_NAMES:
-            score += 2
-            vuln_types.add("path_traversal")
-        if n in REDIRECT_PARAM_NAMES:
-            score += 2
-            vuln_types.add("open_redirect")
-        if n in XSS_PARAM_NAMES:
-            score += 1
-            vuln_types.add("xss")
+    # Integer path segments → IDOR / injection surface
+    parts = [s for s in path.split("/") if s]
+    if any(s.isdigit() for s in parts):
+        score += 2
 
-    # If no named param matched anything specific, still test for sqli/xss
-    # (catches generic params like "data", "value", "input")
-    if not vuln_types:
-        score += 1
-        vuln_types.update({"sqli", "xss"})
+    # More params = more attack surface
+    score += min(len(params), 5)
 
-    return score, list(vuln_types)
+    # vuln_types is now always empty — universal_probe() decides at runtime
+    return score, []
 
 
 # ── HTTP helpers ───────────────────────────────────────────────────────────────
@@ -467,13 +407,442 @@ def _body_diff_ratio(base: str, modified: str) -> float:
         return 0.0
     if not base or not modified:
         return 1.0
-    # Quick hash comparison
     if base == modified:
         return 0.0
-    # Size-based diff as a proxy (fast, avoids full diff on large pages)
     longer = max(len(base), len(modified))
     shorter = min(len(base), len(modified))
     return 1.0 - (shorter / longer)
+
+
+# ── Universal Probe Pipeline ───────────────────────────────────────────────────
+#
+# Replaces name-based vulnerability type assignment.  Every parameter goes
+# through 3 lightweight probe requests; the application's behavioral response
+# determines which targeted detectors are invoked.
+#
+# ProbeSignals carries all behavioral observations collected during the probe
+# phase.  _test_one() reads these signals to dispatch only the detectors that
+# are supported by evidence — no wasted requests, no missed coverage.
+
+@dataclass
+class ProbeSignals:
+    reflects_canary:    bool = False
+    reflection_ctx:     str  = "none"  # html | json | text | script | attr | none
+    quote_triggers_err: bool = False
+    db_error_found:     bool = False
+    template_eval:      bool = False
+    timing_anomaly:     bool = False
+    status_changed:     bool = False
+    value_is_url:       bool = False   # current param value is a URL
+
+
+def _classify_reflection_ctx(canary: str, body: str) -> str:
+    """Classify where in the response body the canary appears."""
+    idx = body.find(canary)
+    if idx == -1:
+        return "none"
+    before = body[max(0, idx - 80):idx]
+    after  = body[idx + len(canary): idx + len(canary) + 80]
+    ctx = (before + after).lower()
+
+    if re.search(r"<script[^>]*>", before, re.I) or "javascript:" in ctx:
+        return "script"
+    if re.search(r"<[a-z][^>]*\s[\w-]+=\s*[\"']?\s*$", before, re.I):
+        return "attr"
+    if "<" in before or ">" in after:
+        return "html"
+    if re.search(r'["\'][\s]*:', before):
+        return "json"
+    return "text"
+
+
+async def universal_probe(
+    client: "httpx.AsyncClient",
+    url: str,
+    method: str,
+    params: Dict[str, List[str]],
+    param_name: str,
+    baseline: Baseline,
+) -> ProbeSignals:
+    """
+    Run 3 lightweight probes against param_name and return behavioral signals.
+
+    Probe 1 — Canary reflection: unique alphanumeric string → where does it appear?
+    Probe 2 — Syntax sensitivity: quote, template marker, HTML tag sent in parallel.
+    Probe 3 — Timing anomaly: only when Probe 2 showed a signal (avoids slow scans).
+    """
+    sig = ProbeSignals()
+    canary = "BRIAR" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+    # ── Probe 1: canary reflection ─────────────────────────────────────────
+    inj_url, post_data = _inject_param(url, params, param_name, canary, method)
+    r = await _request(client, method, inj_url, post_data)
+    if r:
+        _, body, _ = r
+        if canary in body:
+            sig.reflects_canary = True
+            sig.reflection_ctx  = _classify_reflection_ctx(canary, body)
+
+    # ── Probe 2: syntax sensitivity (3 probes in parallel) ────────────────
+    syntax_payloads = ["'", '"{{7*7}}', "<briar-probe>"]
+    tasks = [
+        _request(client, method, *_inject_param(url, params, param_name, p, method)[:2])
+        for p in syntax_payloads
+    ]
+    probe_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for i, res in enumerate(probe_results):
+        if isinstance(res, Exception) or res is None:
+            continue
+        s, body, _ = res
+        if s != baseline.status or abs(len(body) - baseline.size) > 50:
+            sig.status_changed = True
+        if _SQL_ERROR_RE.search(body):
+            sig.db_error_found = True
+        if i == 1 and "49" in body:   # '"{{7*7}}' → template evaluated
+            sig.template_eval = True
+
+    # ── Probe 3: timing (only when syntax showed something interesting) ────
+    if sig.db_error_found or sig.status_changed:
+        t_inj, t_post = _inject_param(url, params, param_name, "' AND SLEEP(1)--", method)
+        t_r = await _request(client, method, t_inj, t_post, timeout=REQUEST_TIMEOUT + 3)
+        if t_r:
+            _, _, elapsed = t_r
+            if elapsed - (baseline.time_ms / 1000.0) >= 1.5:
+                sig.timing_anomaly = True
+
+    # ── Context: does current value look like a URL? ───────────────────────
+    orig = (params.get(param_name) or [""])[0]
+    if orig.startswith(("http://", "https://", "//")):
+        sig.value_is_url = True
+
+    return sig
+
+
+async def universal_probe_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+    baseline: Baseline,
+) -> ProbeSignals:
+    """Same as universal_probe but injects into a JSON body field."""
+    sig = ProbeSignals()
+    canary = "BRIAR" + "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+
+    # Probe 1: canary reflection
+    r = await _request(client, "POST", url,
+                       data=_inject_json_field(json_body, field_name, canary),
+                       json_body=True)
+    if r:
+        _, body, _ = r
+        if canary in body:
+            sig.reflects_canary = True
+            sig.reflection_ctx  = _classify_reflection_ctx(canary, body)
+
+    # Probe 2: syntax sensitivity (parallel)
+    syntax_payloads = ["'", '"{{7*7}}', "<briar-probe>"]
+    tasks = [
+        _request(client, "POST", url,
+                 data=_inject_json_field(json_body, field_name, p),
+                 json_body=True)
+        for p in syntax_payloads
+    ]
+    probe_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for i, res in enumerate(probe_results):
+        if isinstance(res, Exception) or res is None:
+            continue
+        s, body, _ = res
+        if s != baseline.status or abs(len(body) - baseline.size) > 50:
+            sig.status_changed = True
+        if _SQL_ERROR_RE.search(body):
+            sig.db_error_found = True
+        if i == 1 and "49" in body:
+            sig.template_eval = True
+
+    # Probe 3: timing
+    if sig.db_error_found or sig.status_changed:
+        t_r = await _request(client, "POST", url,
+                             data=_inject_json_field(json_body, field_name, "' AND SLEEP(1)--"),
+                             json_body=True,
+                             timeout=REQUEST_TIMEOUT + 3)
+        if t_r:
+            _, _, elapsed = t_r
+            if elapsed - (baseline.time_ms / 1000.0) >= 1.5:
+                sig.timing_anomaly = True
+
+    # URL context
+    field_val = json_body.get(field_name, "")
+    if isinstance(field_val, str) and field_val.startswith(("http://", "https://", "//")):
+        sig.value_is_url = True
+
+    return sig
+
+
+# ── SSRF detection ─────────────────────────────────────────────────────────────
+
+_SSRF_PROBES: List[Tuple[str, List[str]]] = [
+    ("http://169.254.169.254/latest/meta-data/",
+     ["ami-id", "instance-id", "local-ipv4", "placement", "security-credentials"]),
+    ("http://169.254.169.254/metadata/v1/",
+     ["hostname", "interfaces", "droplet_id"]),            # DigitalOcean
+    ("http://metadata.google.internal/computeMetadata/v1/",
+     ["computeMetadata", "instance", "project"]),          # GCP
+    ("http://100.100.100.200/latest/meta-data/",
+     ["instance-id", "mac"]),                              # Aliyun ECS
+    ("http://127.0.0.1:6379/",
+     ["-ERR", "+OK", "PONG", "redis_version"]),            # Redis
+    ("http://127.0.0.1:27017/",
+     ["MongoDB", "ismaster", "\"ok\"", "serverStatus"]),  # MongoDB
+    ("http://127.0.0.1:9200/",
+     ["elasticsearch", "cluster_name", "\"version\""]),   # Elasticsearch
+    ("http://127.0.0.1:11211/",
+     ["VERSION", "STAT pid", "END\r\n"]),                  # Memcached
+]
+
+
+async def _detect_ssrf(
+    client: "httpx.AsyncClient",
+    url: str,
+    method: str,
+    params: Dict[str, List[str]],
+    param_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """SSRF detection via internal service probes."""
+    for probe_url, indicators in _SSRF_PROBES:
+        inj_url, post_data = _inject_param(url, params, param_name, probe_url, method)
+        r = await _request(client, method, inj_url, post_data, timeout=REQUEST_TIMEOUT)
+        if r is None:
+            continue
+        status, body, _ = r
+        body_lower = body.lower()
+        for indicator in indicators:
+            if indicator.lower() in body_lower:
+                return {
+                    "detection": "internal-service-response",
+                    "probe_url": probe_url,
+                    "payload":   probe_url,
+                    "evidence": (
+                        f"SSRF: server fetched {probe_url!r}, "
+                        f"response contains {indicator!r}"
+                    ),
+                }
+    return None
+
+
+async def _detect_ssrf_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """SSRF detection for JSON body fields."""
+    for probe_url, indicators in _SSRF_PROBES:
+        r = await _request(client, "POST", url,
+                           data=_inject_json_field(json_body, field_name, probe_url),
+                           json_body=True,
+                           timeout=REQUEST_TIMEOUT)
+        if r is None:
+            continue
+        _, body, _ = r
+        body_lower = body.lower()
+        for indicator in indicators:
+            if indicator.lower() in body_lower:
+                return {
+                    "detection": "internal-service-response",
+                    "probe_url": probe_url,
+                    "payload":   probe_url,
+                    "evidence": (
+                        f"SSRF (JSON body): server fetched {probe_url!r}, "
+                        f"response contains {indicator!r}"
+                    ),
+                }
+    return None
+
+
+# ── NoSQL injection detection ──────────────────────────────────────────────────
+
+_NOSQL_ERROR_RE = re.compile(
+    r"(?:mongodb|mongoose|bson|objectid|casttoobjectid|"
+    r"mongoclient|mongodberror|bulkwriteerror|"
+    r"\$where|\$expr|operator.*not allowed|"
+    r"expected string.*got object|"
+    r"bad \$push|bad \$set|bad \$pull)",
+    re.IGNORECASE,
+)
+
+
+async def _detect_nosql(
+    client: "httpx.AsyncClient",
+    url: str,
+    method: str,
+    params: Dict[str, List[str]],
+    param_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """
+    NoSQL injection via MongoDB operator injection.
+
+    Tests two surfaces:
+      - Query-string array syntax:  ?field[$ne]=x  (Express/qs parses to {field:{$ne:"x"}})
+      - JSON body (handled separately by _detect_nosql_json)
+    """
+    p = urlparse(url)
+    base_qs = {k: v[0] for k, v in params.items()}
+
+    # ── Test 1: $ne operator ─────────────────────────────────────────────
+    ne_qs = dict(base_qs)
+    ne_qs[f"{param_name}[$ne]"] = "briar_nosql_probe_xyz"
+    ne_qs.pop(param_name, None)
+    ne_url = urlunparse(p._replace(query=urlencode(ne_qs)))
+    r = await _request(client, "GET", ne_url)
+    if r:
+        status, body, _ = r
+        if _NOSQL_ERROR_RE.search(body):
+            m = _NOSQL_ERROR_RE.search(body)
+            return {
+                "detection": "nosql-error",
+                "payload":   f"{param_name}[$ne]=briar_nosql_probe_xyz",
+                "evidence":  f"NoSQL error keyword: {m.group(0)!r}",
+            }
+        # $ne returned MORE data than baseline → filter bypass
+        if status == baseline.status and len(body) > baseline.size + 100:
+            return {
+                "detection": "operator-bypass",
+                "payload":   f"{param_name}[$ne]=briar_nosql_probe_xyz",
+                "evidence": (
+                    f"$ne operator returned {len(body)} bytes vs "
+                    f"baseline {baseline.size} bytes — NoSQL filter bypass"
+                ),
+            }
+
+    # ── Test 2: $regex wildcard ──────────────────────────────────────────
+    regex_qs = dict(base_qs)
+    regex_qs[f"{param_name}[$regex]"] = ".*"
+    regex_qs.pop(param_name, None)
+    regex_url = urlunparse(p._replace(query=urlencode(regex_qs)))
+    r2 = await _request(client, "GET", regex_url)
+    if r2:
+        status2, body2, _ = r2
+        if status2 == 200 and len(body2) > baseline.size + 100:
+            return {
+                "detection": "regex-bypass",
+                "payload":   f"{param_name}[$regex]=.*",
+                "evidence": (
+                    f"$regex wildcard returned {len(body2)} bytes "
+                    f"vs {baseline.size} baseline — NoSQL regex injection"
+                ),
+            }
+
+    return None
+
+
+async def _detect_nosql_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    field_name: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """NoSQL injection via JSON body — inject MongoDB operator objects."""
+    nosql_payloads = [
+        {"$ne": "briar_nosql_probe_xyz"},
+        {"$gt": ""},
+        {"$regex": ".*", "$options": "i"},
+        {"$where": "1==1"},
+    ]
+    for operator_obj in nosql_payloads:
+        modified = dict(json_body)
+        modified[field_name] = operator_obj
+        r = await _request(client, "POST", url, data=modified, json_body=True)
+        if r is None:
+            continue
+        status, body, _ = r
+        if _NOSQL_ERROR_RE.search(body):
+            m = _NOSQL_ERROR_RE.search(body)
+            return {
+                "detection": "nosql-error-json",
+                "payload":   str(operator_obj),
+                "evidence":  f"NoSQL error in JSON response: {m.group(0)!r}",
+            }
+        if status == baseline.status and len(body) > baseline.size + 100:
+            return {
+                "detection": "operator-bypass-json",
+                "payload":   str(operator_obj),
+                "evidence": (
+                    f"JSON NoSQL operator returned {len(body)} bytes "
+                    f"vs {baseline.size} baseline — filter bypass"
+                ),
+            }
+    return None
+
+
+# ── Mass assignment detection ──────────────────────────────────────────────────
+
+_PRIV_FIELDS = [
+    "role", "admin", "isAdmin", "is_admin", "isAdministrator",
+    "privilege", "privileges", "group", "groups",
+    "permission", "permissions", "scope", "accessLevel",
+    "level", "isStaff", "is_staff", "userType", "user_type",
+    "verified", "isVerified", "is_verified",
+]
+
+_BONUS_FIELDS = [
+    "credits", "loyaltyPoints", "creditPoints",
+    "balance", "wallet", "discount",
+]
+
+
+async def _detect_mass_assignment_json(
+    client: "httpx.AsyncClient",
+    url: str,
+    json_body: Dict[str, Any],
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """
+    Mass assignment: inject privilege-escalating extra fields into a JSON body
+    and look for behavioral signals that the server accepted them.
+
+    Signal 1 — Reflection: sentinel value appears in response body.
+    Signal 2 — Status upgrade: 4xx baseline becomes 2xx after injection.
+    Signal 3 — Large numeric bonus field accepted (credits/balance).
+    """
+    sentinel = f"briar_priv_{secrets.token_hex(4)}"
+    inject = {
+        **json_body,
+        **{f: sentinel for f in _PRIV_FIELDS},
+        **{f: 999999 for f in _BONUS_FIELDS},
+    }
+    r = await _request(client, "POST", url, data=inject, json_body=True)
+    if not r:
+        return None
+    status, body, _ = r
+
+    if sentinel in body:
+        accepted = [f for f in _PRIV_FIELDS if f in body]
+        return {
+            "detection": "field-reflection",
+            "payload":   f"extra fields: {_PRIV_FIELDS[:4]}…",
+            "evidence": (
+                f"Injected privilege sentinel {sentinel!r} reflected in response. "
+                f"Likely accepted fields: {accepted or 'unknown'}"
+            ),
+        }
+
+    if baseline.status in (400, 403, 422) and status in (200, 201):
+        return {
+            "detection": "status-upgrade",
+            "payload":   f"extra fields: {_PRIV_FIELDS[:4]}…",
+            "evidence": (
+                f"HTTP {baseline.status} → {status} after privilege field injection — "
+                f"mass assignment may have elevated access"
+            ),
+        }
+
+    return None
 
 
 # ── Detection strategies ───────────────────────────────────────────────────────
@@ -818,16 +1187,15 @@ def _extract_targets(
             else:
                 return  # No params + no IDs → not interesting for injection
 
-        # Cap params per endpoint
+        # Cap params per endpoint — keep highest-priority ones when over limit.
+        # Priority: short names first (id, q, src) then longer custom names.
+        # No name-dictionary lookup — just length + common single-char preference.
         if len(qs_params) > MAX_PARAMS_PER_EP:
-            # Prioritise: SQL params first, then SSTI, then everything else
             def param_prio(name: str) -> int:
                 n = name.lower()
-                if n in SQL_PARAM_NAMES:   return 0
-                if n in SSTI_PARAM_NAMES:  return 1
-                if n in CMDI_PARAM_NAMES:  return 2
-                if n in REDIRECT_PARAM_NAMES: return 3
-                return 4
+                if len(n) <= 3:  return 0   # id, q, to, v, src …
+                if len(n) <= 8:  return 1   # search, email, filter …
+                return 2
             sorted_names = sorted(qs_params.keys(), key=param_prio)[:MAX_PARAMS_PER_EP]
             qs_params = {k: qs_params[k] for k in sorted_names}
 
@@ -922,6 +1290,21 @@ _FINDING_TYPE_META: Dict[str, Dict[str, Any]] = {
         "severity": SeverityLevel.medium,
         "route_to":  "dalfox",
         "owasp":     "A03:2021 – Injection",
+    },
+    "ssrf_candidate": {
+        "severity": SeverityLevel.high,
+        "route_to":  "nuclei",
+        "owasp":     "A10:2021 – SSRF",
+    },
+    "nosql_candidate": {
+        "severity": SeverityLevel.high,
+        "route_to":  "nuclei",
+        "owasp":     "A03:2021 – Injection",
+    },
+    "mass_assignment": {
+        "severity": SeverityLevel.high,
+        "route_to":  "nuclei",
+        "owasp":     "A06:2023 – Mass Assignment (API6:2023)",
     },
 }
 
@@ -1444,67 +1827,91 @@ class InspectorWorker(BaseWorker):
             )
 
             for param_name in ep.params:
-                vuln_types = ep.vuln_types
+                # ── Universal probe: let the application tell us what to test ──
+                signals = await universal_probe(
+                    client, ep.url, ep.method, ep.params, param_name, baseline
+                )
 
-                # SQL injection
-                if "sqli" in vuln_types or not vuln_types:
+                # Track whether this param already has a finding (for priority skip)
+                _param_found = False
+
+                # ── SQLi: DB error OR timing anomaly from probe ────────────────
+                if signals.db_error_found or signals.timing_anomaly:
                     result = await _detect_sqli(
                         client, ep.url, ep.method, ep.params, param_name, baseline
                     )
                     if result:
                         findings.append(_build_finding(ep, param_name, "sqli_candidate", result))
-                        continue  # Found SQLi — no need to test other injection types for this param
+                        _param_found = True
 
-                # SSTI
-                if "ssti" in vuln_types:
+                # ── SSTI: template expression evaluated ───────────────────────
+                if not _param_found and signals.template_eval:
                     result = await _detect_ssti(
                         client, ep.url, ep.method, ep.params, param_name
                     )
                     if result:
                         findings.append(_build_finding(ep, param_name, "ssti_candidate", result))
-                        continue
+                        _param_found = True
 
-                # Command injection
-                if "cmdi" in vuln_types:
-                    result = await _detect_cmdi(
-                        client, ep.url, ep.method, ep.params, param_name, baseline
-                    )
-                    if result:
-                        findings.append(_build_finding(ep, param_name, "cmdi_candidate", result))
-                        continue
-
-                # Path traversal
-                if "path_traversal" in vuln_types:
-                    result = await _detect_path_traversal(
-                        client, ep.url, ep.method, ep.params, param_name
-                    )
-                    if result:
-                        findings.append(_build_finding(ep, param_name, "path_traversal", result))
-
-                # Open redirect
-                if "open_redirect" in vuln_types:
-                    result = await _detect_open_redirect(
-                        client, ep.url, ep.method, ep.params, param_name
-                    )
-                    if result:
-                        findings.append(_build_finding(ep, param_name, "open_redirect", result))
-
-                # XSS (only if no higher-severity vuln found for this param)
-                if "xss" in vuln_types and not any(
-                    f["raw_output"]["parameter"] == param_name for f in findings
+                # ── XSS: canary reflected in HTML/script/attr context ─────────
+                if not _param_found and (
+                    signals.reflects_canary
+                    and signals.reflection_ctx in ("html", "script", "attr")
                 ):
                     result = await _detect_xss(
                         client, ep.url, ep.method, ep.params, param_name, baseline
                     )
                     if result:
                         findings.append(_build_finding(ep, param_name, "xss_candidate", result))
+                        _param_found = True
+
+                # ── SSRF: value is a URL or context suggests URL handling ─────
+                if not _param_found and signals.value_is_url:
+                    result = await _detect_ssrf(
+                        client, ep.url, ep.method, ep.params, param_name, baseline
+                    )
+                    if result:
+                        findings.append(_build_finding(ep, param_name, "ssrf_candidate", result))
+                        _param_found = True
+
+                # ── CMDi: status changed on syntax probe ──────────────────────
+                if not _param_found and signals.status_changed:
+                    result = await _detect_cmdi(
+                        client, ep.url, ep.method, ep.params, param_name, baseline
+                    )
+                    if result:
+                        findings.append(_build_finding(ep, param_name, "cmdi_candidate", result))
+                        _param_found = True
+
+                # ── NoSQL: any signal on API endpoints ───────────────────────
+                if not _param_found and (
+                    signals.status_changed or signals.reflects_canary or signals.db_error_found
+                ):
+                    result = await _detect_nosql(
+                        client, ep.url, ep.method, ep.params, param_name, baseline
+                    )
+                    if result:
+                        findings.append(_build_finding(ep, param_name, "nosql_candidate", result))
+                        _param_found = True
+
+                # ── Path traversal: cheap + clear signal, always run ──────────
+                if not _param_found:
+                    result = await _detect_path_traversal(
+                        client, ep.url, ep.method, ep.params, param_name
+                    )
+                    if result:
+                        findings.append(_build_finding(ep, param_name, "path_traversal", result))
+                        _param_found = True
+
+                # ── Open redirect: always run, distinctive canary ─────────────
+                if not _param_found:
+                    result = await _detect_open_redirect(
+                        client, ep.url, ep.method, ep.params, param_name
+                    )
+                    if result:
+                        findings.append(_build_finding(ep, param_name, "open_redirect", result))
 
             # ── JSON body injection pass (REST API endpoints) ──────────────────
-            # When katana captured a POST request with a JSON body, test each
-            # JSON field for injection vulnerabilities.  Uses the same detection
-            # strategies as query-param injection but sends payloads inside
-            # application/json bodies — covering REST API surfaces that form-based
-            # injection misses entirely.
             if ep.json_body:
                 json_baseline = await _request(
                     client, "POST", ep.url,
@@ -1519,44 +1926,82 @@ class InspectorWorker(BaseWorker):
                         time_ms=jbl_time * 1000,
                     )
 
+                    # Mass assignment probe runs once per endpoint (whole-body)
+                    ma_det = await _detect_mass_assignment_json(
+                        client, ep.url, ep.json_body, jbaseline
+                    )
+                    if ma_det:
+                        findings.append(
+                            _build_json_finding(ep, "__body__", "mass_assignment", ma_det)
+                        )
+
                     for field_name, field_val in ep.json_body.items():
                         if not isinstance(field_val, str):
                             continue  # only inject into string fields
-                        # Build params-like structure for scoring
-                        json_params_as_qs = {field_name: [str(field_val)]}
-                        _, field_vuln_types = score_endpoint(ep.url, json_params_as_qs)
-                        if not field_vuln_types:
-                            field_vuln_types = ["sqli", "xss"]
 
-                        # Test SQLi via JSON body
-                        sqli_det = await _detect_sqli_json(
+                        # ── Universal probe on each JSON field ────────────────
+                        jsig = await universal_probe_json(
                             client, ep.url, ep.json_body, field_name, jbaseline
                         )
-                        if sqli_det:
-                            findings.append(
-                                _build_json_finding(ep, field_name, "sqli_candidate", sqli_det)
-                            )
-                            continue
+                        _jfound = False
 
-                        # Test XSS via JSON body
-                        if "xss" in field_vuln_types:
-                            xss_det = await _detect_xss_json(
+                        # SQLi: DB error or timing anomaly
+                        if jsig.db_error_found or jsig.timing_anomaly:
+                            det = await _detect_sqli_json(
                                 client, ep.url, ep.json_body, field_name, jbaseline
                             )
-                            if xss_det:
+                            if det:
                                 findings.append(
-                                    _build_json_finding(ep, field_name, "xss_candidate", xss_det)
+                                    _build_json_finding(ep, field_name, "sqli_candidate", det)
                                 )
-                                continue
+                                _jfound = True
 
-                        # Test SSTI via JSON body
-                        if "ssti" in field_vuln_types or "ssti" in forced_vuln_types:
-                            ssti_det = await _detect_ssti_json(
+                        # SSTI: template expression evaluated
+                        if not _jfound and jsig.template_eval:
+                            det = await _detect_ssti_json(
                                 client, ep.url, ep.json_body, field_name
                             )
-                            if ssti_det:
+                            if det:
                                 findings.append(
-                                    _build_json_finding(ep, field_name, "ssti_candidate", ssti_det)
+                                    _build_json_finding(ep, field_name, "ssti_candidate", det)
+                                )
+                                _jfound = True
+
+                        # XSS: canary in HTML/script context
+                        if not _jfound and (
+                            jsig.reflects_canary
+                            and jsig.reflection_ctx in ("html", "script", "attr")
+                        ):
+                            det = await _detect_xss_json(
+                                client, ep.url, ep.json_body, field_name, jbaseline
+                            )
+                            if det:
+                                findings.append(
+                                    _build_json_finding(ep, field_name, "xss_candidate", det)
+                                )
+                                _jfound = True
+
+                        # SSRF: field value is a URL
+                        if not _jfound and jsig.value_is_url:
+                            det = await _detect_ssrf_json(
+                                client, ep.url, ep.json_body, field_name, jbaseline
+                            )
+                            if det:
+                                findings.append(
+                                    _build_json_finding(ep, field_name, "ssrf_candidate", det)
+                                )
+                                _jfound = True
+
+                        # NoSQL: any signal present
+                        if not _jfound and (
+                            jsig.status_changed or jsig.reflects_canary or jsig.db_error_found
+                        ):
+                            det = await _detect_nosql_json(
+                                client, ep.url, ep.json_body, field_name, jbaseline
+                            )
+                            if det:
+                                findings.append(
+                                    _build_json_finding(ep, field_name, "nosql_candidate", det)
                                 )
 
         return findings

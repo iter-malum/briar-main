@@ -109,6 +109,21 @@ FINDING_ROUTES: Dict[str, Dict] = {
         "requires_exploit": False,
         "description":      "OpenAPI spec found → spec-driven auth/BOLA/mass-assignment testing",
     },
+    "ssrf_candidate": {
+        "tool":             "nuclei",
+        "requires_exploit": False,
+        "description":      "SSRF surface → nuclei ssrf templates for confirmation",
+    },
+    "nosql_candidate": {
+        "tool":             "nuclei",
+        "requires_exploit": False,
+        "description":      "NoSQL injection surface → nuclei nosql templates",
+    },
+    "mass_assignment": {
+        "tool":             "nuclei",
+        "requires_exploit": False,
+        "description":      "Mass assignment surface → nuclei mass-assignment templates",
+    },
 }
 
 # ── Technology → Nuclei template tags ─────────────────────────────────────────
@@ -260,7 +275,7 @@ PHASES: List[Dict] = [
     # and most modern Node apps use JWT — jwt_tool provides real coverage here.
     {
         "id": "dast",
-        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "jwt_tool"},
+        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola"},
         "trigger_after": {"httpx", "ffuf", "gobuster"},
         "source_tools": {
             "nuclei":   ["katana", "ffuf", "gobuster", "httpx"],
@@ -269,8 +284,9 @@ PHASES: List[Dict] = [
             "dalfox":   ["katana", "ffuf", "gobuster", "httpx", "arjun"],
             "cors":     ["katana", "ffuf", "gobuster", "httpx"],
             "bola":     ["katana", "ffuf", "gobuster", "httpx", "arjun"],
-            # jwt_tool needs the live endpoint list to find JWT-bearing responses
-            "jwt_tool": ["katana", "httpx"],
+            # jwt_tool is finding-triggered only (via finding_router on jwt_found),
+            # NOT phase-triggered — keeping it here caused the DAST phase to appear
+            # "already started" whenever finding_router ran jwt_tool before ffuf finished.
             # graphql/openapi are finding-triggered (via finding_router), not phase-triggered
         },
         "requires_explicit": False,

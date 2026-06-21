@@ -854,7 +854,7 @@ services:
     image: bkimminich/juice-shop:latest
     container_name: briar-juice-shop
     ports:
-      - "3002:3000"
+      - "3031:3000"
     networks:
       - briar-net
     restart: unless-stopped
