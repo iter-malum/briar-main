@@ -489,21 +489,128 @@ async def create_session_from_curl(body: Dict[str, Any]):
     )
     return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
 
+
+@app.post("/api/v1/auth/sessions/http-login", response_model=AuthSessionResponse)
+async def create_session_http_login(body: Dict[str, Any]):
+    """Create an auth session by doing a JSON POST login — no browser needed.
+
+    Extracts the auth token from the JSON response using dot-notation path.
+    Works for any REST API that returns a token on POST login.
+
+    Example for Juice Shop:
+      {
+        "target_url": "http://juice-shop:3000",
+        "login_url":  "http://juice-shop:3000/rest/user/login",
+        "json_body":  {"email": "admin@juice-sh.op", "password": "admin123"},
+        "token_path": "authentication.token",
+        "label":      "Juice Shop admin"
+      }
+    """
+    target_url: str = body.get("target_url", "")
+    login_url: str  = body.get("login_url", "")
+    json_body: Dict = body.get("json_body", {})
+    token_path: str = body.get("token_path", "token")
+    label: Optional[str] = body.get("label")
+
+    if not target_url or not login_url or not json_body:
+        raise HTTPException(
+            status_code=422,
+            detail="target_url, login_url, and json_body are required",
+        )
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            resp = await client.post(login_url, json=json_body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Login request failed: {exc}")
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Login endpoint returned HTTP {resp.status_code}: {resp.text[:200]}",
+        )
+
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Login response is not valid JSON")
+
+    token: Optional[str] = None
+    node = data
+    for key in token_path.split("."):
+        if isinstance(node, dict):
+            node = node.get(key)
+        else:
+            node = None
+            break
+    if isinstance(node, str):
+        token = node
+
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token not found at path '{token_path}' in response: {json.dumps(data)[:300]}",
+        )
+
+    headers_out: Dict[str, str] = {"Authorization": f"Bearer {token}"}
+    cookies_out: List[Dict] = [{"name": k, "value": v} for k, v in resp.cookies.items()]
+
+    session_id = uuid4()
+    expires_at = await _persist_session(
+        session_id=session_id,
+        target_url=target_url,
+        auth_type="http_login",
+        cookies=cookies_out,
+        headers=headers_out,
+        storage_state="{}",
+        label=label or f"HTTP login — {login_url}",
+    )
+    logger.info(f"[auth] HTTP login session created: {session_id} target={target_url}")
+    return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
+
+
+@app.get("/api/v1/health/target")
+async def check_target_health(url: str = Query(..., description="Target URL to check")):
+    """Probe a target URL and return reachability + basic info."""
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(verify=False, follow_redirects=True, timeout=10.0) as client:
+            resp = await client.get(url)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        return {
+            "reachable":        True,
+            "status_code":      resp.status_code,
+            "response_time_ms": elapsed_ms,
+            "content_type":     resp.headers.get("content-type", ""),
+            "server":           resp.headers.get("server", ""),
+            "powered_by":       resp.headers.get("x-powered-by", ""),
+            "url":              url,
+        }
+    except httpx.ConnectError:
+        return {"reachable": False, "error": "Connection refused", "url": url}
+    except httpx.TimeoutException:
+        return {"reachable": False, "error": "Timeout", "url": url}
+    except Exception as exc:
+        return {"reachable": False, "error": str(exc), "url": url}
+
+
 @app.post("/api/v1/auth/sessions/{session_id}/test")
 async def test_session(session_id: UUID):
-    """Make a GET request to the session's target_url using stored headers/cookies."""
+    """Probe the session's target_url with stored auth headers/cookies."""
+    # Load from Redis or fall back to PostgreSQL
     session_raw = await redis_client.get(f"auth:session:{session_id}")
-    meta_raw = await redis_client.get(f"auth:meta:{session_id}")
-
-    if not session_raw or not meta_raw:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
-
-    session_data = json.loads(session_raw)
-    meta = json.loads(meta_raw)
-    target_url = meta.get("target_url", "")
+    if session_raw:
+        session_data = json.loads(session_raw)
+        row = await _load_session_from_db(session_id)
+        target_url = row.target_url if row else ""
+    else:
+        row = await _load_session_from_db(session_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Session not found")
+        session_data = {"cookies": row.cookies, "headers": row.headers}
+        target_url = row.target_url
 
     request_headers = dict(session_data.get("headers", {}))
-    # Build cookie header from stored cookies
     cookie_list = session_data.get("cookies", [])
     if cookie_list:
         cookie_str = "; ".join(
@@ -513,19 +620,11 @@ async def test_session(session_id: UUID):
             request_headers["Cookie"] = cookie_str
 
     try:
-        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, verify=False) as client:
             resp = await client.get(target_url, headers=request_headers)
-        alive = resp.status_code < 400
-        return {"alive": alive, "status_code": resp.status_code}
+        return {"alive": resp.status_code < 400, "status_code": resp.status_code, "target_url": target_url}
     except Exception as e:
-        return {"alive": False, "status_code": 0}
-
-@app.delete("/api/v1/auth/sessions/{session_id}")
-async def delete_session(session_id: UUID):
-    """Delete a session from Redis."""
-    await redis_client.delete(f"auth:session:{session_id}")
-    await redis_client.delete(f"auth:meta:{session_id}")
-    return {"deleted": True}
+        return {"alive": False, "status_code": 0, "error": str(e)}
 
 @app.post("/api/v1/auth/sessions/record/start", response_model=RecordStartResponse)
 async def start_recording(payload: RecordStartRequest):
@@ -759,126 +858,6 @@ async def delete_session(session_id: UUID):
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"deleted": True, "session_id": str(session_id)}
-
-
-@app.post("/api/v1/auth/sessions/http-login", response_model=AuthSessionResponse)
-async def create_session_http_login(body: Dict[str, Any]):
-    """Create an auth session by doing a JSON POST login — no browser needed.
-
-    Extracts the auth token from the JSON response using dot-notation path.
-    Works for any REST API that returns a token on POST login.
-
-    Example for Juice Shop:
-      {
-        "target_url": "http://juice-shop:3000",
-        "login_url":  "http://juice-shop:3000/rest/user/login",
-        "json_body":  {"email": "admin@juice-sh.op", "password": "admin123"},
-        "token_path": "authentication.token",
-        "label":      "Juice Shop admin"
-      }
-    """
-    target_url: str = body.get("target_url", "")
-    login_url: str  = body.get("login_url", "")
-    json_body: Dict = body.get("json_body", {})
-    token_path: str = body.get("token_path", "token")
-    label: Optional[str] = body.get("label")
-
-    if not target_url or not login_url or not json_body:
-        raise HTTPException(
-            status_code=422,
-            detail="target_url, login_url, and json_body are required",
-        )
-
-    try:
-        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
-            resp = await client.post(login_url, json=json_body)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Login request failed: {exc}")
-
-    if resp.status_code not in (200, 201):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Login endpoint returned HTTP {resp.status_code}: {resp.text[:200]}",
-        )
-
-    # Extract token from nested JSON using dot-notation path
-    try:
-        data = resp.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Login response is not valid JSON")
-
-    token: Optional[str] = None
-    node = data
-    for key in token_path.split("."):
-        if isinstance(node, dict):
-            node = node.get(key)
-        else:
-            node = None
-            break
-    if isinstance(node, str):
-        token = node
-
-    if not token:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Token not found at path '{token_path}' in response: {json.dumps(data)[:300]}",
-        )
-
-    headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
-    cookies: List[Dict] = [
-        {"name": k, "value": v}
-        for k, v in resp.cookies.items()
-    ]
-
-    session_id = uuid4()
-    expires_at = await _persist_session(
-        session_id=session_id,
-        target_url=target_url,
-        auth_type="http_login",
-        cookies=cookies,
-        headers=headers,
-        storage_state="{}",
-        label=label or f"HTTP login — {login_url}",
-    )
-
-    logger.info(
-        f"[auth] HTTP login session created: {session_id} "
-        f"target={target_url} label={label!r}"
-    )
-    return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
-
-
-@app.get("/api/v1/health/target")
-async def check_target_health(url: str = Query(..., description="Target URL to check")):
-    """Probe a target URL and return reachability + basic info.
-
-    Used to verify Juice Shop (or any other target) is up before starting a scan.
-    """
-    t0 = time.monotonic()
-    try:
-        async with httpx.AsyncClient(
-            verify=False, follow_redirects=True, timeout=10.0
-        ) as client:
-            resp = await client.get(url)
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        ct = resp.headers.get("content-type", "")
-        server = resp.headers.get("server", "")
-        powered_by = resp.headers.get("x-powered-by", "")
-        return {
-            "reachable":       True,
-            "status_code":     resp.status_code,
-            "response_time_ms": elapsed_ms,
-            "content_type":    ct,
-            "server":          server,
-            "powered_by":      powered_by,
-            "url":             url,
-        }
-    except httpx.ConnectError:
-        return {"reachable": False, "error": "Connection refused", "url": url}
-    except httpx.TimeoutException:
-        return {"reachable": False, "error": "Timeout", "url": url}
-    except Exception as exc:
-        return {"reachable": False, "error": str(exc), "url": url}
 
 
 @app.get("/health")
