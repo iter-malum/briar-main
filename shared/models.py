@@ -174,6 +174,29 @@ class VulnStatusHistoryORM(Base):
     result: Mapped["ScanResultORM"] = relationship("ScanResultORM", back_populates="status_history")
 
 
+class AuthSessionORM(Base):
+    """Persistent auth session — stores cookies/headers extracted by auth-service.
+
+    Replaces Redis-only storage so sessions survive container restarts.
+    Redis is kept as a fast-access cache (shorter TTL); PostgreSQL is the
+    source of truth.
+    """
+    __tablename__ = "auth_sessions"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    target_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    auth_type: Mapped[str] = mapped_column(String(50), nullable=False, default="custom_script")
+    label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    cookies: Mapped[List] = mapped_column(JSON, nullable=False, default=list)
+    headers: Mapped[Dict] = mapped_column(JSON, nullable=False, default=dict)
+    storage_state: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+    # None = never expires; set to allow scheduled cleanup of stale sessions
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ScanScheduleORM(Base):
     """Recurring scan schedule — runs on a cron expression and triggers a new scan each time."""
     __tablename__ = "scan_schedules"

@@ -107,10 +107,16 @@ services:
     container_name: briar-auth-service
     depends_on:
       redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       PLAYWRIGHT_TIMEOUT: "30000"
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
     ports:
       - "8002:8000"
       - "6080:6080"    # noVNC interactive browser
@@ -843,6 +849,21 @@ services:
     networks:
       - briar-net
     restart: unless-stopped
+
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: briar-juice-shop
+    ports:
+      - "3030:3000"
+    networks:
+      - briar-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/rest/admin/application-version"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
 volumes:
   pg_data:

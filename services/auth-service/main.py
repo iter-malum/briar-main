@@ -6,30 +6,51 @@ import re
 import textwrap
 import logging
 import asyncio
+import time
 from dataclasses import dataclass, field as dc_field
 from typing import Optional, List, Dict, Any
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Query
 from pydantic import BaseModel, Field, HttpUrl
 from pydantic_settings import BaseSettings
 from playwright.async_api import async_playwright, Browser, Playwright, Page
 import redis.asyncio as redis
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import select, delete
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from shared.models import Base, AuthSessionORM
 
 # --- Конфигурация ---
 class Settings(BaseSettings):
     REDIS_HOST: str = "redis"
     REDIS_PORT: str = "6379"
-    PLAYWRIGHT_TIMEOUT: int = 30000 # ms
-    SESSION_TTL_SECONDS: int = 7200 # 2 hours
-    
+    PLAYWRIGHT_TIMEOUT: int = 30000  # ms
+    SESSION_TTL_SECONDS: int = 7200  # Redis cache TTL — PostgreSQL is source of truth
+    # PostgreSQL
+    DB_USER: str = "briar"
+    DB_PASSWORD: str = "secure_password_change_me"
+    DB_HOST: str = "postgres"
+    DB_PORT: str = "5432"
+    DB_NAME: str = "briar_db"
+
     @property
     def redis_url(self) -> str:
         return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
+    @property
+    def db_url(self) -> str:
+        return (
+            f"postgresql+asyncpg://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@{self.DB_HOST}:{self.DB_PORT}/{self.DB_NAME}"
+        )
+
 settings = Settings()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
 logger = logging.getLogger("auth-service")
 
 # In-memory store for active interactive recording sessions
@@ -46,6 +67,61 @@ _recording_lock = asyncio.Lock()
 
 app = FastAPI(title="Briar Auth Service", version="0.1.0")
 redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+
+# PostgreSQL async engine
+_engine = create_async_engine(settings.db_url, pool_pre_ping=True)
+_AsyncSession = sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+# ── DB helpers ────────────────────────────────────────────────────────────────
+
+async def _save_session_to_db(
+    session_id: UUID,
+    target_url: str,
+    auth_type: str,
+    cookies: List[Dict],
+    headers: Dict[str, str],
+    storage_state: str,
+    label: Optional[str] = None,
+) -> None:
+    """Persist an auth session to PostgreSQL."""
+    async with _AsyncSession() as s:
+        row = AuthSessionORM(
+            id=session_id,
+            target_url=target_url,
+            auth_type=auth_type,
+            label=label,
+            cookies=cookies,
+            headers=headers,
+            storage_state=storage_state,
+        )
+        s.add(row)
+        await s.commit()
+
+
+async def _load_session_from_db(session_id: UUID) -> Optional[AuthSessionORM]:
+    async with _AsyncSession() as s:
+        result = await s.execute(
+            select(AuthSessionORM).where(AuthSessionORM.id == session_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def _list_sessions_from_db() -> List[AuthSessionORM]:
+    async with _AsyncSession() as s:
+        result = await s.execute(
+            select(AuthSessionORM).order_by(AuthSessionORM.created_at.desc())
+        )
+        return list(result.scalars().all())
+
+
+async def _delete_session_from_db(session_id: UUID) -> bool:
+    async with _AsyncSession() as s:
+        result = await s.execute(
+            delete(AuthSessionORM).where(AuthSessionORM.id == session_id)
+        )
+        await s.commit()
+        return result.rowcount > 0
 
 # --- Модели данных (Pydantic) ---
 
@@ -258,12 +334,62 @@ await page.wait_for_load_state('networkidle')
 
 @app.on_event("startup")
 async def startup():
-    # Проверка подключения к Redis
+    # Redis
     try:
         await redis_client.ping()
         logger.info("Connected to Redis")
     except Exception as e:
         logger.error(f"Redis connection failed: {e}")
+    # PostgreSQL — create auth_sessions table if not exists
+    try:
+        async with _engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("PostgreSQL auth_sessions table ready")
+    except Exception as e:
+        logger.error(f"PostgreSQL init failed: {e}")
+
+async def _persist_session(
+    session_id: UUID,
+    target_url: str,
+    auth_type: str,
+    cookies: List[Dict],
+    headers: Dict[str, str],
+    storage_state: str,
+    label: Optional[str] = None,
+) -> datetime:
+    """Save session to PostgreSQL (source of truth) + Redis (fast cache).
+    Returns expires_at (None in DB = no expiry; Redis cache uses SESSION_TTL_SECONDS).
+    """
+    # PostgreSQL — permanent storage, no expiry
+    await _save_session_to_db(
+        session_id=session_id,
+        target_url=target_url,
+        auth_type=auth_type,
+        cookies=cookies,
+        headers=headers,
+        storage_state=storage_state,
+        label=label,
+    )
+
+    # Redis — short-lived cache for fast retrieval; falls back to DB on miss
+    payload_json = json.dumps({
+        "cookies": cookies,
+        "headers": headers,
+        "storage_state": storage_state,
+        "status": "ready",
+    })
+    try:
+        await redis_client.setex(
+            f"auth:session:{session_id}",
+            settings.SESSION_TTL_SECONDS,
+            payload_json,
+        )
+    except Exception as exc:
+        logger.warning(f"Redis cache write failed (session still saved to DB): {exc}")
+
+    expires_at = datetime.utcnow() + timedelta(seconds=settings.SESSION_TTL_SECONDS)
+    return expires_at
+
 
 @app.post("/api/v1/auth/sessions", response_model=AuthSessionResponse)
 async def create_session(payload: AuthSessionCreate):
@@ -274,57 +400,32 @@ async def create_session(payload: AuthSessionCreate):
         raise HTTPException(status_code=400, detail=result["error"])
 
     session_id = uuid4()
-    expires_at = datetime.utcnow() + timedelta(seconds=settings.SESSION_TTL_SECONDS)
-
-    # Сохранение в Redis
-    await redis_client.setex(
-        f"auth:session:{session_id}",
-        settings.SESSION_TTL_SECONDS,
-        json.dumps({
-            "cookies": result["cookies"],
-            "headers": result["headers"],
-            "storage_state": result["storage_state"],
-            "status": "ready"
-        })
-    )
-
-    # Store metadata for listing
-    await redis_client.setex(
-        f"auth:meta:{session_id}",
-        settings.SESSION_TTL_SECONDS,
-        json.dumps({
-            "target_url": str(payload.target_url),
-            "auth_type": payload.auth_type,
-            "created_at": datetime.utcnow().isoformat(),
-            "expires_at": expires_at.isoformat(),
-        })
-    )
-
-    return AuthSessionResponse(
+    expires_at = await _persist_session(
         session_id=session_id,
-        expires_at=expires_at,
-        status="ready"
+        target_url=str(payload.target_url),
+        auth_type=payload.auth_type,
+        cookies=result["cookies"],
+        headers=result["headers"],
+        storage_state=result["storage_state"],
     )
+    return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
+
 
 @app.get("/api/v1/auth/sessions")
 async def list_sessions():
-    """List all sessions by scanning auth:meta:* keys in Redis."""
-    keys = []
-    async for key in redis_client.scan_iter("auth:meta:*"):
-        keys.append(key)
-
-    sessions = []
-    for key in keys:
-        raw = await redis_client.get(key)
-        if raw:
-            meta = json.loads(raw)
-            session_id = key.replace("auth:meta:", "")
-            sessions.append({
-                "session_id": session_id,
-                **meta,
-                "status": "ready",
-            })
-    return sessions
+    """List all sessions from PostgreSQL (survives restarts)."""
+    rows = await _list_sessions_from_db()
+    return [
+        {
+            "session_id": str(row.id),
+            "target_url": row.target_url,
+            "auth_type": row.auth_type,
+            "label": row.label,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "status": "ready",
+        }
+        for row in rows
+    ]
 
 @app.post("/api/v1/auth/sessions/from-curl", response_model=AuthSessionResponse)
 async def create_session_from_curl(body: Dict[str, Any]):
@@ -374,36 +475,19 @@ async def create_session_from_curl(body: Dict[str, Any]):
     session_id = uuid4()
     expires_at = datetime.utcnow() + timedelta(seconds=settings.SESSION_TTL_SECONDS)
 
-    # Build cookie list compatible with AuthSessionRetrieve
     cookie_list = [{"name": k, "value": v} for k, v in cookies.items()]
+    label = body.get("label")
 
-    await redis_client.setex(
-        f"auth:session:{session_id}",
-        settings.SESSION_TTL_SECONDS,
-        json.dumps({
-            "cookies": cookie_list,
-            "headers": headers,
-            "storage_state": "{}",
-            "status": "ready"
-        })
-    )
-
-    await redis_client.setex(
-        f"auth:meta:{session_id}",
-        settings.SESSION_TTL_SECONDS,
-        json.dumps({
-            "target_url": target_url,
-            "auth_type": "curl",
-            "created_at": datetime.utcnow().isoformat(),
-            "expires_at": expires_at.isoformat(),
-        })
-    )
-
-    return AuthSessionResponse(
+    expires_at = await _persist_session(
         session_id=session_id,
-        expires_at=expires_at,
-        status="ready"
+        target_url=target_url,
+        auth_type="curl",
+        cookies=cookie_list,
+        headers=headers,
+        storage_state="{}",
+        label=label,
     )
+    return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
 
 @app.post("/api/v1/auth/sessions/{session_id}/test")
 async def test_session(session_id: UUID):
@@ -636,12 +720,166 @@ async def get_session_script(session_id: UUID):
 
 @app.get("/api/v1/auth/sessions/{session_id}", response_model=AuthSessionRetrieve)
 async def get_session(session_id: UUID):
+    # 1. Try Redis cache first (fast path)
     data = await redis_client.get(f"auth:session:{session_id}")
-    if not data:
-        raise HTTPException(status_code=404, detail="Session not found or expired")
+    if data:
+        return AuthSessionRetrieve(**json.loads(data))
 
-    session_data = json.loads(data)
-    return AuthSessionRetrieve(**session_data)
+    # 2. Cache miss → load from PostgreSQL and re-warm Redis
+    row = await _load_session_from_db(session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    payload = {
+        "cookies": row.cookies,
+        "headers": row.headers,
+        "storage_state": row.storage_state,
+        "status": "ready",
+    }
+    try:
+        await redis_client.setex(
+            f"auth:session:{session_id}",
+            settings.SESSION_TTL_SECONDS,
+            json.dumps(payload),
+        )
+    except Exception:
+        pass
+    return AuthSessionRetrieve(**payload)
+
+
+@app.delete("/api/v1/auth/sessions/{session_id}")
+async def delete_session(session_id: UUID):
+    """Delete an auth session from both PostgreSQL and Redis."""
+    deleted = await _delete_session_from_db(session_id)
+    try:
+        await redis_client.delete(f"auth:session:{session_id}")
+        await redis_client.delete(f"auth:meta:{session_id}")
+    except Exception:
+        pass
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"deleted": True, "session_id": str(session_id)}
+
+
+@app.post("/api/v1/auth/sessions/http-login", response_model=AuthSessionResponse)
+async def create_session_http_login(body: Dict[str, Any]):
+    """Create an auth session by doing a JSON POST login — no browser needed.
+
+    Extracts the auth token from the JSON response using dot-notation path.
+    Works for any REST API that returns a token on POST login.
+
+    Example for Juice Shop:
+      {
+        "target_url": "http://juice-shop:3000",
+        "login_url":  "http://juice-shop:3000/rest/user/login",
+        "json_body":  {"email": "admin@juice-sh.op", "password": "admin123"},
+        "token_path": "authentication.token",
+        "label":      "Juice Shop admin"
+      }
+    """
+    target_url: str = body.get("target_url", "")
+    login_url: str  = body.get("login_url", "")
+    json_body: Dict = body.get("json_body", {})
+    token_path: str = body.get("token_path", "token")
+    label: Optional[str] = body.get("label")
+
+    if not target_url or not login_url or not json_body:
+        raise HTTPException(
+            status_code=422,
+            detail="target_url, login_url, and json_body are required",
+        )
+
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            resp = await client.post(login_url, json=json_body)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Login request failed: {exc}")
+
+    if resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Login endpoint returned HTTP {resp.status_code}: {resp.text[:200]}",
+        )
+
+    # Extract token from nested JSON using dot-notation path
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Login response is not valid JSON")
+
+    token: Optional[str] = None
+    node = data
+    for key in token_path.split("."):
+        if isinstance(node, dict):
+            node = node.get(key)
+        else:
+            node = None
+            break
+    if isinstance(node, str):
+        token = node
+
+    if not token:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Token not found at path '{token_path}' in response: {json.dumps(data)[:300]}",
+        )
+
+    headers: Dict[str, str] = {"Authorization": f"Bearer {token}"}
+    cookies: List[Dict] = [
+        {"name": k, "value": v}
+        for k, v in resp.cookies.items()
+    ]
+
+    session_id = uuid4()
+    expires_at = await _persist_session(
+        session_id=session_id,
+        target_url=target_url,
+        auth_type="http_login",
+        cookies=cookies,
+        headers=headers,
+        storage_state="{}",
+        label=label or f"HTTP login — {login_url}",
+    )
+
+    logger.info(
+        f"[auth] HTTP login session created: {session_id} "
+        f"target={target_url} label={label!r}"
+    )
+    return AuthSessionResponse(session_id=session_id, expires_at=expires_at, status="ready")
+
+
+@app.get("/api/v1/health/target")
+async def check_target_health(url: str = Query(..., description="Target URL to check")):
+    """Probe a target URL and return reachability + basic info.
+
+    Used to verify Juice Shop (or any other target) is up before starting a scan.
+    """
+    t0 = time.monotonic()
+    try:
+        async with httpx.AsyncClient(
+            verify=False, follow_redirects=True, timeout=10.0
+        ) as client:
+            resp = await client.get(url)
+        elapsed_ms = int((time.monotonic() - t0) * 1000)
+        ct = resp.headers.get("content-type", "")
+        server = resp.headers.get("server", "")
+        powered_by = resp.headers.get("x-powered-by", "")
+        return {
+            "reachable":       True,
+            "status_code":     resp.status_code,
+            "response_time_ms": elapsed_ms,
+            "content_type":    ct,
+            "server":          server,
+            "powered_by":      powered_by,
+            "url":             url,
+        }
+    except httpx.ConnectError:
+        return {"reachable": False, "error": "Connection refused", "url": url}
+    except httpx.TimeoutException:
+        return {"reachable": False, "error": "Timeout", "url": url}
+    except Exception as exc:
+        return {"reachable": False, "error": str(exc), "url": url}
+
 
 @app.get("/health")
 async def health():
