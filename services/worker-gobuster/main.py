@@ -189,6 +189,13 @@ class GobusterWorker(BaseWorker):
             if r["url"] not in found_urls:
                 results.append(r)
 
+        # M23: information disclosure audit
+        info_disc = await _probe_info_disclosure(url, auth_headers)
+        found_urls = {r["url"] for r in results}
+        for r in info_disc:
+            if r["url"] not in found_urls:
+                results.append(r)
+
         return results
 
     # ── DNS mode ───────────────────────────────────────────────────────────────
@@ -381,6 +388,224 @@ _SUPPLEMENTAL_PATHS = [
     "/sitemap.xml",
     "/crossdomain.xml",
 ]
+
+
+# ── M23: Information Disclosure audit ────────────────────────────────────────
+#
+# Probes for Juice Shop challenges:
+#   Access Log              – /ftp/access.log download
+#   Misplaced Signature     – /ftp/legal.md, /ftp/encrypt.pyc
+#   Error Handling          – trigger 400/500 and detect stack-trace leak
+#   Security Policy         – /security.txt, /.well-known/security.txt
+#   Blockchain Hype         – chatbot with trigger phrase leaks private key
+#   Missing Encoding        – /api/... endpoints with unencoded chars in body
+
+_SENSITIVE_FTP_FILES = [
+    ("/ftp/access.log",    "access_log_exposure",        "high",   "A02:2021 – Cryptographic Failures"),
+    ("/ftp/encrypt.pyc",   "sensitive_file_exposure",    "high",   "A02:2021 – Cryptographic Failures"),
+    ("/ftp/legal.md",      "sensitive_file_exposure",    "medium", "A05:2021 – Security Misconfiguration"),
+    ("/ftp/package.json.bak", "sensitive_file_exposure", "high",   "A05:2021 – Security Misconfiguration"),
+    ("/ftp/acquisitions.md",  "sensitive_file_exposure", "high",   "A02:2021 – Cryptographic Failures"),
+    ("/ftp/coupons_2013.md.bak", "sensitive_file_exposure", "medium", "A05:2021 – Security Misconfiguration"),
+]
+
+_ERROR_TRIGGER_PATHS = [
+    "/rest/products/search?q=',",
+    "/api/Users/undefined",
+    "/api/BasketItems/undefined",
+    "/rest/basket/undefined",
+    "/ftp/invalid\x00.md",
+]
+
+_STACK_TRACE_PATTERNS = [
+    "at Object.", "at Module.", "at Function.",   # Node.js
+    "Error: ", "UnhandledPromiseRejection",        # JS runtime
+    "Sequelize", "SequelizeDatabaseError",         # ORM errors
+    "sqlite_", "SQLITE_", "sqlite3",               # SQLite internals
+    "stack:", "\"stack\":",                         # JSON error bodies
+    "Traceback (most recent call last)",           # Python
+    "java.lang.", "NullPointerException",          # Java
+]
+
+_CHATBOT_TRIGGERS = [
+    "blockchain",
+    "bitcoin",
+    "NFT",
+    "cryptocurrency",
+    "what is blockchain",
+]
+
+_SECURITY_POLICY_PATHS = [
+    "/security.txt",
+    "/.well-known/security.txt",
+    "/humans.txt",
+]
+
+
+async def _probe_info_disclosure(
+    base_url: str,
+    auth_headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    M23: Audit for information disclosure across 4 vectors:
+      1. Sensitive files in /ftp/ directory (access log, bytecode, backups)
+      2. Error-triggered stack-trace leakage
+      3. Security policy presence / absence
+      4. Chatbot private-key / blockchain disclosure
+    """
+    results: List[Dict[str, Any]] = []
+    _sev = {"critical": SeverityLevel.critical, "high": SeverityLevel.high,
+            "medium": SeverityLevel.medium, "low": SeverityLevel.low,
+            "info": SeverityLevel.info}
+
+    async with _httpx.AsyncClient(
+        headers=auth_headers,
+        follow_redirects=True,
+        timeout=8.0,
+        verify=False,
+    ) as client:
+
+        # ── 1. Sensitive FTP files ─────────────────────────────────────────────
+        for path, vtype, sev, owasp in _SENSITIVE_FTP_FILES:
+            url = base_url.rstrip("/") + path
+            try:
+                resp = await client.get(url)
+                if resp.status_code in (200, 206):
+                    size = len(resp.content)
+                    results.append({
+                        "url":         url,
+                        "type":        vtype,
+                        "description": (
+                            f"Sensitive file exposed: {path} "
+                            f"(HTTP {resp.status_code}, {size} bytes). "
+                            f"File should not be publicly accessible."
+                        ),
+                        "severity":    _sev[sev],
+                        "vulnerability_type": vtype,
+                        "raw_output":  {
+                            "url": url, "path": path,
+                            "status_code": resp.status_code,
+                            "size": size,
+                            "preview": resp.text[:200],
+                            "source": "gobuster-info-disclosure",
+                            "owasp": owasp,
+                        },
+                    })
+                    logger.info(f"[gobuster/m23] Sensitive file found: {path} ({size}B)")
+            except Exception:
+                continue
+
+        # ── 2. Error-triggered stack-trace leak ────────────────────────────────
+        for path in _ERROR_TRIGGER_PATHS:
+            url = base_url.rstrip("/") + path
+            try:
+                resp = await client.get(url)
+                body = resp.text
+                leaked = [p for p in _STACK_TRACE_PATTERNS if p in body]
+                if leaked and resp.status_code >= 400:
+                    results.append({
+                        "url":         url,
+                        "type":        "error_information_disclosure",
+                        "description": (
+                            f"Server error response leaks internal implementation details "
+                            f"(HTTP {resp.status_code}). Patterns found: {', '.join(leaked[:3])}"
+                        ),
+                        "severity":    SeverityLevel.medium,
+                        "vulnerability_type": "error_information_disclosure",
+                        "raw_output":  {
+                            "url": url, "path": path,
+                            "status_code": resp.status_code,
+                            "leaked_patterns": leaked[:5],
+                            "body_preview": body[:300],
+                            "source": "gobuster-info-disclosure",
+                            "owasp": "A05:2021 – Security Misconfiguration",
+                        },
+                    })
+                    logger.info(f"[gobuster/m23] Stack trace leak at {path}: {leaked[:2]}")
+                    break
+            except Exception:
+                continue
+
+        # ── 3. Security policy ─────────────────────────────────────────────────
+        policy_found = False
+        for path in _SECURITY_POLICY_PATHS:
+            url = base_url.rstrip("/") + path
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200 and len(resp.content) > 10:
+                    policy_found = True
+                    results.append({
+                        "url":         url,
+                        "type":        "security_policy_found",
+                        "description": f"Security policy file found at {path}",
+                        "severity":    SeverityLevel.info,
+                        "vulnerability_type": "security_policy_found",
+                        "raw_output":  {
+                            "url": url, "path": path,
+                            "preview": resp.text[:200],
+                            "source": "gobuster-info-disclosure",
+                        },
+                    })
+                    break
+            except Exception:
+                continue
+
+        if not policy_found:
+            results.append({
+                "url":         base_url,
+                "type":        "missing_security_policy",
+                "description": (
+                    "No security.txt or /.well-known/security.txt found. "
+                    "RFC 9116 recommends publishing a security disclosure policy."
+                ),
+                "severity":    SeverityLevel.info,
+                "vulnerability_type": "missing_security_policy",
+                "raw_output":  {
+                    "url": base_url,
+                    "checked_paths": _SECURITY_POLICY_PATHS,
+                    "source": "gobuster-info-disclosure",
+                    "owasp": "A05:2021 – Security Misconfiguration",
+                },
+            })
+
+        # ── 4. Chatbot blockchain / private-key disclosure ─────────────────────
+        chatbot_url = base_url.rstrip("/") + "/api/Chatbot/respond"
+        for trigger in _CHATBOT_TRIGGERS:
+            try:
+                resp = await client.post(
+                    chatbot_url,
+                    json={"action": "query", "query": trigger},
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                )
+                body = resp.text.lower()
+                if resp.status_code == 200 and any(
+                    kw in body for kw in ("private key", "blockchain", "bitcoin", "nft", "0x")
+                ):
+                    results.append({
+                        "url":         chatbot_url,
+                        "type":        "chatbot_disclosure",
+                        "description": (
+                            f"Chatbot discloses sensitive information when prompted with "
+                            f"blockchain/cryptocurrency query ({trigger!r})"
+                        ),
+                        "severity":    SeverityLevel.medium,
+                        "vulnerability_type": "chatbot_disclosure",
+                        "raw_output":  {
+                            "url": chatbot_url,
+                            "trigger": trigger,
+                            "response_preview": resp.text[:300],
+                            "source": "gobuster-info-disclosure",
+                            "owasp": "A02:2021 – Cryptographic Failures",
+                        },
+                    })
+                    logger.info(f"[gobuster/m23] Chatbot disclosure triggered by {trigger!r}")
+                    break
+            except Exception:
+                continue
+
+    if results:
+        logger.info(f"[gobuster/m23] Info disclosure: {len(results)} finding(s)")
+    return results
 
 
 # ── Legacy endpoints known to lack CSP ────────────────────────────────────────

@@ -19,17 +19,17 @@ const TOOL_GROUPS: Record<string, { label: string; tools: string[]; color: strin
   recon: {
     label: 'Recon',
     color: 'text-blue-400',
-    tools: ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun'],
+    tools: ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun', 'jsscanner', 'retirejs'],
   },
   dast: {
     label: 'DAST',
     color: 'text-yellow-400',
-    tools: ['nuclei', 'zap', 'nikto', 'dalfox', 'inspector'],
+    tools: ['nuclei', 'zap', 'nikto', 'dalfox', 'inspector', 'playwright', 'xxe'],
   },
-  api: {
-    label: 'API / Secrets',
+  logic: {
+    label: 'Auth & Logic',
     color: 'text-purple-400',
-    tools: ['jsscanner', 'graphql', 'openapi', 'cors', 'bola'],
+    tools: ['bola', 'creds', 'bizlogic', 'cors', 'graphql', 'openapi'],
   },
   exploit: {
     label: 'Exploit (needs flag)',
@@ -41,12 +41,15 @@ const TOOL_GROUPS: Record<string, { label: string; tools: string[]; color: strin
 const ALL_TOOLS = Object.values(TOOL_GROUPS).flatMap((g) => g.tools)
 
 const PRESETS: Record<string, string[]> = {
-  quick:  ['whatweb', 'katana', 'httpx', 'nuclei'],
-  full:   ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun',
-           'nuclei', 'zap', 'nikto', 'dalfox', 'inspector',
-           'jsscanner', 'cors', 'bola'],
-  api:    ['whatweb', 'katana', 'httpx', 'arjun',
-           'jsscanner', 'graphql', 'openapi', 'cors', 'bola', 'jwt_tool'],
+  quick:   ['whatweb', 'katana', 'httpx', 'nuclei'],
+  full:    ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun',
+            'nuclei', 'zap', 'nikto', 'dalfox', 'inspector',
+            'jsscanner', 'retirejs', 'cors', 'bola', 'creds', 'bizlogic', 'playwright'],
+  api:     ['whatweb', 'katana', 'httpx', 'arjun',
+            'jsscanner', 'graphql', 'openapi', 'cors', 'bola', 'jwt_tool'],
+  juiceshop: ['whatweb', 'katana', 'httpx', 'ffuf', 'gobuster', 'arjun',
+              'nuclei', 'dalfox', 'inspector', 'jsscanner',
+              'bola', 'creds', 'bizlogic', 'playwright'],
   exploit: ALL_TOOLS,
 }
 
@@ -397,6 +400,41 @@ function ScanRow({ scan }: { scan: Scan }) {
 
 // ── Dashboard ──────────────────────────────────────────────────────────────────
 
+const STAT_CARDS = [
+  {
+    label: 'Total scans',
+    key: 'total' as const,
+    icon: <GitGraph size={18} />,
+    accent: 'rgba(124,111,255,0.18)',
+    border: 'rgba(124,111,255,0.35)',
+    text: '#a89fff',
+  },
+  {
+    label: 'Running',
+    key: 'running' as const,
+    icon: <Zap size={18} />,
+    accent: 'rgba(63,168,213,0.18)',
+    border: 'rgba(63,168,213,0.35)',
+    text: '#60c8f0',
+  },
+  {
+    label: 'Completed',
+    key: 'completed' as const,
+    icon: <ShieldAlert size={18} />,
+    accent: 'rgba(16,185,129,0.18)',
+    border: 'rgba(16,185,129,0.35)',
+    text: '#34d399',
+  },
+  {
+    label: 'Failed',
+    key: 'failed' as const,
+    icon: <AlertTriangle size={18} />,
+    accent: 'rgba(239,68,68,0.18)',
+    border: 'rgba(239,68,68,0.28)',
+    text: '#f87171',
+  },
+]
+
 export default function Dashboard() {
   const [showModal, setShowModal] = useState(false)
   const qc = useQueryClient()
@@ -407,72 +445,159 @@ export default function Dashboard() {
     refetchInterval: 5000,
   })
 
-  return (
-    <div className="p-6 max-w-7xl mx-auto space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-slate-100">Dashboard</h1>
-          <p className="text-slate-400 text-sm mt-1">Active DAST scan sessions</p>
-        </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => qc.invalidateQueries({ queryKey: ['scans'] })}
-            className="btn-ghost flex items-center gap-2"
-          >
-            <RefreshCw size={14} /> Refresh
-          </button>
-          <button onClick={() => setShowModal(true)} className="btn-primary flex items-center gap-2">
-            <Plus size={14} /> New Scan
-          </button>
-        </div>
-      </div>
+  const counts = {
+    total:     scans?.length ?? 0,
+    running:   scans?.filter((s) => s.status === 'running').length   ?? 0,
+    completed: scans?.filter((s) => s.status === 'completed').length ?? 0,
+    failed:    scans?.filter((s) => s.status === 'failed').length    ?? 0,
+  }
 
-      {/* Stats */}
-      {scans && (
+  return (
+    <div
+      className="min-h-screen"
+      style={{
+        background: [
+          'radial-gradient(ellipse 60% 40% at 10% 0%, rgba(124,111,255,0.07) 0%, transparent 60%)',
+          'radial-gradient(ellipse 50% 35% at 90% 100%, rgba(63,168,213,0.05) 0%, transparent 60%)',
+        ].join(', '),
+      }}
+    >
+      <div className="px-6 pt-8 pb-10 max-w-7xl mx-auto space-y-8">
+
+        {/* ── Hero header ─────────────────────────────────────────────────── */}
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2 mb-2">
+              <span
+                className="text-xs font-mono tracking-widest uppercase px-2 py-0.5 rounded"
+                style={{ background: 'rgba(124,111,255,0.15)', color: '#a89fff', border: '1px solid rgba(124,111,255,0.3)' }}
+              >
+                Briar DAST
+              </span>
+              <span
+                className="text-xs font-mono tracking-widest uppercase px-2 py-0.5 rounded"
+                style={{ background: 'rgba(16,185,129,0.12)', color: '#34d399', border: '1px solid rgba(16,185,129,0.25)' }}
+              >
+                ● Live
+              </span>
+            </div>
+            <h1 className="text-3xl font-bold text-slate-100 tracking-tight">
+              Scan Dashboard
+            </h1>
+            <p className="text-slate-500 text-sm mt-1">
+              Automated penetration testing — {scans?.length ?? '…'} scan sessions
+            </p>
+          </div>
+          <div className="flex gap-2 shrink-0 pt-1">
+            <button
+              onClick={() => qc.invalidateQueries({ queryKey: ['scans'] })}
+              className="btn-ghost flex items-center gap-2 text-xs"
+            >
+              <RefreshCw size={13} /> Refresh
+            </button>
+            <button
+              onClick={() => setShowModal(true)}
+              className="btn-primary flex items-center gap-2"
+            >
+              <Plus size={14} /> New Scan
+            </button>
+          </div>
+        </div>
+
+        {/* ── Stat cards ──────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-          {[
-            { label: 'Total',     value: scans.length,                                          color: 'text-slate-100' },
-            { label: 'Running',   value: scans.filter((s) => s.status === 'running').length,    color: 'text-blue-400' },
-            { label: 'Completed', value: scans.filter((s) => s.status === 'completed').length,  color: 'text-emerald-400' },
-            { label: 'Failed',    value: scans.filter((s) => s.status === 'failed').length,     color: 'text-red-400' },
-          ].map(({ label, value, color }) => (
-            <div key={label} className="card text-center">
-              <div className={`text-3xl font-bold ${color}`}>{value}</div>
-              <div className="text-slate-400 text-sm mt-1">{label}</div>
+          {STAT_CARDS.map(({ label, key, icon, accent, border, text }) => (
+            <div
+              key={key}
+              className="rounded-xl p-5 flex flex-col gap-3"
+              style={{
+                background: `linear-gradient(135deg, ${accent} 0%, rgba(0,0,0,0) 100%), #1c1a1a`,
+                border: `1px solid ${border}`,
+              }}
+            >
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-slate-500 font-medium tracking-wide uppercase">{label}</span>
+                <span style={{ color: text, opacity: 0.7 }}>{icon}</span>
+              </div>
+              <div className="text-4xl font-bold tracking-tight" style={{ color: text }}>
+                {counts[key]}
+              </div>
             </div>
           ))}
         </div>
-      )}
 
-      {/* Table */}
-      <div className="card p-0 overflow-hidden">
-        {isLoading && <div className="p-8 text-center text-slate-500">Loading scans…</div>}
-        {isError && <div className="p-8 text-center text-red-400">Failed to load scans. Is the UI service running?</div>}
-        {scans && scans.length === 0 && (
-          <div className="p-8 text-center text-slate-500">No scans yet. Click "New Scan" to get started.</div>
-        )}
-        {scans && scans.length > 0 && (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="border-b border-briar-border">
-                <tr>
-                  <th className="table-header">ID</th>
-                  <th className="table-header">Target</th>
-                  <th className="table-header">Status</th>
-                  <th className="table-header">Progress</th>
-                  <th className="table-header">Created</th>
-                  <th className="table-header">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {scans.map((scan) => (
-                  <ScanRow key={scan.id} scan={scan} />
-                ))}
-              </tbody>
-            </table>
+        {/* ── Scan table ──────────────────────────────────────────────────── */}
+        <div>
+          <div className="flex items-center justify-between mb-3">
+            <h2 className="text-sm font-semibold text-slate-400 uppercase tracking-wider">
+              Recent Scans
+            </h2>
+            {counts.running > 0 && (
+              <span
+                className="text-xs px-2 py-0.5 rounded-full font-mono"
+                style={{ background: 'rgba(63,168,213,0.12)', color: '#60c8f0', border: '1px solid rgba(63,168,213,0.25)' }}
+              >
+                {counts.running} running
+              </span>
+            )}
           </div>
-        )}
+
+          <div
+            className="rounded-xl overflow-hidden"
+            style={{ border: '1px solid rgba(124,111,255,0.2)', background: '#1c1a1a' }}
+          >
+            {isLoading && (
+              <div className="p-12 text-center text-slate-600">
+                <RefreshCw size={20} className="animate-spin mx-auto mb-3 opacity-40" />
+                Loading scans…
+              </div>
+            )}
+            {isError && (
+              <div className="p-12 text-center text-red-400 text-sm">
+                Failed to load scans. Is the UI service running?
+              </div>
+            )}
+            {scans && scans.length === 0 && (
+              <div className="p-16 text-center">
+                <div
+                  className="w-14 h-14 rounded-2xl flex items-center justify-center mx-auto mb-4"
+                  style={{ background: 'rgba(124,111,255,0.1)', border: '1px solid rgba(124,111,255,0.2)' }}
+                >
+                  <ShieldAlert size={24} style={{ color: '#a89fff' }} />
+                </div>
+                <p className="text-slate-400 text-sm font-medium">No scans yet</p>
+                <p className="text-slate-600 text-xs mt-1">Click "New Scan" to launch your first DAST assessment</p>
+                <button
+                  onClick={() => setShowModal(true)}
+                  className="mt-5 btn-primary flex items-center gap-2 mx-auto"
+                >
+                  <Plus size={14} /> New Scan
+                </button>
+              </div>
+            )}
+            {scans && scans.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="w-full">
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid rgba(124,111,255,0.15)' }}>
+                      <th className="table-header">ID</th>
+                      <th className="table-header">Target</th>
+                      <th className="table-header">Status</th>
+                      <th className="table-header">Progress</th>
+                      <th className="table-header">Created</th>
+                      <th className="table-header">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {scans.map((scan) => (
+                      <ScanRow key={scan.id} scan={scan} />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
       </div>
 
       {showModal && <NewScanModal onClose={() => setShowModal(false)} />}
