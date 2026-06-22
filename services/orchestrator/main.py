@@ -550,6 +550,9 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
         if recon_tools:
             scan.config = {**scan.config, "started_phases": [initial_phase_id]}
             await session.commit()
+            # Refresh after second commit so server-generated updated_at is loaded
+            # into Python memory before FastAPI serializes the response (MissingGreenlet fix)
+            await session.refresh(scan_with_steps)
 
         for tool in recon_tools:
             queue_name = TOOL_QUEUES.get(tool)
