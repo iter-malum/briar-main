@@ -140,6 +140,77 @@ def _is_likely_real(value: str) -> bool:
     return True
 
 
+# ── Supply-chain helpers ───────────────────────────────────────────────────────
+
+_KNOWN_COMPROMISED: Dict[str, Dict[str, str]] = {
+    "event-stream":         {"desc": "Malicious 2018 supply-chain attack injecting bitcoin stealer", "severity": SeverityLevel.critical, "advisory": "https://blog.npmjs.org/post/180565383195/details-about-the-event-stream-incident"},
+    "flatmap-stream":       {"desc": "Injected by event-stream compromise (bitcoin stealer)", "severity": SeverityLevel.critical, "advisory": "https://blog.npmjs.org/post/180565383195/details-about-the-event-stream-incident"},
+    "colors":               {"desc": "Author sabotaged v1.4.44-liberty-2 with infinite loop", "severity": SeverityLevel.high, "advisory": "https://github.com/Marak/colors.js/issues/285"},
+    "faker":                {"desc": "Author sabotaged v6.6.6 (same actor as colors)", "severity": SeverityLevel.high, "advisory": "https://github.com/marak/Faker.js/issues/1046"},
+    "node-ipc":             {"desc": "Author added wiper payload targeting Russian/Belarusian IPs (v10.1.1-v10.1.2)", "severity": SeverityLevel.critical, "advisory": "https://github.com/RIAEvangelist/node-ipc/issues/233"},
+    "ua-parser-js":         {"desc": "NPM account compromised; malicious versions 0.7.29, 0.8.0, 1.0.1 published", "severity": SeverityLevel.critical, "advisory": "https://github.com/faisalman/ua-parser-js/issues/536"},
+    "coa":                  {"desc": "NPM account compromised; crypto-miner injected (2.0.3, 2.0.4)", "severity": SeverityLevel.critical, "advisory": "https://github.com/veged/coa/issues/99"},
+    "rc":                   {"desc": "NPM account compromised; crypto-miner injected (1.2.9)", "severity": SeverityLevel.critical, "advisory": "https://github.com/dominictarr/rc/issues/131"},
+    "eslint-scope":         {"desc": "Compromised to steal npm credentials (3.7.2)", "severity": SeverityLevel.high, "advisory": "https://eslint.org/blog/2018/07/postmortem-for-malicious-package-publishes/"},
+    "getcookies":           {"desc": "Compromised cookie-stealing module injected via mailparser", "severity": SeverityLevel.critical, "advisory": "https://blog.npmjs.org/post/173526807575/reported-malicious-module-getcookies"},
+    "bootstrap-sass":       {"desc": "Backdoor injected in 3.2.0.3 (remote code execution)", "severity": SeverityLevel.critical, "advisory": "https://www.rubysec.com/advisories/CVE-2019-10842/"},
+    "left-pad":             {"desc": "Package was unpublished causing massive breakage (reliability risk)", "severity": SeverityLevel.medium, "advisory": "https://blog.npmjs.org/post/141577284765/kik-left-pad-and-npm"},
+    "crossenv":             {"desc": "Typosquatting cross-env — data exfiltration", "severity": SeverityLevel.high, "advisory": "https://github.com/nicolo-ribaudo/chokidar/issues/858"},
+    "lodash":               {"desc": "CVE-2021-23337 command injection / CVE-2020-8203 prototype pollution (pin >=4.17.21)", "severity": SeverityLevel.medium, "advisory": "https://github.com/lodash/lodash/issues/5261"},
+    "axios":                {"desc": "SSRF via CVE-2023-45857 if <1.6.0", "severity": SeverityLevel.medium, "advisory": "https://github.com/axios/axios/issues/6027"},
+}
+
+_POPULAR_PACKAGES: List[str] = [
+    "react", "react-dom", "vue", "angular", "svelte",
+    "lodash", "underscore", "ramda",
+    "express", "koa", "fastify", "hapi",
+    "axios", "node-fetch", "got", "superagent",
+    "webpack", "rollup", "vite", "esbuild", "parcel",
+    "babel-core", "typescript", "eslint", "prettier",
+    "jest", "mocha", "chai", "sinon",
+    "cross-env", "dotenv", "moment", "dayjs",
+    "uuid", "nanoid", "chalk", "debug",
+    "socket.io", "ws", "mqtt", "amqplib",
+    "sequelize", "mongoose", "pg", "redis",
+    "passport", "jsonwebtoken", "bcrypt", "crypto-js",
+    "inquirer", "commander", "yargs", "minimist",
+    "sharp", "jimp", "puppeteer", "playwright",
+    "multer", "formidable", "busboy",
+    "helmet", "cors", "compression", "morgan",
+    "nodemailer", "twilio", "stripe", "aws-sdk",
+]
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Levenshtein distance — returns early if distance > 2 for speed."""
+    if abs(len(a) - len(b)) > 2:
+        return 3
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev = dp[0]
+        dp[0] = i
+        for j in range(1, n + 1):
+            temp = dp[j]
+            if a[i - 1] == b[j - 1]:
+                dp[j] = prev
+            else:
+                dp[j] = 1 + min(prev, dp[j], dp[j - 1])
+            prev = temp
+    return dp[n]
+
+
+def _find_typosquat(pkg: str) -> Optional[str]:
+    """Return the legitimate package name if pkg looks like a typosquat, else None."""
+    pkg_l = pkg.lower()
+    if pkg_l in _POPULAR_PACKAGES:
+        return None
+    for pop in _POPULAR_PACKAGES:
+        if _edit_distance(pkg_l, pop) == 1:
+            return pop
+    return None
+
+
 # ── Worker ─────────────────────────────────────────────────────────────────────
 
 class JsScannerWorker(BaseWorker):
@@ -245,10 +316,103 @@ class JsScannerWorker(BaseWorker):
                 + ", ".join(f"{k}={v}" for k, v in sorted(tech_stack.items()))
             )
 
+        # ── M17: Supply chain + typosquatting analysis ────────────────────────
+        sc_findings = await self._probe_supply_chain(target, _build_headers(auth_context))
+        findings.extend(sc_findings)
+
         logger.info(
             f"[jsscanner] Complete — {len(findings)} finding(s) total "
-            f"({len(lib_findings)} library, {len(findings) - len(lib_findings) - (1 if lib_matches else 0)} secrets)"
+            f"({len(lib_findings)} library, "
+            f"{len(sc_findings)} supply-chain, "
+            f"{len(findings) - len(lib_findings) - len(sc_findings) - (1 if lib_matches else 0)} secrets)"
         )
+        return findings
+
+    async def _probe_supply_chain(
+        self, target: str, headers: Dict[str, str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Download backup package.json files exposed on the server, parse
+        dependencies, and check for:
+          1. Known compromised / malicious packages (hardcoded list)
+          2. Typosquatting — package names within edit-distance 1 of top packages
+        """
+        findings: List[Dict[str, Any]] = []
+        pkg_paths = [
+            "/ftp/package.json.bak",
+            "/ftp/package.json",
+            "/package.json",
+            "/package.json.bak",
+            "/backup/package.json",
+        ]
+        parsed = urlparse(target)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+
+        async with httpx.AsyncClient(
+            headers=headers, verify=False, follow_redirects=True,
+            timeout=httpx.Timeout(10)
+        ) as client:
+            for path in pkg_paths:
+                url = origin + path
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+                    data = resp.json()
+                except Exception:
+                    continue
+
+                logger.info(f"[jsscanner/supply-chain] Found package.json at {url}")
+
+                deps: Dict[str, str] = {}
+                for section in ("dependencies", "devDependencies", "peerDependencies"):
+                    deps.update(data.get(section, {}))
+
+                if not deps:
+                    continue
+
+                # ── Check 1: known compromised packages ───────────────────────
+                for pkg_name in deps:
+                    vuln = _KNOWN_COMPROMISED.get(pkg_name.lower())
+                    if vuln:
+                        findings.append({
+                            "url":  url,
+                            "type": "supply_chain_attack",
+                            "description": (
+                                f"Supply chain risk: package {pkg_name!r} — {vuln['desc']}"
+                            ),
+                            "severity": vuln["severity"],
+                            "vulnerability_type": "supply_chain_attack",
+                            "raw_output": {
+                                "package": pkg_name,
+                                "version": deps[pkg_name],
+                                "advisory": vuln["advisory"],
+                                "source": "jsscanner-supply-chain",
+                                "owasp": "A06:2021 – Vulnerable and Outdated Components",
+                            },
+                        })
+
+                # ── Check 2: typosquatting ─────────────────────────────────────
+                for pkg_name in deps:
+                    squatter = _find_typosquat(pkg_name)
+                    if squatter:
+                        findings.append({
+                            "url":  url,
+                            "type": "typosquatting",
+                            "description": (
+                                f"Possible typosquatting: {pkg_name!r} looks like {squatter!r}"
+                            ),
+                            "severity": SeverityLevel.medium,
+                            "vulnerability_type": "typosquatting",
+                            "raw_output": {
+                                "package":    pkg_name,
+                                "legitimate": squatter,
+                                "version":    deps[pkg_name],
+                                "source":     "jsscanner-supply-chain",
+                                "owasp":      "A06:2021 – Vulnerable and Outdated Components",
+                            },
+                        })
+
         return findings
 
     async def _collect_js_urls_from_target(

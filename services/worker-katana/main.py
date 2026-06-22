@@ -28,7 +28,7 @@ import os
 import re
 import sys
 from collections import Counter
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse, urlencode, parse_qs
 
 import httpx as _httpx
@@ -49,9 +49,28 @@ logger = logging.getLogger("katana-worker")
 # ── Well-known API spec paths to probe ────────────────────────────────────────
 
 API_SPEC_PATHS = [
-    # OpenAPI / Swagger JSON
+    # Swagger UI / API Docs pages first — these are the most common spec hosts.
+    # Probed with Accept:application/json so frameworks that serve HTML by default
+    # (Juice Shop /api-docs → JSON when asked) are handled correctly.
+    "/api-docs",
+    "/api-docs/",
+    "/swagger",
+    "/swagger-ui.html",
+    "/swagger-ui/index.html",
+    "/docs",
+    "/redoc",
+    # Spring Boot / Actuator — also common and respond correctly
+    "/v2/api-docs",
+    "/v3/api-docs",
+    # OpenAPI / Swagger JSON at root — often serve SPA shell on 200, not real spec
     "/openapi.json",
     "/swagger.json",
+    "/openapi.yaml",
+    "/swagger.yaml",
+    # OpenAPI / Swagger YAML
+    "/api/swagger.yaml",
+    "/api/openapi.yaml",
+    # /api/* paths — Juice Shop returns 500 for these; kept last to avoid early bail
     "/api/swagger.json",
     "/api/openapi.json",
     "/api/v1/openapi.json",
@@ -61,22 +80,6 @@ API_SPEC_PATHS = [
     "/v1/openapi.json",
     "/v2/openapi.json",
     "/docs/openapi.json",
-    # OpenAPI / Swagger YAML
-    "/openapi.yaml",
-    "/swagger.yaml",
-    "/api/swagger.yaml",
-    "/api/openapi.yaml",
-    # Swagger UI / API Docs pages (also probed with Accept:application/json)
-    "/api-docs",
-    "/api-docs/",
-    "/swagger",
-    "/swagger-ui.html",
-    "/swagger-ui/index.html",
-    "/docs",
-    "/redoc",
-    # Spring Boot / Actuator
-    "/v2/api-docs",
-    "/v3/api-docs",
     "/actuator",
     "/actuator/mappings",
     # GraphQL
@@ -126,6 +129,114 @@ SENSITIVE_PROBE_PATHS = [
 # Paths that may return Swagger JSON when requested with Accept: application/json
 # (e.g. OWASP Juice Shop /api-docs serves HTML by default but JSON when asked)
 _API_DOCS_JSON_PROBE = frozenset({"/api-docs", "/api-docs/", "/swagger", "/docs"})
+
+# Seed JSON bodies for known endpoint patterns.  For these paths we skip the
+# "POST {} → extract fields from 422" heuristic and use the pre-filled body
+# directly.  This guarantees Inspector gets the correct field set even when the
+# server returns a terse 401/403 with no field names in the error message
+# (e.g. Juice Shop /rest/user/login returns {"error":"..."} on empty body).
+_REST_SEED_BODIES: Dict[str, Dict[str, Any]] = {
+    "/rest/user/login":     {"email": "test@test.com", "password": "test"},
+    "/rest/user/register":  {"email": "test@test.com", "password": "test", "passwordRepeat": "test"},
+    "/login":               {"email": "test@test.com", "password": "test"},
+    "/signin":              {"email": "test@test.com", "password": "test"},
+    "/api/login":           {"email": "test@test.com", "password": "test"},
+    "/api/signin":          {"email": "test@test.com", "password": "test"},
+    "/auth/login":          {"email": "test@test.com", "password": "test"},
+    "/auth/signin":         {"email": "test@test.com", "password": "test"},
+    "/api/auth/login":      {"email": "test@test.com", "password": "test"},
+    "/api/auth/signin":     {"email": "test@test.com", "password": "test"},
+    "/api/v1/login":        {"email": "test@test.com", "password": "test"},
+    "/api/v2/login":        {"email": "test@test.com", "password": "test"},
+    "/user/login":          {"email": "test@test.com", "password": "test"},
+    "/account/login":       {"email": "test@test.com", "password": "test"},
+    "/register":            {"email": "test@test.com", "password": "test", "name": "Test"},
+    "/signup":              {"email": "test@test.com", "password": "test", "name": "Test"},
+    "/api/register":        {"email": "test@test.com", "password": "test"},
+    "/api/signup":          {"email": "test@test.com", "password": "test"},
+    "/api/v1/register":     {"email": "test@test.com", "password": "test"},
+    "/api/v1/users":        {"email": "test@test.com", "password": "test", "username": "test"},
+    "/api/users":           {"email": "test@test.com", "password": "test", "username": "test"},
+    "/forgot-password":     {"email": "test@test.com"},
+    "/api/forgot-password": {"email": "test@test.com"},
+    "/reset-password":      {"token": "test", "password": "Newpassword1!"},
+    "/api/reset-password":  {"token": "test", "password": "Newpassword1!"},
+    "/change-password":     {"current": "test", "new": "Newpassword1!"},
+    "/api/change-password": {"current": "test", "new": "Newpassword1!"},
+    "/session":             {"email": "test@test.com", "password": "test"},
+    "/token":               {"grant_type": "password", "username": "test", "password": "test"},
+    "/oauth/token":         {"grant_type": "password", "username": "test", "password": "test"},
+}
+
+# Common REST POST endpoint patterns probed actively to discover JSON body fields.
+# A POST {} is sent to each; 400/422 validation errors reveal required field names.
+_REST_PROBE_PATHS = [
+    "/login",
+    "/signin",
+    "/api/login",
+    "/api/signin",
+    "/auth/login",
+    "/auth/signin",
+    "/api/auth/login",
+    "/api/auth/signin",
+    "/rest/user/login",
+    "/register",
+    "/signup",
+    "/api/register",
+    "/api/signup",
+    "/api/v1/login",
+    "/api/v1/register",
+    "/api/v1/users",
+    "/api/v2/login",
+    "/api/v2/register",
+    "/api/users",
+    "/api/user",
+    "/users",
+    "/user/login",
+    "/user/register",
+    "/account/login",
+    "/account/register",
+    "/session",
+    "/sessions",
+    "/api/session",
+    "/token",
+    "/api/token",
+    "/oauth/token",
+    "/forgot-password",
+    "/reset-password",
+    "/api/forgot-password",
+    "/api/reset-password",
+    "/change-password",
+    "/api/change-password",
+]
+
+# GET endpoints with known querystring params — probed as GET to capture
+# search/filter/lookup surfaces that Katana's headless crawl might miss.
+# Each entry: (path, {param: seed_value})
+_GET_PROBE_ENDPOINTS: List[Tuple[str, Dict[str, str]]] = [
+    # Search / filter
+    ("/rest/products/search",  {"q": "test"}),
+    ("/api/products/search",   {"q": "test"}),
+    ("/search",                {"q": "test"}),
+    ("/api/search",            {"q": "test", "query": "test"}),
+    ("/api/v1/search",         {"q": "test"}),
+    # User lookup
+    ("/api/users",             {"id": "1", "email": "test@test.com"}),
+    ("/api/v1/users",          {"id": "1"}),
+    ("/rest/user/whoami",      {}),
+    # Product / item lookups
+    ("/api/products",          {"id": "1", "category": "test"}),
+    ("/api/v1/products",       {"id": "1"}),
+    # Orders / basket
+    ("/api/orders",            {"id": "1"}),
+    ("/rest/basket",           {}),
+    # Common filter/list endpoints
+    ("/api/items",             {"id": "1", "filter": "test"}),
+    ("/api/v1/items",          {"id": "1"}),
+    # Password reset token check
+    ("/api/reset-password",    {"token": "test"}),
+    ("/rest/user/reset-password", {"token": "test"}),
+]
 
 
 def _build_cookie_header(cookies: List[Dict[str, str]]) -> str:
@@ -364,6 +475,22 @@ class KatanaWorker(BaseWorker):
         # ── Sensitive path probing ─────────────────────────────────────────────
         sensitive_results = await self._probe_sensitive_paths(target, headers, cookies)
         for r in sensitive_results:
+            results.append(r)
+
+        # ── Active REST POST endpoint discovery ────────────────────────────────
+        # Probes common REST paths with an empty JSON body to discover injectable
+        # POST endpoints that katana's crawler cannot capture (e.g. Angular XHR
+        # login forms).  Extracts field names from 400/422 validation errors so
+        # worker-inspector can test JSON body parameters for injection.
+        rest_results = await self._probe_rest_endpoints(target, headers, cookies, existing_urls)
+        for r in rest_results:
+            existing_urls.add(r["url"])
+            results.append(r)
+
+        # GET probe: capture querystring endpoints (search, filter, lookup) that
+        # the headless crawler may miss because they require user interaction.
+        get_results = await self._probe_get_endpoints(target, headers, cookies, existing_urls)
+        for r in get_results:
             results.append(r)
 
         logger.info(f"[katana] Total unique endpoints: {len(results)}")
@@ -957,26 +1084,8 @@ class KatanaWorker(BaseWorker):
                             try:
                                 spec = resp.json()
                                 api_paths = self._extract_openapi_paths(spec, origin)
-                                for ep in api_paths:
-                                    results.append({
-                                        "url":         ep["url"],
-                                        "type":        "api_endpoint",
-                                        "description": f"OpenAPI endpoint [{ep['method']}] {ep['path']}",
-                                        "severity":    SeverityLevel.info,
-                                        "method":      ep["method"],
-                                        "has_params":  ep["has_params"],
-                                        "param_names": ep["param_names"],
-                                        "raw_output": {
-                                            "source":    "openapi_spec",
-                                            "spec_url":  url,
-                                            "operation": ep.get("operation", {}),
-                                            "params": {
-                                                "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
-                                                "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
-                                                "all":  ep["param_names"],
-                                            },
-                                        },
-                                    })
+                                for ep in self._openapi_to_results(api_paths, url):
+                                    results.append(ep)
                                 if api_paths:
                                     logger.info(f"[katana] OpenAPI JSON spec at {url}: extracted {len(api_paths)} endpoints")
                             except Exception as exc:
@@ -1016,26 +1125,8 @@ class KatanaWorker(BaseWorker):
                                 import yaml as _yaml
                                 spec = _yaml.safe_load(resp.text)
                                 api_paths = self._extract_openapi_paths(spec, origin)
-                                for ep in api_paths:
-                                    results.append({
-                                        "url":         ep["url"],
-                                        "type":        "api_endpoint",
-                                        "description": f"OpenAPI endpoint [{ep['method']}] {ep['path']}",
-                                        "severity":    SeverityLevel.info,
-                                        "method":      ep["method"],
-                                        "has_params":  ep["has_params"],
-                                        "param_names": ep["param_names"],
-                                        "raw_output": {
-                                            "source":    "openapi_spec",
-                                            "spec_url":  url,
-                                            "operation": ep.get("operation", {}),
-                                            "params": {
-                                                "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
-                                                "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
-                                                "all":  ep["param_names"],
-                                            },
-                                        },
-                                    })
+                                for ep in self._openapi_to_results(api_paths, url):
+                                    results.append(ep)
                                 if api_paths:
                                     logger.info(f"[katana] OpenAPI YAML spec at {url}: extracted {len(api_paths)} endpoints")
                             except Exception as exc:
@@ -1191,6 +1282,349 @@ class KatanaWorker(BaseWorker):
             logger.info(f"[katana/sensitive] {len(results)} sensitive paths accessible")
         return results
 
+    # ── Active REST POST endpoint discovery ───────────────────────────────────
+
+    async def _probe_rest_endpoints(
+        self,
+        target: str,
+        headers: Dict[str, str],
+        cookies: List[Dict],
+        existing_urls: Set[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Probe common REST POST endpoint patterns with an empty JSON body.
+
+        A 400/422 validation error response usually reveals the required field
+        names in its body.  We extract those field names and save the endpoint
+        as type='endpoint' with raw_output.params.json populated so that
+        worker-inspector can test the JSON body fields for injection.
+
+        Only emits results for URLs NOT already in existing_urls (to avoid
+        overwriting a katana-crawled record that already has JSON body context).
+        """
+        origin = _base_origin(target)
+        request_headers = dict(headers)
+        request_headers["Content-Type"] = "application/json"
+        if cookies:
+            request_headers["Cookie"] = _build_cookie_header(cookies)
+
+        results: List[Dict[str, Any]] = []
+
+        async with _httpx.AsyncClient(
+            headers=request_headers,
+            follow_redirects=False,
+            timeout=8.0,
+            verify=False,
+        ) as client:
+            for path in _REST_PROBE_PATHS:
+                url = urljoin(origin, path)
+                if url in existing_urls:
+                    continue
+                try:
+                    seed = _REST_SEED_BODIES.get(path)
+                    probe_body = seed if seed is not None else {}
+                    resp = await client.post(
+                        url,
+                        json=probe_body,
+                        headers={"Content-Type": "application/json"},
+                    )
+
+                    # 404 → endpoint definitely doesn't exist; skip
+                    # 405 → wrong method at that path; skip
+                    if resp.status_code in (404, 405):
+                        continue
+
+                    # 5xx → server-side error unrelated to us; skip
+                    if resp.status_code >= 500:
+                        continue
+
+                    # Any 2xx or 4xx (400, 401, 422, …) means the path exists.
+                    # If we used a seed body, use its keys directly — no extraction needed.
+                    fields: Dict[str, Any] = {}
+
+                    if seed:
+                        fields = {k: str(v) for k, v in seed.items() if v != ""}
+                    elif "json" in resp.headers.get("content-type", "").lower():
+                        try:
+                            fields = self._extract_json_body_fields(
+                                resp.json(), resp.status_code
+                            )
+                        except Exception:
+                            pass
+
+                    if not fields:
+                        # Endpoint exists but we couldn't determine field names;
+                        # skip — Inspector has nothing to fuzz without field names.
+                        continue
+
+                    all_fields = list(fields.keys())
+                    logger.info(
+                        f"[katana/rest-probe] POST {url} → HTTP {resp.status_code} "
+                        f"fields: {all_fields}"
+                    )
+                    results.append({
+                        "url":         url,
+                        "type":        "endpoint",
+                        "description": "REST POST endpoint (active probe, JSON body)",
+                        "severity":    SeverityLevel.info,
+                        "method":      "POST",
+                        "body":        "{}",
+                        "has_params":  True,
+                        "param_names": all_fields,
+                        "json_params": fields,
+                        "raw_output": {
+                            "source":      "rest_probe",
+                            "status_code": resp.status_code,
+                            "params": {
+                                "get":  {},
+                                "post": {},
+                                "json": fields,
+                                "all":  all_fields,
+                            },
+                        },
+                    })
+                    existing_urls.add(url)
+
+                except (_httpx.TimeoutException, _httpx.ConnectError):
+                    continue
+                except Exception as exc:
+                    logger.debug(f"[katana/rest-probe] {url}: {exc}")
+
+        if results:
+            logger.info(f"[katana/rest-probe] Found {len(results)} injectable REST POST endpoint(s)")
+        return results
+
+    async def _probe_get_endpoints(
+        self,
+        target: str,
+        headers: Dict[str, str],
+        cookies: List[Dict],
+        existing_urls: Set[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Probe common GET endpoints that carry querystring parameters.
+
+        These are search, filter, and lookup endpoints that the headless crawler
+        might miss because they require specific user interactions (typing in a
+        search box, clicking a filter, etc.).
+
+        Saves discovered endpoints as type='api_endpoint' so Inspector reads
+        them via openapi_param_map and tests each querystring param for injection.
+        """
+        from urllib.parse import urlencode
+        origin = _base_origin(target)
+        request_headers = dict(headers)
+        if cookies:
+            request_headers["Cookie"] = _build_cookie_header(cookies)
+
+        results: List[Dict[str, Any]] = []
+
+        async with _httpx.AsyncClient(
+            headers=request_headers,
+            follow_redirects=True,
+            timeout=6.0,
+            verify=False,
+        ) as client:
+            for path, params in _GET_PROBE_ENDPOINTS:
+                qs = ("?" + urlencode(params)) if params else ""
+                url = urljoin(origin, path)
+                full_url = url + qs
+
+                if url in existing_urls or full_url in existing_urls:
+                    continue
+
+                try:
+                    resp = await client.get(full_url)
+
+                    # Skip true 404s — endpoint doesn't exist
+                    if resp.status_code == 404:
+                        continue
+
+                    # Any other response (200, 400, 401, 403, 500) means path exists
+                    all_param_names = list(params.keys())
+                    logger.info(
+                        f"[katana/get-probe] GET {full_url} → HTTP {resp.status_code} "
+                        f"params: {all_param_names}"
+                    )
+                    results.append({
+                        "url":         full_url,
+                        "type":        "api_endpoint",
+                        "description": "GET endpoint (active probe, querystring params)",
+                        "severity":    SeverityLevel.info,
+                        "method":      "GET",
+                        "has_params":  True,
+                        "param_names": all_param_names,
+                        "raw_output": {
+                            "source":      "get_probe",
+                            "status_code": resp.status_code,
+                            "params": {
+                                "get":  {k: [v] for k, v in params.items()},
+                                "post": {},
+                                "json": {},
+                                "all":  all_param_names,
+                            },
+                        },
+                    })
+                    existing_urls.add(full_url)
+
+                except (_httpx.TimeoutException, _httpx.ConnectError):
+                    continue
+                except Exception as exc:
+                    logger.debug(f"[katana/get-probe] {full_url}: {exc}")
+
+        if results:
+            logger.info(f"[katana/get-probe] Found {len(results)} GET endpoint(s) with params")
+        return results
+
+    def _extract_json_body_fields(
+        self, body: Any, status_code: int
+    ) -> Dict[str, Any]:
+        """
+        Extract injectable field names from a JSON validation error response.
+
+        Handles the most common REST API error formats:
+          • {"email": "required", "password": "must be ≥8 chars"}
+          • {"errors": {"email": "required"}}
+          • {"errors": [{"field": "email", "message": "required"}]}
+          • {"message": '"email" is required'}
+        """
+        if not isinstance(body, dict):
+            return {}
+
+        _SKIP_KEYS = frozenset({
+            "message", "error", "errors", "status", "code", "statusCode",
+            "detail", "details", "msg", "data", "success", "result", "info",
+            "timestamp", "path", "trace", "type",
+        })
+        _FIELD_NAME_RE = re.compile(r'^[a-zA-Z_][a-zA-Z0-9_]{0,39}$')
+
+        fields: Dict[str, Any] = {}
+
+        # Pattern 1: top-level keys ARE field names with error strings as values
+        # {"email": "required", "password": "min 8 chars"}
+        if status_code in (400, 422):
+            for key, val in body.items():
+                if key in _SKIP_KEYS:
+                    continue
+                if _FIELD_NAME_RE.match(key) and isinstance(val, (str, list, dict, bool)):
+                    fields[key] = ""
+
+        # Pattern 2: nested under "errors" / "error" key as a dict
+        # {"errors": {"email": "required"}}
+        if not fields:
+            for wrapper in ("errors", "error", "validation", "validationErrors", "fieldErrors"):
+                sub = body.get(wrapper)
+                if isinstance(sub, dict):
+                    for key in sub:
+                        if _FIELD_NAME_RE.match(key) and key not in _SKIP_KEYS:
+                            fields[key] = ""
+                    if fields:
+                        break
+
+        # Pattern 3: array of {field/param/name/path: "...", message: "..."}
+        # {"errors": [{"field": "email", "message": "required"}]}
+        if not fields:
+            for wrapper in ("errors", "error", "validation", "details"):
+                sub = body.get(wrapper)
+                if isinstance(sub, list):
+                    for item in sub:
+                        if not isinstance(item, dict):
+                            continue
+                        fname = (
+                            item.get("field")
+                            or item.get("param")
+                            or item.get("name")
+                            or item.get("path")
+                            or item.get("key")
+                        )
+                        if fname and _FIELD_NAME_RE.match(str(fname)):
+                            fields[str(fname)] = ""
+                    if fields:
+                        break
+
+        # Pattern 4: extract field names from the error message string via regex
+        # {"message": '"email" is required, "password" must be a string'}
+        if not fields:
+            message = (
+                body.get("message")
+                or body.get("error")
+                or body.get("msg")
+                or body.get("detail")
+                or ""
+            )
+            if isinstance(message, str) and len(message) < 1000:
+                for m in re.findall(r'"([a-zA-Z_][a-zA-Z0-9_]{1,30})"', message):
+                    if m not in _SKIP_KEYS and _FIELD_NAME_RE.match(m):
+                        fields[m] = ""
+
+        return fields
+
+    def _openapi_to_results(
+        self,
+        api_paths: List[Dict[str, Any]],
+        spec_url: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert _extract_openapi_paths() dicts to DB result records.
+
+        GET endpoints  → type='api_endpoint' (inspector reads via openapi_param_map)
+        POST/PUT/PATCH with JSON body → type='endpoint' with raw_output.params.json
+          so inspector reads them via json_endpoint_map and tests JSON body fields.
+        POST/PUT/PATCH without JSON body → type='api_endpoint' (fallback)
+        """
+        results = []
+        for ep in api_paths:
+            method     = ep["method"]
+            json_body  = ep.get("json_body", {})
+            is_mutating = method in ("POST", "PUT", "PATCH")
+
+            if is_mutating and json_body:
+                # Inspector json_endpoint_map path
+                all_fields = list(json_body.keys())
+                results.append({
+                    "url":         ep["url"],
+                    "type":        "endpoint",
+                    "description": f"OpenAPI endpoint [{method}] {ep['path']} (JSON body)",
+                    "severity":    SeverityLevel.info,
+                    "method":      method,
+                    "has_params":  True,
+                    "param_names": ep["param_names"],
+                    "json_params": json_body,
+                    "raw_output": {
+                        "source":    "openapi_spec",
+                        "spec_url":  spec_url,
+                        "operation": ep.get("operation", {}),
+                        "params": {
+                            "get":  {},
+                            "post": {},
+                            "json": json_body,
+                            "all":  ep["param_names"],
+                        },
+                    },
+                })
+            else:
+                # Inspector openapi_param_map path (query/path params)
+                results.append({
+                    "url":         ep["url"],
+                    "type":        "api_endpoint",
+                    "description": f"OpenAPI endpoint [{method}] {ep['path']}",
+                    "severity":    SeverityLevel.info,
+                    "method":      method,
+                    "has_params":  ep["has_params"],
+                    "param_names": ep["param_names"],
+                    "raw_output": {
+                        "source":    "openapi_spec",
+                        "spec_url":  spec_url,
+                        "operation": ep.get("operation", {}),
+                        "params": {
+                            "get":  {p: [] for p in ep["param_names"] if ep.get("param_in") == "query"},
+                            "post": {p: [] for p in ep["param_names"] if ep.get("param_in") in ("body", "formData")},
+                            "all":  ep["param_names"],
+                        },
+                    },
+                })
+        return results
+
     def _make_spec_result(self, url: str, type_: str) -> Dict[str, Any]:
         return {
             "url": url,
@@ -1260,6 +1694,35 @@ class KatanaWorker(BaseWorker):
                 if query_params and method.lower() == "get":
                     example_url += "?" + "&".join(query_params)
 
+                # OpenAPI 3 requestBody — extract JSON schema properties
+                # (OpenAPI 2 uses "in: body" parameter handled above)
+                json_body_template: Dict[str, Any] = {}
+                request_body = operation.get("requestBody", {})
+                if request_body and isinstance(request_body, dict):
+                    content = request_body.get("content", {})
+                    json_schema = (
+                        content.get("application/json", {})
+                        or content.get("application/x-www-form-urlencoded", {})
+                        or content.get("*/*", {})
+                    )
+                    schema = json_schema.get("schema", {})
+                    props  = schema.get("properties", {})
+                    for prop_name in props:
+                        if re.match(r'^[a-zA-Z_][a-zA-Z0-9_]{0,39}$', prop_name):
+                            json_body_template[prop_name] = ""
+                            if prop_name not in param_names:
+                                param_names.append(prop_name)
+                    # "required" array may add fields missing from properties
+                    for req_field in schema.get("required", []):
+                        if (
+                            isinstance(req_field, str)
+                            and re.match(r'^[a-zA-Z_][a-zA-Z0-9_]{0,39}$', req_field)
+                            and req_field not in json_body_template
+                        ):
+                            json_body_template[req_field] = ""
+                            if req_field not in param_names:
+                                param_names.append(req_field)
+
                 endpoints.append({
                     "url":         example_url,
                     "path":        path,
@@ -1267,6 +1730,7 @@ class KatanaWorker(BaseWorker):
                     "has_params":  bool(param_names),
                     "param_names": param_names,
                     "param_in":    param_in,
+                    "json_body":   json_body_template,   # non-empty for POST+requestBody
                     "operation":   {
                         "operationId": operation.get("operationId", ""),
                         "summary":     operation.get("summary", ""),

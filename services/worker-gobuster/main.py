@@ -171,7 +171,25 @@ class GobusterWorker(BaseWorker):
         logger.info(f"[gobuster] dir mode → {url}")
         await self._run_gobuster(cmd, timeout)
 
-        return _parse_dir_output(OUTPUT_FILE, url)
+        results = _parse_dir_output(OUTPUT_FILE, url)
+
+        # Always probe high-value paths directly — these are fast single GETs
+        # that ensure critical paths (FTP dumps, admin panels, .git, .env) are
+        # never missed even if the main wordlist doesn't cover them.
+        supplemental = await _probe_supplemental_paths(url, auth_headers)
+        found_urls = {r["url"] for r in results}
+        for r in supplemental:
+            if r["url"] not in found_urls:
+                results.append(r)
+
+        # M19: legacy endpoint + CSP header audit
+        legacy_findings = await _probe_legacy_csp(url, auth_headers)
+        found_urls = {r["url"] for r in results}
+        for r in legacy_findings:
+            if r["url"] not in found_urls:
+                results.append(r)
+
+        return results
 
     # ── DNS mode ───────────────────────────────────────────────────────────────
 
@@ -284,6 +302,255 @@ class GobusterWorker(BaseWorker):
 
         except FileNotFoundError:
             logger.error("[gobuster] 'gobuster' binary not found in PATH")
+
+
+# ── High-value supplemental paths ────────────────────────────────────────────
+#
+# These are known high-value paths that appear in real apps and CTF targets.
+# Gobuster's wordlist will find most of them on a slow scan, but we probe these
+# directly to ensure they are always surfaced regardless of wordlist coverage.
+
+_SUPPLEMENTAL_PATHS = [
+    # FTP / file dumps (OWASP Juice Shop, legacy apps)
+    "/ftp",
+    "/ftp/acquisitions.md",
+    "/ftp/package.json.bak",
+    "/ftp/coupons_2013.md.bak",
+    "/ftp/eastere.gg",
+    "/ftp/incident-support.kdbx",
+    "/ftp/legal.md",
+    "/ftp/quarantine",
+    # Backup / source files
+    "/backup",
+    "/backup.zip",
+    "/backup.tar.gz",
+    "/.git/HEAD",
+    "/.git/config",
+    "/source.zip",
+    "/dump.sql",
+    # Admin panels
+    "/admin",
+    "/admin/",
+    "/administrator",
+    "/manager",
+    "/management",
+    "/wp-admin",
+    "/phpmyadmin",
+    # Monitoring / diagnostics
+    "/metrics",
+    "/actuator",
+    "/actuator/health",
+    "/actuator/env",
+    "/actuator/mappings",
+    "/actuator/beans",
+    "/debug",
+    "/console",
+    "/health",
+    "/status",
+    "/info",
+    "/_debug",
+    # Logs
+    "/logs",
+    "/log",
+    "/logs/access.log",
+    "/error.log",
+    # Config / secrets
+    "/.env",
+    "/config.php",
+    "/config.json",
+    "/configuration.php",
+    "/web.config",
+    "/app.config",
+    "/settings.py",
+    # GraphQL / API schema
+    "/graphql",
+    "/graphiql",
+    "/playground",
+    "/api/graphql",
+    "/swagger-ui.html",
+    "/api-docs",
+    "/swagger.json",
+    # Test / dev artifacts
+    "/test",
+    "/phpinfo.php",
+    "/info.php",
+    "/server-status",
+    "/server-info",
+    "/.htaccess",
+    "/robots.txt",
+    "/sitemap.xml",
+    "/crossdomain.xml",
+]
+
+
+# ── Legacy endpoints known to lack CSP ────────────────────────────────────────
+#
+# These paths are common in apps that migrated from v1 → v2 but left old routes
+# alive without applying modern security headers (CSP, HSTS, X-Frame-Options).
+# Juice Shop exposes /rest/products/search and /redirect?to= without full CSP.
+
+_LEGACY_PATHS = [
+    # Old REST versions
+    "/v1/", "/v1/users", "/v1/products", "/v1/search",
+    "/v2/", "/api/v1/", "/api/v2/",
+    # Juice Shop legacy / redirect endpoints
+    "/redirect",
+    "/rest/products/search",
+    "/rest/user/whoami",
+    "/rest/track-order",
+    "/rest/repeat-notification",
+    "/rest/continue-code",
+    "/rest/memories",
+    # Common legacy admin/test pages
+    "/old/",
+    "/legacy/",
+    "/beta/",
+    "/dev/",
+    "/staging/",
+    "/test/",
+    # Common debug / info endpoints that may skip CSP
+    "/trace",
+    "/dump",
+    "/env",
+    "/version",
+    "/build-info",
+    "/whoami",
+    "/server-info",
+]
+
+# Headers that constitute a minimal security policy
+_SECURITY_HEADERS = {
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+}
+
+
+async def _probe_legacy_csp(
+    base_url: str,
+    auth_headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Probe legacy / outdated endpoints and report those lacking CSP headers.
+
+    Findings:
+      - csp_missing   (medium)  — live endpoint without Content-Security-Policy
+      - legacy_endpoint (info) — deprecated path still alive (400/401 counts too)
+    """
+    results: List[Dict[str, Any]] = []
+
+    async with _httpx.AsyncClient(
+        headers=auth_headers,
+        follow_redirects=True,
+        timeout=6.0,
+        verify=False,
+    ) as client:
+        for path in _LEGACY_PATHS:
+            full_url = base_url.rstrip("/") + path
+            try:
+                resp = await client.get(full_url)
+                if resp.status_code == 404:
+                    continue
+
+                resp_headers_lower = {k.lower(): v for k, v in resp.headers.items()}
+                has_csp    = "content-security-policy" in resp_headers_lower
+                has_xframe = "x-frame-options" in resp_headers_lower
+
+                missing = []
+                if not has_csp:
+                    missing.append("Content-Security-Policy")
+                if not has_xframe:
+                    missing.append("X-Frame-Options")
+
+                if missing:
+                    results.append({
+                        "url":         full_url,
+                        "type":        "csp_missing",
+                        "description": (
+                            f"Legacy/outdated endpoint {path!r} is live "
+                            f"(HTTP {resp.status_code}) but missing security headers: "
+                            + ", ".join(missing)
+                        ),
+                        "severity":    SeverityLevel.medium,
+                        "vulnerability_type": "csp_missing",
+                        "raw_output":  {
+                            "url":            full_url,
+                            "status_code":    resp.status_code,
+                            "path":           path,
+                            "missing_headers": missing,
+                            "response_headers": dict(list(resp_headers_lower.items())[:10]),
+                            "source":         "gobuster-legacy-csp",
+                            "owasp":          "A05:2021 – Security Misconfiguration",
+                        },
+                    })
+                else:
+                    # Endpoint exists with headers — still worth reporting as info
+                    results.append({
+                        "url":         full_url,
+                        "type":        "legacy_endpoint",
+                        "description": f"Legacy endpoint {path!r} is live (HTTP {resp.status_code})",
+                        "severity":    SeverityLevel.info,
+                        "raw_output":  {
+                            "url": full_url, "status_code": resp.status_code,
+                            "path": path, "source": "gobuster-legacy-csp",
+                        },
+                    })
+            except Exception:
+                continue
+
+    if results:
+        import logging as _log
+        csp_count = sum(1 for r in results if r["type"] == "csp_missing")
+        _log.getLogger("gobuster").info(
+            f"[gobuster/legacy-csp] {len(results)} legacy path(s) found, "
+            f"{csp_count} without CSP"
+        )
+    return results
+
+
+async def _probe_supplemental_paths(
+    base_url: str,
+    auth_headers: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    """
+    Directly probe _SUPPLEMENTAL_PATHS with a single HTTP GET each.
+    Returns discovered paths in the same format as _parse_dir_output.
+    """
+    results: List[Dict[str, Any]] = []
+    async with _httpx.AsyncClient(
+        headers=auth_headers,
+        follow_redirects=False,
+        timeout=6.0,
+        verify=False,
+    ) as client:
+        for path in _SUPPLEMENTAL_PATHS:
+            full_url = base_url.rstrip("/") + path
+            try:
+                resp = await client.get(full_url)
+                if resp.status_code == 404:
+                    continue
+                # Anything non-404 is worth reporting
+                results.append({
+                    "url":         full_url,
+                    "type":        "endpoint",
+                    "description": f"Supplemental probe: HTTP {resp.status_code} {path}",
+                    "severity":    SeverityLevel.info,
+                    "raw_output": {
+                        "url":         full_url,
+                        "status_code": resp.status_code,
+                        "path":        path,
+                        "size":        len(resp.content),
+                        "source":      "supplemental_probe",
+                    },
+                })
+            except Exception:
+                continue
+    if results:
+        import logging as _log
+        _log.getLogger("gobuster").info(
+            f"[gobuster/supplemental] Found {len(results)} path(s) in supplemental probe"
+        )
+    return results
 
 
 # ── Wildcard detection ────────────────────────────────────────────────────────

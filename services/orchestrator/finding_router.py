@@ -222,32 +222,42 @@ class FindingRouter:
         route_ctx = raw.get("route_context", {})
         app_ctx: Dict[str, Any] = scan.config.get("app_context") or {}
 
+        payload: Dict[str, Any] = {
+            # Standard pipeline fields
+            "phase":           "exploit",
+            "source_tools":    [finding.tool],
+            "exploit_enabled": scan.config.get("exploit_enabled", False),
+            # App-type context (M8)
+            "app_type":        app_ctx.get("app_type", "unknown"),
+            "is_spa":          app_ctx.get("is_spa", False),
+            "framework":       app_ctx.get("framework"),
+            "tech_stack":      app_ctx.get("tech_stack", []),
+            # Finding-specific routing context
+            "finding_triggered": True,
+            "finding_id":        str(finding.id),
+            "finding_type":      vtype,
+            # Pre-validated endpoint for targeted exploitation
+            "endpoints":       [url] if url else [],
+            "inject_param":    param or route_ctx.get("param"),
+            "inject_method":   route_ctx.get("method", "GET"),
+            "inject_payload":  route_ctx.get("payload"),
+            "evidence":        finding.description,
+        }
+
+        # ── M20: credential_exposure → playwright admin workflow ─────────────
+        # When routing valid credentials to playwright, include email/password so
+        # the admin workflow test can login programmatically via REST.
+        if vtype == "credential_exposure" and tool == "playwright":
+            payload["admin_email"]     = raw.get("email")
+            payload["admin_password"]  = raw.get("password")
+            payload["admin_login_url"] = url  # login endpoint URL
+
         return {
             "event":           "scan.task.created",
             "scan_id":         scan_id,
             "target":          url or scan.target_url,
             "auth_session_id": scan.config.get("auth_session_id"),
-            "payload": {
-                # Standard pipeline fields
-                "phase":           "exploit",
-                "source_tools":    [finding.tool],
-                "exploit_enabled": scan.config.get("exploit_enabled", False),
-                # App-type context (M8)
-                "app_type":        app_ctx.get("app_type", "unknown"),
-                "is_spa":          app_ctx.get("is_spa", False),
-                "framework":       app_ctx.get("framework"),
-                "tech_stack":      app_ctx.get("tech_stack", []),
-                # Finding-specific routing context
-                "finding_triggered": True,
-                "finding_id":        str(finding.id),
-                "finding_type":      vtype,
-                # Pre-validated endpoint for targeted exploitation
-                "endpoints":       [url] if url else [],
-                "inject_param":    param or route_ctx.get("param"),
-                "inject_method":   route_ctx.get("method", "GET"),
-                "inject_payload":  route_ctx.get("payload"),
-                "evidence":        finding.description,
-            },
+            "payload":         payload,
         }
 
 

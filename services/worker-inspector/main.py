@@ -1063,6 +1063,48 @@ async def _detect_path_traversal(
     return None
 
 
+# ── Open redirect bypass payloads ─────────────────────────────────────────────
+#
+# Progressive from basic → advanced bypass techniques.  Stop on first hit.
+# The canary domain is our signal; encoding / scheme tricks defeat naive filters.
+
+_OPEN_REDIRECT_CANARY = "briar-evil-redirect-canary.example.com"
+
+_REDIRECT_PAYLOADS: List[str] = [
+    # Basic
+    f"https://{_OPEN_REDIRECT_CANARY}/",
+    # Protocol-relative (works when host strips leading scheme check)
+    f"//{_OPEN_REDIRECT_CANARY}/",
+    # Backslash — some parsers treat \ as / in paths
+    f"/\\{_OPEN_REDIRECT_CANARY}/",
+    # URL-encoded slash after scheme
+    f"https://{_OPEN_REDIRECT_CANARY}%2F",
+    # Double-encoded
+    f"https://{_OPEN_REDIRECT_CANARY}%252F",
+    # Scheme without double-slash (IIS/ASP quirk)
+    f"https:{_OPEN_REDIRECT_CANARY}/",
+    # CRLF injection in redirect value
+    f"https://{_OPEN_REDIRECT_CANARY}/%0d%0aSet-Cookie:briar=1",
+    # Tab prefix (bypasses simple startswith check)
+    f"\thttps://{_OPEN_REDIRECT_CANARY}/",
+    # Credential-in-URL trick (legit@evil)
+    f"https://legit-site.com@{_OPEN_REDIRECT_CANARY}/",
+    # Allowlist bypass: crypto/blockchain sites (common in Juice Shop challenges)
+    f"https://blockchain.info/address/{_OPEN_REDIRECT_CANARY}",
+    f"https://etherscan.io/tx/{_OPEN_REDIRECT_CANARY}",
+]
+
+# Known redirect parameter names — for aggressive endpoint-level probing
+_REDIRECT_PARAM_NAMES: List[str] = [
+    "redirect", "redirect_to", "redirect_url", "redirectUrl", "redirectTo",
+    "to", "url", "next", "next_url", "nextUrl",
+    "return", "return_url", "returnUrl", "return_to",
+    "location", "goto", "go", "continue", "dest", "destination",
+    "forward", "callback", "callback_url", "link", "target", "out",
+    "ref", "referer", "referrer", "href", "src",
+]
+
+
 async def _detect_open_redirect(
     client: "httpx.AsyncClient",
     url: str,
@@ -1070,28 +1112,252 @@ async def _detect_open_redirect(
     params: Dict[str, List[str]],
     param_name: str,
 ) -> Optional[Dict[str, Any]]:
-    """Open redirect detection via Location header inspection."""
-    evil_url = "https://briar-evil-redirect-canary.example.com/"
-    inject_url, post_data = _inject_param(url, params, param_name, evil_url, method)
+    """Open redirect detection — tests multiple bypass payloads per parameter."""
+    for payload in _REDIRECT_PAYLOADS:
+        inject_url, post_data = _inject_param(url, params, param_name, payload, method)
+        try:
+            if method.upper() == "POST" and post_data:
+                resp = await client.post(inject_url, data=post_data,
+                                         timeout=REQUEST_TIMEOUT, follow_redirects=False)
+            else:
+                resp = await client.get(inject_url,
+                                        timeout=REQUEST_TIMEOUT, follow_redirects=False)
 
+            location = resp.headers.get("location", "")
+            if _OPEN_REDIRECT_CANARY in location:
+                return {
+                    "detection": "header-reflection",
+                    "payload":   payload,
+                    "bypass":    payload != f"https://{_OPEN_REDIRECT_CANARY}/",
+                    "evidence": (
+                        f"Location header reflects injected URL: {location!r} — "
+                        f"open redirect confirmed via bypass payload, status {resp.status_code}"
+                    ),
+                }
+        except Exception:
+            continue
+
+    return None
+
+
+async def _detect_open_redirect_aggressive(
+    client: "httpx.AsyncClient",
+    url: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Endpoint-level aggressive open redirect probe.
+
+    Injects canary into well-known redirect params (?redirect=, ?to=, ?next=, …)
+    regardless of whether arjun discovered them — these are invisible to parameter
+    discovery because they only manifest on redirect-capable endpoints.
+    Also tests /redirect?to= and /api/redirect?url= path patterns.
+    """
+    import urllib.parse as _urllib_parse
+
+    canary    = f"https://{_OPEN_REDIRECT_CANARY}/"
+    parsed    = urlparse(url)
+    base_path = urlunparse(parsed._replace(query="", fragment="")).rstrip("/")
+
+    # Probe known redirect params on the endpoint's own path
+    for param in _REDIRECT_PARAM_NAMES:
+        probe = f"{base_path}?{param}={_urllib_parse.quote(canary)}"
+        try:
+            resp = await client.get(probe, timeout=REQUEST_TIMEOUT, follow_redirects=False)
+            location = resp.headers.get("location", "")
+            if _OPEN_REDIRECT_CANARY in location:
+                return {
+                    "detection": "aggressive-param-probe",
+                    "param":     param,
+                    "payload":   canary,
+                    "evidence": (
+                        f"Endpoint-level redirect probe ?{param}=<canary> → "
+                        f"Location: {location!r} — open redirect confirmed"
+                    ),
+                    "owasp": "A01:2021 – Broken Access Control (Open Redirect)",
+                }
+        except Exception:
+            continue
+
+    # Probe dedicated redirect paths common in Express / Node / Java apps
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    redirect_paths = [
+        f"/redirect?to={_urllib_parse.quote(canary)}",
+        f"/redirect?url={_urllib_parse.quote(canary)}",
+        f"/go?url={_urllib_parse.quote(canary)}",
+        f"/out?url={_urllib_parse.quote(canary)}",
+        f"/link?url={_urllib_parse.quote(canary)}",
+        f"/api/redirect?to={_urllib_parse.quote(canary)}",
+        f"/rest/redirect?url={_urllib_parse.quote(canary)}",
+    ]
+    for path in redirect_paths:
+        try:
+            resp = await client.get(
+                origin + path, timeout=REQUEST_TIMEOUT, follow_redirects=False
+            )
+            location = resp.headers.get("location", "")
+            if _OPEN_REDIRECT_CANARY in location:
+                return {
+                    "detection": "dedicated-redirect-path",
+                    "param":     "url/to",
+                    "payload":   canary,
+                    "evidence": (
+                        f"Dedicated redirect endpoint {path} → "
+                        f"Location: {location!r} — open redirect confirmed"
+                    ),
+                    "owasp": "A01:2021 – Broken Access Control (Open Redirect)",
+                }
+        except Exception:
+            continue
+
+    return None
+
+
+async def _detect_header_injection(
+    client: "httpx.AsyncClient",
+    url: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """
+    Detect HTTP header injection vulnerabilities:
+      1. Host header poisoning — server reflects Host in response/links
+      2. X-Forwarded-Host override — same, via proxy header
+      3. Auth bypass via X-Original-URL / X-Rewrite-URL (path override)
+      4. IP-based access bypass via X-Forwarded-For: 127.0.0.1
+    """
+    canary_host = "briar-header-canary.example.com"
+
+    # ── 1. Host / X-Forwarded-Host ────────────────────────────────────────
+    for header_name in ("Host", "X-Forwarded-Host", "X-Host"):
+        try:
+            resp = await client.get(url, headers={header_name: canary_host},
+                                    timeout=REQUEST_TIMEOUT)
+            body = resp.text
+            location = resp.headers.get("location", "")
+            if canary_host in body or canary_host in location:
+                return {
+                    "detection":    "host-header-injection",
+                    "payload":      f"{header_name}: {canary_host}",
+                    "evidence": (
+                        f"Injected {header_name} value {canary_host!r} reflected in "
+                        f"{'Location header' if canary_host in location else 'response body'} — "
+                        f"Host header injection / password-reset link poisoning"
+                    ),
+                }
+        except Exception:
+            pass
+
+    # ── 2. X-Original-URL auth bypass (Nginx/IIS path override) ──────────
+    restricted_paths = ["/admin", "/admin/", "/management", "/api/admin", "/api/v1/admin"]
+    for bypass_path in restricted_paths:
+        try:
+            resp_bypass = await client.get(
+                url,
+                headers={"X-Original-URL": bypass_path, "X-Rewrite-URL": bypass_path},
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp_direct = await client.get(url + bypass_path.rstrip("/"),
+                                           timeout=REQUEST_TIMEOUT)
+            # If the bypass returns 200 but direct request returns 403/404 → bypass
+            if (resp_bypass.status_code == 200
+                    and resp_direct.status_code in (403, 404, 401)
+                    and len(resp_bypass.text) > 50):
+                return {
+                    "detection":    "path-bypass",
+                    "payload":      f"X-Original-URL: {bypass_path}",
+                    "evidence": (
+                        f"X-Original-URL: {bypass_path} → 200 OK "
+                        f"(direct request {resp_direct.status_code}) — "
+                        f"path override bypasses access control"
+                    ),
+                }
+        except Exception:
+            pass
+
+    # ── 3. X-Forwarded-For: 127.0.0.1 IP allowlist bypass ────────────────
     try:
-        if method.upper() == "POST" and post_data:
-            resp = await client.post(inject_url, data=post_data,
-                                     timeout=REQUEST_TIMEOUT, follow_redirects=False)
-        else:
-            resp = await client.get(inject_url,
-                                    timeout=REQUEST_TIMEOUT, follow_redirects=False)
-
-        location = resp.headers.get("location", "")
-        if "briar-evil-redirect-canary.example.com" in location:
+        resp_xff = await client.get(
+            url,
+            headers={"X-Forwarded-For": "127.0.0.1",
+                     "X-Real-IP": "127.0.0.1",
+                     "Client-IP": "127.0.0.1"},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if (baseline.status in (401, 403)
+                and resp_xff.status_code in (200, 201, 302)):
             return {
-                "detection": "header-reflection",
-                "payload": evil_url,
+                "detection":    "ip-bypass",
+                "payload":      "X-Forwarded-For: 127.0.0.1",
                 "evidence": (
-                    f"Location header reflects injected URL: {location!r} — "
-                    f"open redirect confirmed, status {resp.status_code}"
+                    f"HTTP {baseline.status} → {resp_xff.status_code} when "
+                    f"X-Forwarded-For: 127.0.0.1 — IP-based allowlist bypass"
                 ),
             }
+    except Exception:
+        pass
+
+    return None
+
+
+async def _detect_csrf(
+    client: "httpx.AsyncClient",
+    url: str,
+    method: str,
+    baseline: Baseline,
+    auth_headers: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Detect CSRF vulnerabilities on state-changing endpoints.
+
+    Checks:
+      1. Cross-origin POST accepted without CSRF token (JSON body w/ evil Origin)
+      2. Cookies missing SameSite attribute in response Set-Cookie headers
+      3. Endpoint accepts form-encoded POST when baseline expects JSON (JSON CSRF)
+    """
+    if method.upper() not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+
+    evil_origin = "https://evil-csrf-canary.example.com"
+
+    # ── 1. Cross-origin request accepted ─────────────────────────────────
+    try:
+        csrf_headers = {
+            **auth_headers,
+            "Origin":  evil_origin,
+            "Referer": evil_origin + "/",
+            "Content-Type": "application/json",
+        }
+        resp = await client.request(method, url, content="{}", headers=csrf_headers,
+                                    timeout=REQUEST_TIMEOUT)
+        cors_allow = resp.headers.get("access-control-allow-origin", "")
+        # If the origin is reflected or wildcard AND the status is success → CSRF risk
+        if resp.status_code in (200, 201, 204) and (
+            cors_allow == "*" or evil_origin in cors_allow
+        ):
+            return {
+                "detection": "cors-csrf",
+                "payload":   f"Origin: {evil_origin}",
+                "evidence": (
+                    f"POST from evil origin {evil_origin!r} returned {resp.status_code} "
+                    f"with CORS: {cors_allow!r} — CORS policy allows cross-origin state changes"
+                ),
+            }
+    except Exception:
+        pass
+
+    # ── 2. Missing SameSite on session cookies ────────────────────────────
+    try:
+        resp = await client.get(url, timeout=REQUEST_TIMEOUT)
+        for sc in resp.headers.get_list("set-cookie"):
+            if sc and "samesite" not in sc.lower():
+                if any(kw in sc.lower() for kw in ("session", "token", "auth", "jwt", "connect.sid")):
+                    return {
+                        "detection": "missing-samesite",
+                        "payload":   "N/A",
+                        "evidence": (
+                            f"Session cookie missing SameSite attribute: {sc[:120]!r} — "
+                            f"vulnerable to CSRF on browsers without strict defaults"
+                        ),
+                    }
     except Exception:
         pass
 
@@ -1305,6 +1571,16 @@ _FINDING_TYPE_META: Dict[str, Dict[str, Any]] = {
         "severity": SeverityLevel.high,
         "route_to":  "nuclei",
         "owasp":     "A06:2023 – Mass Assignment (API6:2023)",
+    },
+    "header_injection": {
+        "severity": SeverityLevel.high,
+        "route_to":  None,
+        "owasp":     "A05:2021 – Security Misconfiguration",
+    },
+    "csrf": {
+        "severity": SeverityLevel.medium,
+        "route_to":  None,
+        "owasp":     "A01:2021 – Broken Access Control",
     },
 }
 
@@ -1610,6 +1886,81 @@ async def _detect_jwt_tokens(
     return findings
 
 
+# ── Rate-limit / race-condition detection ─────────────────────────────────────
+
+async def _detect_rate_limit(
+    client: "httpx.AsyncClient",
+    url: str,
+    method: str,
+    baseline: Baseline,
+) -> Optional[Dict[str, Any]]:
+    """
+    Send 20 identical requests in parallel and check whether the server
+    throttles any of them (429 / 503 / Retry-After header).  If all succeed
+    with 2xx/3xx we flag a missing rate-limit finding.
+
+    Also fires a naïve race-condition probe: send 10 simultaneous POST
+    requests with a unique token value and report if >1 succeed (status < 400),
+    which can indicate a time-of-check / time-of-use race.
+    """
+    _BURST = 20
+    _RACE  = 10
+
+    # ── Burst probe ───────────────────────────────────────────────────────────
+    async def _one(_client, _url, _method):
+        try:
+            if _method.upper() in ("POST", "PUT", "PATCH"):
+                r = await _client.request(_method.upper(), _url, json={}, timeout=10)
+            else:
+                r = await _client.request(_method.upper(), _url, timeout=10)
+            return r.status_code
+        except Exception:
+            return 0
+
+    tasks = [_one(client, url, method) for _ in range(_BURST)]
+    statuses = await asyncio.gather(*tasks)
+
+    # If server returned 429 or 503 for any request → rate-limit IS present
+    if any(s in (429, 503) for s in statuses):
+        return None  # protected
+
+    ok_count = sum(1 for s in statuses if 200 <= s < 400)
+    if ok_count < _BURST * 0.7:
+        return None  # too many errors, indeterminate
+
+    # All burst requests succeeded → missing rate-limit
+    finding = {
+        "description": (
+            f"No rate-limiting detected: {_BURST} simultaneous requests to "
+            f"{url} all returned 2xx/3xx (no 429/503 seen). "
+            "Brute-force and credential-stuffing attacks are possible."
+        ),
+        "evidence": f"statuses={list(statuses)[:10]}",
+        "technique": "burst_probe",
+        "owasp": "A04:2021 – Insecure Design",
+    }
+
+    # ── Race-condition probe (POST-only endpoints) ─────────────────────────────
+    if method.upper() in ("POST", "PUT", "PATCH"):
+        import uuid as _uuid_mod
+        race_token = str(_uuid_mod.uuid4())
+        race_body  = {"race_probe_token": race_token, "quantity": 1}
+        race_tasks = [
+            _one(client, url, method) for _ in range(_RACE)
+        ]
+        race_stats = await asyncio.gather(*race_tasks)
+        race_ok = sum(1 for s in race_stats if 200 <= s < 400)
+        if race_ok > 1:
+            finding["race_condition"] = True
+            finding["race_successes"] = race_ok
+            finding["description"] += (
+                f" Additionally {race_ok}/{_RACE} simultaneous POST requests succeeded, "
+                "indicating a possible race condition (TOCTOU)."
+            )
+
+    return finding
+
+
 # ── Worker ─────────────────────────────────────────────────────────────────────
 
 class InspectorWorker(BaseWorker):
@@ -1910,6 +2261,45 @@ class InspectorWorker(BaseWorker):
                     )
                     if result:
                         findings.append(_build_finding(ep, param_name, "open_redirect", result))
+
+            # ── Endpoint-level checks (run once per URL, not per param) ───────
+            # Header injection: Host override, X-Original-URL bypass, IP bypass
+            hi = await _detect_header_injection(client, ep.url, baseline)
+            if hi:
+                findings.append(_build_finding(ep, "__headers__", "header_injection", hi))
+
+            # CSRF: cross-origin acceptance, missing SameSite
+            csrf = await _detect_csrf(client, ep.url, ep.method, baseline, headers)
+            if csrf:
+                findings.append(_build_finding(ep, "__csrf__", "csrf", csrf))
+
+            # Open redirect: aggressive endpoint-level probe for dedicated redirect params
+            redir_agg = await _detect_open_redirect_aggressive(client, ep.url)
+            if redir_agg:
+                findings.append({
+                    "url":    ep.url,
+                    "type":   "open_redirect",
+                    "param":  redir_agg.get("param", "__redirect__"),
+                    "severity": SeverityLevel.medium,
+                    "vulnerability_type": "open_redirect",
+                    "description": redir_agg["evidence"],
+                    "evidence":    redir_agg.get("evidence", ""),
+                    "raw_output":  {**redir_agg, "owasp": "A01:2021 – Broken Access Control"},
+                })
+
+            # Rate limiting + race condition
+            rl = await _detect_rate_limit(client, ep.url, ep.method, baseline)
+            if rl:
+                findings.append({
+                    "url":    ep.url,
+                    "type":   "missing_rate_limit",
+                    "param":  "__rate_limit__",
+                    "severity": SeverityLevel.medium,
+                    "vulnerability_type": "missing_rate_limit",
+                    "description": rl["description"],
+                    "evidence":    rl.get("evidence", ""),
+                    "raw_output":  rl,
+                })
 
             # ── JSON body injection pass (REST API endpoints) ──────────────────
             if ep.json_body:

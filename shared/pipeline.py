@@ -50,6 +50,14 @@ TOOL_QUEUES: Dict[str, str] = {
     # ── M11: Access control testing ────────────────────────────────────────────
     "cors":       "scan.dast.cors",
     "bola":       "scan.dast.bola",
+    # ── M12: DOM XSS via headless browser ──────────────────────────────────────
+    "playwright": "scan.dast.playwright",
+    # ── M13/M14: XXE + file upload testing ─────────────────────────────────────
+    "xxe":        "scan.dast.xxe",
+    # ── M15: Credential attack ─────────────────────────────────────────────────
+    "creds":      "scan.dast.creds",
+    # ── M16: Business logic testing ────────────────────────────────────────────
+    "bizlogic":   "scan.dast.bizlogic",
 }
 
 # ── M7: Finding Router — finding type → tool routing table ────────────────────
@@ -123,6 +131,12 @@ FINDING_ROUTES: Dict[str, Dict] = {
         "tool":             "nuclei",
         "requires_exploit": False,
         "description":      "Mass assignment surface → nuclei mass-assignment templates",
+    },
+    # ── M20: Admin workflow trigger ───────────────────────────────────────────
+    "credential_exposure": {
+        "tool":             "playwright",
+        "requires_exploit": False,
+        "description":      "Valid credentials found → playwright admin workflow test",
     },
 }
 
@@ -275,15 +289,23 @@ PHASES: List[Dict] = [
     # and most modern Node apps use JWT — jwt_tool provides real coverage here.
     {
         "id": "dast",
-        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola"},
+        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "playwright", "xxe", "creds", "bizlogic"},
         "trigger_after": {"httpx", "ffuf", "gobuster"},
         "source_tools": {
-            "nuclei":   ["katana", "ffuf", "gobuster", "httpx"],
-            "zap":      ["katana", "ffuf", "gobuster", "httpx"],
-            "nikto":    ["katana", "httpx"],
-            "dalfox":   ["katana", "ffuf", "gobuster", "httpx", "arjun"],
-            "cors":     ["katana", "ffuf", "gobuster", "httpx"],
-            "bola":     ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            "nuclei":     ["katana", "ffuf", "gobuster", "httpx"],
+            "zap":        ["katana", "ffuf", "gobuster", "httpx"],
+            "nikto":      ["katana", "httpx"],
+            "dalfox":     ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            "cors":       ["katana", "ffuf", "gobuster", "httpx"],
+            "bola":       ["katana", "ffuf", "gobuster", "httpx", "arjun"],
+            # playwright gets all crawled URLs so it can test Angular hash-fragment routes
+            "playwright": ["katana", "ffuf", "gobuster", "httpx"],
+            # xxe gets all endpoints to discover upload/XML surfaces
+            "xxe":        ["katana", "ffuf", "gobuster", "httpx"],
+            # creds needs katana endpoint list to discover login paths
+            "creds":      ["katana", "ffuf", "gobuster", "httpx"],
+            # bizlogic tests business logic on the target directly
+            "bizlogic":   ["katana", "ffuf", "gobuster", "httpx"],
             # jwt_tool is finding-triggered only (via finding_router on jwt_found),
             # NOT phase-triggered — keeping it here caused the DAST phase to appear
             # "already started" whenever finding_router ran jwt_tool before ffuf finished.
@@ -336,22 +358,35 @@ def should_trigger_phase(
     phase: Dict,
     completed_tools: Set[str],
     selected_tools: Set[str],
+    started_phases: Optional[Set[str]] = None,
 ) -> bool:
     """
     Returns True if this phase should be published now.
 
     Rules:
     - At least one of its tools is in selected_tools
-    - None of its tools have been completed yet (not already started)
+    - Phase has NOT already been published (tracked in started_phases)
     - All trigger_after tools that are in selected_tools have completed
+
+    started_phases: set of phase ids already dispatched via _publish_phase.
+    This is the authoritative "already started" check — it is immune to
+    finding_router side-effects (e.g. finding_router completing a DAST-phase
+    tool before the DAST phase's trigger deps are met would previously cause
+    the phase to be skipped forever).
     """
     phase_tools = phase["tools"] & selected_tools
     if not phase_tools:
         return False  # Nothing from this phase was selected
 
-    # Already started: some phase tool has completed or is running
-    if phase_tools & completed_tools:
-        return False
+    # Primary guard: phase was explicitly dispatched by the orchestrator
+    if started_phases is not None:
+        if phase["id"] in started_phases:
+            return False
+    else:
+        # Legacy fallback when started_phases is not available:
+        # use completed_tools heuristic (can be fooled by finding_router)
+        if phase_tools & completed_tools:
+            return False
 
     # Evaluate dependencies — only count triggers that were actually selected
     deps = phase["trigger_after"] & selected_tools

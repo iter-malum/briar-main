@@ -647,6 +647,116 @@ services:
       - briar-net
     restart: unless-stopped
 
+  # === DOM XSS WORKER ===
+
+  worker-playwright:
+    build:
+      context: .
+      dockerfile: services/worker-playwright/Dockerfile
+    container_name: briar-worker-playwright
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      PLAYWRIGHT_XSS_CONCURRENCY: "2"
+      PLAYWRIGHT_PAGE_TIMEOUT: "10000"
+      PLAYWRIGHT_WAIT_RENDER: "3000"
+      PLAYWRIGHT_MAX_PARAM_URLS: "40"
+      PLAYWRIGHT_TOTAL_TIMEOUT: "900"
+    deploy:
+      resources:
+        limits:
+          memory: 1G    # Chromium needs ~400 MB per instance
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  worker-xxe:
+    build:
+      context: .
+      dockerfile: services/worker-xxe/Dockerfile
+    container_name: briar-worker-xxe
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+      XXE_REQUEST_TIMEOUT: "12"
+      XXE_TIMING_THRESHOLD: "8"
+      XXE_TOTAL_TIMEOUT: "600"
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  # === M15 DAST WORKERS (credential attack) ===
+
+  worker-creds:
+    build:
+      context: .
+      dockerfile: services/worker-creds/Dockerfile
+    container_name: briar-worker-creds
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+    networks:
+      - briar-net
+    restart: unless-stopped
+
+  # === M16 DAST WORKERS (business logic) ===
+
+  worker-bizlogic:
+    build:
+      context: .
+      dockerfile: services/worker-bizlogic/Dockerfile
+    container_name: briar-worker-bizlogic
+    depends_on:
+      rabbitmq: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: "5672"
+      RABBITMQ_USER: guest
+      RABBITMQ_PASS: guest
+      DB_USER: briar
+      DB_PASSWORD: secure_password_change_me
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: briar_db
+      AUTH_SERVICE_URL: http://auth-service:8000
+    networks:
+      - briar-net
+    restart: unless-stopped
+
   # === M11 DAST WORKERS ===
 
   worker-cors:

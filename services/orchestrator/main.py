@@ -15,7 +15,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 from uuid import UUID, uuid4
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -215,8 +215,11 @@ class PipelineManager:
                     )
 
             # Evaluate which phases are now unblocked
+            # started_phases tracks phases explicitly dispatched by _publish_phase
+            # so finding_router completions can't trick us into skipping a phase.
+            started_phases: Set[str] = set(scan.config.get("started_phases", []))
             for phase in PHASES:
-                if not should_trigger_phase(phase, completed_tools, selected_tools):
+                if not should_trigger_phase(phase, completed_tools, selected_tools, started_phases):
                     continue
 
                 # Extra guards for exploit phase
@@ -231,6 +234,9 @@ class PipelineManager:
                         continue
 
                 await self._publish_phase(scan_id, scan, phase, selected_tools, app_context or {})
+                # Mark phase as started so re-entrant calls don't double-publish
+                started_phases.add(phase["id"])
+                scan.config = {**scan.config, "started_phases": list(started_phases)}
 
             # M7: Route any newly-emitted high-value findings to specialized tools.
             # Runs after phase triggers so both paths are committed together.
@@ -528,6 +534,7 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
 
         # Publish ONLY the recon phase tools immediately
         recon_tools = get_tools_for_initial_publish(set(payload.tools))
+        initial_phase_id = "recon"
 
         # If no recon tools selected, skip directly to the first eligible phase
         if not recon_tools:
@@ -536,7 +543,13 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
                 phase_tools = phase["tools"] & set(payload.tools)
                 if phase_tools and not (phase["trigger_after"] & set(payload.tools)):
                     recon_tools = list(phase_tools)
+                    initial_phase_id = phase["id"]
                     break
+
+        # Record the initial phase as started so _advance_pipeline won't re-publish it
+        if recon_tools:
+            scan.config = {**scan.config, "started_phases": [initial_phase_id]}
+            await session.commit()
 
         for tool in recon_tools:
             queue_name = TOOL_QUEUES.get(tool)

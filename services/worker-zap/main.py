@@ -349,7 +349,11 @@ class ZAPWorker(BaseWorker):
     # ── Auth loading ───────────────────────────────────────────────────────────
 
     async def _load_auth(self, client: httpx.AsyncClient, auth_context: Dict[str, Any]):
-        """Add cookies and custom headers via ZAP's replacer API."""
+        """Add cookies and custom headers via ZAP's replacer API.
+
+        ZAP 2.15+ replacer addRule requires the `url` parameter (empty = all URLs).
+        Without it the API returns HTTP 400.  Always pass url="" explicitly.
+        """
         cookies = auth_context.get("cookies", [])
         if cookies:
             cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
@@ -364,7 +368,9 @@ class ZAPWorker(BaseWorker):
                     matchstring="Cookie",
                     replacement=cookie_str,
                     initiators="",
+                    url="",
                 )
+                logger.info("[zap] Auth cookie injected via replacer")
             except Exception as exc:
                 logger.warning(f"[zap] Failed to set cookie: {exc}")
 
@@ -382,7 +388,9 @@ class ZAPWorker(BaseWorker):
                     matchstring=name,
                     replacement=value,
                     initiators="",
+                    url="",
                 )
+                logger.info(f"[zap] Auth header '{name}' injected via replacer")
             except Exception as exc:
                 logger.warning(f"[zap] Failed to set header {name}: {exc}")
 
@@ -406,9 +414,16 @@ class ZAPWorker(BaseWorker):
         spec_url: Optional[str] = task_payload.get("openapi_url")
 
         if not spec_url:
-            # Probe common OpenAPI spec paths
+            # Probe common OpenAPI spec paths.
+            # /api-docs first — Juice Shop returns JSON spec when asked with
+            # Accept: application/json. Use follow_redirects=True and record
+            # the *final* URL so ZAP's importUrl doesn't hit a 301.
             base = _extract_base_url(target)
             candidates = [
+                f"{base}/api-docs",
+                f"{base}/api-docs/",
+                f"{base}/v2/api-docs",   # Spring Boot default
+                f"{base}/v3/api-docs",
                 f"{base}/openapi.json",
                 f"{base}/openapi.yaml",
                 f"{base}/swagger.json",
@@ -416,18 +431,22 @@ class ZAPWorker(BaseWorker):
                 f"{base}/api/openapi.json",
                 f"{base}/api/swagger.json",
                 f"{base}/v1/openapi.json",
-                f"{base}/v2/api-docs",   # Spring Boot default
-                f"{base}/api-docs",
             ]
             for candidate in candidates:
                 try:
-                    resp = await client.get(candidate, timeout=5, follow_redirects=True)
+                    resp = await client.get(
+                        candidate,
+                        timeout=5,
+                        follow_redirects=True,
+                        headers={"Accept": "application/json"},
+                    )
                     if resp.status_code == 200 and (
                         "openapi" in resp.text[:200].lower()
                         or "swagger" in resp.text[:200].lower()
-                        or '"paths"' in resp.text[:500]
+                        or ('"paths"' in resp.text[:500] and '"info"' in resp.text[:500])
                     ):
-                        spec_url = candidate
+                        # Use the final URL after redirects so ZAP importUrl succeeds
+                        spec_url = str(resp.url)
                         logger.info(f"[zap] OpenAPI spec discovered at {spec_url}")
                         break
                 except Exception:
