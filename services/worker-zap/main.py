@@ -49,6 +49,7 @@ ZAP_ADDONS = [
     "graphql",          # GraphQL introspection and active scanning
     "soap",             # WSDL/SOAP service scanning
     "retire",           # Retire.js integration — JS library CVE matching
+    "replacer",         # HTTP request/response replacer — REQUIRED for auth header injection
 ]
 
 # Extensions that are pointless to scan with ZAP active scanner
@@ -437,10 +438,18 @@ class ZAPWorker(BaseWorker):
                         follow_redirects=True,
                         headers={"Accept": "application/json"},
                     )
-                    if resp.status_code == 200 and (
-                        "openapi" in resp.text[:200].lower()
-                        or "swagger" in resp.text[:200].lower()
-                        or ('"paths"' in resp.text[:500] and '"info"' in resp.text[:500])
+                    if resp.status_code != 200:
+                        continue
+                    ct = resp.headers.get("content-type", "")
+                    body = resp.text
+                    # Must be JSON/YAML content — reject HTML Swagger UI pages
+                    is_html = "text/html" in ct or body.lstrip().startswith("<!DOCTYPE")
+                    if is_html:
+                        continue
+                    if (
+                        "openapi" in body[:400].lower()
+                        or "swagger" in body[:400].lower()
+                        or ('"paths"' in body[:800] and '"info"' in body[:800])
                     ):
                         # Use the final URL after redirects so ZAP importUrl succeeds
                         spec_url = str(resp.url)
