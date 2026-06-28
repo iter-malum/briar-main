@@ -19,7 +19,7 @@ RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sou
 WORKDIR /app
 
 COPY services/worker-whatweb/requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-whatweb/main.py ./main.py

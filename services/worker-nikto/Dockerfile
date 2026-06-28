@@ -25,7 +25,7 @@ RUN sed -i 's|URIs: http://|URIs: https://|g' /etc/apt/sources.list.d/debian.sou
 WORKDIR /app
 
 COPY services/worker-nikto/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-nikto/main.py ./

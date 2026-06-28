@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY services/worker-playwright/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt \
  && playwright install chromium --with-deps
 
 COPY shared/ ./shared/

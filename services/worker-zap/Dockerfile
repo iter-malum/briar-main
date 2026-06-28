@@ -17,7 +17,7 @@ ENV PYTHONPATH=/app
 WORKDIR /app
 
 COPY services/worker-zap/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-zap/main.py .

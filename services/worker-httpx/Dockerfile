@@ -22,7 +22,7 @@ RUN curl -sL -o /tmp/httpx.zip \
 WORKDIR /app
 
 COPY services/worker-httpx/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-httpx/main.py ./

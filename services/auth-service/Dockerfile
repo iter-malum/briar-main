@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir websockify==0.11.0 && \
 WORKDIR /app
 
 COPY services/auth-service/requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 # Chromium is already installed in the base image — just verify it
 RUN python -m playwright install chromium
