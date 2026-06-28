@@ -351,8 +351,9 @@ class ZAPWorker(BaseWorker):
     async def _load_auth(self, client: httpx.AsyncClient, auth_context: Dict[str, Any]):
         """Add cookies and custom headers via ZAP's replacer API.
 
-        ZAP 2.15+ replacer addRule requires the `url` parameter (empty = all URLs).
-        Without it the API returns HTTP 400.  Always pass url="" explicitly.
+        Omit optional `url` and `initiators` params entirely — passing empty strings
+        causes ZAP's Jetty to return 400 due to URL validation. Omitting them makes
+        ZAP apply the rule to all URLs (the desired default).
         """
         cookies = auth_context.get("cookies", [])
         if cookies:
@@ -367,8 +368,6 @@ class ZAPWorker(BaseWorker):
                     matchregex="false",
                     matchstring="Cookie",
                     replacement=cookie_str,
-                    initiators="",
-                    url="",
                 )
                 logger.info("[zap] Auth cookie injected via replacer")
             except Exception as exc:
@@ -387,8 +386,6 @@ class ZAPWorker(BaseWorker):
                     matchregex="false",
                     matchstring=name,
                     replacement=value,
-                    initiators="",
-                    url="",
                 )
                 logger.info(f"[zap] Auth header '{name}' injected via replacer")
             except Exception as exc:

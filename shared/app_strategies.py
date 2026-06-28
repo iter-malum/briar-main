@@ -41,9 +41,9 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {
         },
         "zap": {
             "run_ajax_spider":        True,
-            "ajax_timeout":           300,  # longer for full route discovery
-            "run_traditional_spider": True,
-            "run_openapi_import":     False,
+            "ajax_timeout":           300,  # longer for full Angular/React route discovery
+            "run_traditional_spider": False, # traditional spider misses hash-fragment routes
+            "run_openapi_import":     True,  # Juice Shop exposes /api-docs
         },
         "ffuf": {
             # SPAs rarely expose extension-based paths — root wordlist is best
@@ -56,8 +56,11 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {
             # - nodejs/express: Node.js CVEs, prototype pollution, path traversal
             # - api: REST API misconfigurations, undocumented endpoints
             # - injection: broad injection category (SQL, SSTI, cmdi templates)
+            # - nosql: Sequelize/MongoDB ORM injection patterns
+            # - prototype-pollution: Node.js __proto__ merge attacks
             "extra_tags":      ["xss", "cors", "csp", "clickjacking", "dom",
-                                "jwt", "auth", "token", "nodejs", "api", "injection"],
+                                "jwt", "auth", "token", "nodejs", "api", "injection",
+                                "nosql", "prototype-pollution", "idor", "exposure"],
             "template_paths":  [],
         },
         "inspector": {

@@ -185,6 +185,18 @@ class BizLogicWorker(BaseWorker):
             if r:
                 results.append(r)
 
+            # ── Test 8: BOLA — access other users' basket ─────────────────────
+            logger.info("[bizlogic] Test 8: BOLA — access another user's basket")
+            r = await self._test_bola_basket(client, origin, json_headers)
+            if r:
+                results.append(r)
+
+            # ── Test 9: Admin section access without role check ───────────────
+            logger.info("[bizlogic] Test 9: admin section access")
+            r = await self._test_admin_section(client, origin, json_headers)
+            if r:
+                results.append(r)
+
         logger.info(f"[bizlogic] Done — {len(results)} finding(s)")
         return results
 
@@ -514,6 +526,91 @@ class BizLogicWorker(BaseWorker):
             f"Payload exposed product with deletedAt set: id={deleted_product_id}",
             "A03:2021 – Injection (SQL Injection)",
         )
+
+
+    async def _test_bola_basket(
+        self,
+        client: httpx.AsyncClient,
+        origin: str,
+        headers: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        BOLA (Broken Object Level Authorization): access another user's basket.
+        Juice Shop: GET /rest/basket/:id returns any basket, even for other users.
+        Test by reading basket IDs 2-5 without owning them.
+        """
+        for basket_id in range(2, 6):
+            url = f"{origin}/rest/basket/{basket_id}"
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        products = data.get("data", {}).get("Products", [])
+                        if isinstance(products, list):
+                            logger.info(
+                                f"[bizlogic/bola] Basket {basket_id} accessible: "
+                                f"{len(products)} item(s)"
+                            )
+                            return _finding(
+                                url, "bola_basket", SeverityLevel.high,
+                                (
+                                    f"BOLA: unauthenticated/unprivileged access to basket "
+                                    f"id={basket_id} — returned {len(products)} product(s) "
+                                    "belonging to another user"
+                                ),
+                                f"GET {url} → HTTP 200 with Products list",
+                                "A01:2021 – Broken Access Control",
+                            )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"[bizlogic/bola] Basket {basket_id}: {e}")
+        return None
+
+    async def _test_admin_section(
+        self,
+        client: httpx.AsyncClient,
+        origin: str,
+        headers: Dict[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Test whether the /administration SPA route returns admin-only data via REST
+        even without admin role in the JWT.
+        Juice Shop: GET /api/Users returns all users for any authenticated user.
+        """
+        admin_api_paths = [
+            "/api/Users",        # lists all registered users
+            "/api/Feedbacks",    # lists all feedback (admin-only in UI)
+        ]
+        for path in admin_api_paths:
+            url = f"{origin}{path}"
+            try:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        items = data.get("data", [])
+                        if isinstance(items, list) and len(items) > 1:
+                            logger.info(
+                                f"[bizlogic/admin] {path} returned {len(items)} items "
+                                "without admin role check"
+                            )
+                            return _finding(
+                                url, "missing_admin_role_check", SeverityLevel.high,
+                                (
+                                    f"Missing admin role check: {path} returned "
+                                    f"{len(items)} records without admin privileges — "
+                                    "all user emails / feedback data exposed"
+                                ),
+                                f"GET {url} → HTTP 200, {len(items)} records in data[]",
+                                "A01:2021 – Broken Access Control",
+                            )
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.debug(f"[bizlogic/admin] {path}: {e}")
+        return None
 
 
 if __name__ == "__main__":

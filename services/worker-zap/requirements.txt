@@ -9,3 +9,4 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.0
 python-owasp-zap-v2.4==0.0.21
 prometheus-client==0.20.0
+# rebuild: 2026-06-28

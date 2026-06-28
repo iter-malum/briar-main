@@ -267,8 +267,8 @@ services:
       ZAP_TIMEOUT: "3600"
       ZAP_PORT: "8090"
       ZAP_API_KEY: "briar-zap-api-key-2024"
-      ZAP_MAX_DURATION: "30"
-      ZAP_AJAX_TIMEOUT: "120"      # Seconds to run AJAX Spider for SPA route discovery
+      ZAP_MAX_DURATION: "55"
+      ZAP_AJAX_TIMEOUT: "300"      # Seconds to run AJAX Spider for SPA route discovery
       ZAP_INSTALL_ADDONS: "true"   # Install community add-ons on startup
     networks:
       - briar-net
@@ -455,8 +455,8 @@ services:
       DB_NAME: briar_db
       AUTH_SERVICE_URL: http://auth-service:8000
       SQLMAP_BIN: /opt/sqlmap/sqlmap.py
-      SQLMAP_LEVEL: "1"
-      SQLMAP_RISK: "1"
+      SQLMAP_LEVEL: "2"
+      SQLMAP_RISK: "2"
       SQLMAP_DUMP: "false"
       SQLMAP_PER_URL_TIMEOUT: "600"
       SQLMAP_TOTAL_TIMEOUT: "1800"

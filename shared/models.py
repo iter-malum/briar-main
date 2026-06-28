@@ -49,6 +49,7 @@ class ScanCreateRequest(BaseModel):
     auth_session_id: Optional[UUID] = None
     tools: List[str] = Field(default_factory=lambda: ["katana", "nuclei"], min_length=1)
     exploit_enabled: bool = False
+    use_endpoint_cache: bool = False  # warm-start: reuse katana results from a previous scan
 
 class ScanResponse(BaseModel):
     id: UUID

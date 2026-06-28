@@ -110,11 +110,23 @@ export const fetchVulnerabilities = (params: VulnParams = {}): Promise<Vulnerabi
 
 // ── Create scan (via gateway POST /api/v1/scans) ─────────────────────────────
 
+export interface CacheStats {
+  available: boolean
+  source_scan_id: string | null
+  endpoint_count: number
+  cached_at: string | null
+  age_hours: number | null
+}
+
+export const fetchCacheStats = (targetUrl: string): Promise<CacheStats> =>
+  get(`/api/v1/scans/cache-stats?target_url=${encodeURIComponent(targetUrl)}`)
+
 export interface CreateScanPayload {
   target_url: string
   tools: string[]
   auth_session_id?: string | null
   exploit_enabled?: boolean
+  use_endpoint_cache?: boolean
   second_auth_context?: {
     session_id: string
     target_url: string

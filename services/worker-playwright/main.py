@@ -144,6 +144,17 @@ _STORED_XSS_PATTERNS: List[Dict[str, Any]] = [
         "ids":         [None],
         "method":      "POST",
     },
+    # ── Juice Shop: user profile username field (stored XSS via username) ───────
+    # PUT /rest/user/whoami requires auth; profile rendered at /#/profile
+    # Angular {{username}} interpolation in profile page can execute injected JS
+    {
+        "desc":        "user profile username (Juice Shop)",
+        "post_path":   "/rest/users/me",
+        "post_body":   {"username": "{payload}"},
+        "render_path": "/#/profile",
+        "ids":         [None],
+        "method":      "PUT",
+    },
     # ── Generic patterns for non-Juice-Shop targets ──────────────────────────
     {
         "desc":        "generic /api/comments",

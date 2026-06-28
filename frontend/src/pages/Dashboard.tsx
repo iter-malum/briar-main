@@ -1,15 +1,17 @@
-import { useState } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import {
   RefreshCw, Plus, GitGraph, ShieldAlert, ExternalLink,
   StopCircle, Trash2, FileBarChart, ChevronDown, ChevronUp,
-  AlertTriangle, Zap,
+  AlertTriangle, Zap, Database,
 } from 'lucide-react'
 import {
   fetchScans, createScan, cancelScan, deleteScan,
   fetchAuthSessions, downloadHtmlReport, downloadJsonReport,
+  fetchCacheStats,
 } from '../api/client'
+import type { CacheStats } from '../api/client'
 import { StatusBadge } from '../components/StatusBadge'
 import type { Scan, AuthSession } from '../types'
 
@@ -67,8 +69,34 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
   const [selectedSession, setSelectedSession] = useState('')
   const [secondSession, setSecondSession] = useState('')
   const [exploitEnabled, setExploitEnabled] = useState(false)
+  const [useEndpointCache, setUseEndpointCache] = useState(false)
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null)
+  const [cacheLoading, setCacheLoading] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState('')
+  const cacheTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Debounced cache check — fires 600ms after URL stops changing
+  useEffect(() => {
+    setCacheStats(null)
+    setUseEndpointCache(false)
+    if (!url || !url.startsWith('http')) return
+    if (cacheTimerRef.current) clearTimeout(cacheTimerRef.current)
+    cacheTimerRef.current = setTimeout(async () => {
+      setCacheLoading(true)
+      try {
+        const stats = await fetchCacheStats(url)
+        setCacheStats(stats)
+        // Auto-enable cache if available and katana is selected
+        if (stats.available && tools.includes('katana')) setUseEndpointCache(true)
+      } catch {
+        setCacheStats(null)
+      } finally {
+        setCacheLoading(false)
+      }
+    }, 600)
+    return () => { if (cacheTimerRef.current) clearTimeout(cacheTimerRef.current) }
+  }, [url])
 
   const { data: sessions } = useQuery({
     queryKey: ['auth-sessions'],
@@ -92,6 +120,7 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
       tools,
       auth_session_id: selectedSession || null,
       exploit_enabled: exploitEnabled,
+      use_endpoint_cache: useEndpointCache && tools.includes('katana'),
       second_auth_context: (secondSession && tools.includes('bola'))
         ? { session_id: secondSession, target_url: url }
         : null,
@@ -122,6 +151,62 @@ function NewScanModal({ onClose }: { onClose: () => void }) {
               className={inputCls}
             />
           </div>
+
+          {/* Endpoint Cache / Warm Start */}
+          {(cacheLoading || cacheStats) && (
+            <div
+              className={`rounded-lg px-3 py-2.5 flex items-start gap-3 text-xs transition-all ${
+                cacheStats?.available
+                  ? 'border border-emerald-500/30 bg-emerald-500/5'
+                  : 'border border-slate-700 bg-slate-800/40'
+              }`}
+            >
+              <Database
+                size={14}
+                className={`mt-0.5 shrink-0 ${cacheStats?.available ? 'text-emerald-400' : 'text-slate-500'}`}
+              />
+              <div className="flex-1 min-w-0">
+                {cacheLoading && (
+                  <p className="text-slate-400">Checking endpoint cache…</p>
+                )}
+                {!cacheLoading && cacheStats?.available && (
+                  <>
+                    <p className="text-emerald-300 font-medium">
+                      Endpoint cache available — {cacheStats.endpoint_count} endpoints
+                      {cacheStats.age_hours != null && (
+                        <span className="text-emerald-500 font-normal">
+                          {' '}· {cacheStats.age_hours < 1
+                            ? 'less than 1h ago'
+                            : `${Math.round(cacheStats.age_hours)}h ago`}
+                        </span>
+                      )}
+                    </p>
+                    <p className="text-slate-500 mt-0.5">
+                      Skip katana crawl and start probe/DAST immediately using results from a previous scan.
+                    </p>
+                    <label className="flex items-center gap-2 mt-2 cursor-pointer">
+                      <div
+                        onClick={() => setUseEndpointCache((x) => !x)}
+                        className={`w-8 h-4 rounded-full transition-colors flex items-center shrink-0 ${
+                          useEndpointCache ? 'bg-emerald-500' : 'bg-briar-border'
+                        }`}
+                      >
+                        <div className={`w-3 h-3 bg-white rounded-full shadow transition-transform mx-0.5 ${
+                          useEndpointCache ? 'translate-x-4' : 'translate-x-0'
+                        }`} />
+                      </div>
+                      <span className={useEndpointCache ? 'text-emerald-300' : 'text-slate-400'}>
+                        {useEndpointCache ? 'Warm start ON — katana will be skipped' : 'Warm start OFF — run full crawl'}
+                      </span>
+                    </label>
+                  </>
+                )}
+                {!cacheLoading && cacheStats && !cacheStats.available && (
+                  <p className="text-slate-500">No cached endpoints for this target — full crawl will run.</p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Auth session */}
           <div>

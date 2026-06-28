@@ -67,6 +67,10 @@ def _route(path: str, method: str) -> str:
     if path.startswith("/api/v1/integrations/"):
         return INTEGRATION_SERVICE_URL
 
+    # Endpoint cache stats (GET /api/v1/scans/cache-stats) → orchestrator
+    if method == "GET" and path.rstrip("/") == "/api/v1/scans/cache-stats":
+        return settings.ORCHESTRATOR_URL
+
     # Scan creation (POST /api/v1/scans exactly) → orchestrator
     if method == "POST" and path.rstrip("/") == "/api/v1/scans":
         return settings.ORCHESTRATOR_URL

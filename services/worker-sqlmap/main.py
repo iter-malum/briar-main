@@ -46,6 +46,16 @@ TOTAL_TIMEOUT   = int(os.getenv("SQLMAP_TOTAL_TIMEOUT", "1800"))
 # Safety: refuse obviously unrelated URLs (local, reserved)
 _BLOCKED_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
+# Juice Shop known SQLi surfaces tested directly when the upstream pipeline
+# produces no sqli_candidate findings (e.g. after auth failures or worker crashes).
+# Format: (path, method, post_data — use "*" as injection marker for sqlmap)
+_JUICE_SHOP_SQLI_SURFACES = [
+    # Sequelize raw-query search endpoint: GET /rest/products/search?q=<payload>
+    ("/rest/products/search", "GET", ""),
+    # Login endpoint: POST body email field is injectable
+    ("/rest/user/login", "POST", '{"email":"*","password":"test"}'),
+]
+
 
 class SqlmapWorker(BaseWorker):
     def __init__(self):
@@ -66,32 +76,52 @@ class SqlmapWorker(BaseWorker):
         # Load SQLi-positive endpoints (URLs only) from DB
         sqli_endpoints = await self._get_sqli_endpoints_from_db(scan_id, source_tools)
 
-        if not sqli_endpoints:
-            logger.info("[sqlmap] No SQLi-positive endpoints found — skipping")
-            return []
-
         # Also load full context (method + POST body) for those same endpoints
         all_eps = await self._get_endpoints_with_params(scan_id, source_tools)
-        # Build lookup: url → endpoint context
         ep_context: Dict[str, Dict] = {ep["url"]: ep for ep in all_eps}
 
-        logger.info(f"[sqlmap] Will test {len(sqli_endpoints)} SQLi-positive endpoints")
+        # Fallback: when upstream pipeline found no SQLi candidates (e.g. ZAP/nuclei
+        # ran without auth or other workers crashed), inject known Juice Shop SQLi
+        # surfaces directly so sqlmap always tests high-confidence targets.
+        fallback_items: List[Dict[str, str]] = []
+        if not sqli_endpoints:
+            logger.info(
+                "[sqlmap] No SQLi-positive endpoints from DB — "
+                "falling back to known Juice Shop SQLi surfaces"
+            )
+            base = target.rstrip("/")
+            for path, method, body in _JUICE_SHOP_SQLI_SURFACES:
+                url = base + path
+                if method == "GET":
+                    url = url + "?q=test"
+                fallback_items.append({"url": url, "body": body, "method": method})
+        else:
+            logger.info(f"[sqlmap] Will test {len(sqli_endpoints)} SQLi-positive endpoints")
 
         results: List[Dict[str, Any]] = []
         total_start = asyncio.get_event_loop().time()
 
+        # Test DB-sourced endpoints
         for url in sqli_endpoints:
             if asyncio.get_event_loop().time() - total_start > TOTAL_TIMEOUT:
                 logger.warning("[sqlmap] Total timeout reached")
                 break
-
             host = urlparse(url).hostname or ""
             if host in _BLOCKED_HOSTS:
                 logger.warning(f"[sqlmap] Skipping blocked host: {url}")
                 continue
-
             ctx = ep_context.get(url, {})
             partial = await self._run_sqlmap(url, auth_context, post_data=ctx.get("body", ""))
+            results.extend(partial)
+
+        # Test fallback surfaces (Juice Shop known endpoints)
+        for item in fallback_items:
+            if asyncio.get_event_loop().time() - total_start > TOTAL_TIMEOUT:
+                logger.warning("[sqlmap] Total timeout reached during fallback")
+                break
+            partial = await self._run_sqlmap(
+                item["url"], auth_context, post_data=item["body"]
+            )
             results.extend(partial)
 
         logger.info(f"[sqlmap] Confirmed {len(results)} injection points")

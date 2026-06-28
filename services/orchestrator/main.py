@@ -51,6 +51,7 @@ from shared.pipeline import (
 from finding_router import FindingRouter
 from shared.rabbitmq import RabbitMQPublisher
 from result_processor import process_tool_results
+from shared.endpoint_cache import find_best_source_scan, inject_cached_endpoints
 from report_generator import generate_json_report, generate_html_report
 
 # ── Prometheus metrics ─────────────────────────────────────────────────────────
@@ -495,6 +496,25 @@ async def shutdown():
 
 # ── REST API ───────────────────────────────────────────────────────────────────
 
+@app.get("/scans/cache-stats")
+async def get_endpoint_cache_stats(
+    target_url: str,
+    session: AsyncSession = Depends(get_db),
+):
+    """
+    Return endpoint-cache availability for *target_url*.
+
+    Response fields:
+      available       — whether a warm-start cache exists
+      source_scan_id  — UUID of the scan that will be used as source
+      endpoint_count  — number of endpoints that would be injected
+      cached_at       — ISO datetime of that scan's completion
+      age_hours       — how old the cache is in hours
+    """
+    from shared.endpoint_cache import get_cache_stats
+    return await get_cache_stats(target_url, session)
+
+
 @app.post("/scans", response_model=ScanResponse, status_code=201)
 async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depends(get_db)):
     logger.info(f"New scan request: {payload.target_url} tools={payload.tools}")
@@ -521,6 +541,56 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
         for tool in payload.tools:
             session.add(ScanStepORM(scan_id=scan.id, tool=tool, status=ScanStatus.pending))
 
+        # ── Endpoint cache warm-start ─────────────────────────────────────────
+        # If the user requested a warm-start and katana is in the tool list,
+        # try to copy endpoint rows from the most recent completed scan for
+        # the same target.  If injection succeeds we mark the katana step as
+        # completed immediately so the pipeline advances to probe/DAST without
+        # running the crawler again.
+        endpoint_cache_used = False
+        if payload.use_endpoint_cache and "katana" in payload.tools:
+            cache_hit = await find_best_source_scan(
+                target_url=str(payload.target_url).rstrip("/"),
+                current_scan_id=scan_id,
+                session=session,
+            )
+            if cache_hit:
+                source_scan_id, cached_at, cached_count = cache_hit
+                injected = await inject_cached_endpoints(source_scan_id, scan_id, session)
+                if injected > 0:
+                    # Mark katana step completed so the pipeline skips it
+                    katana_step = next(
+                        (s for s in scan.steps if s.tool == "katana"), None
+                    )
+                    if katana_step is None:
+                        # steps not loaded yet — query directly
+                        from sqlalchemy import update as sa_update
+                        await session.execute(
+                            sa_update(ScanStepORM)
+                            .where(ScanStepORM.scan_id == scan_id, ScanStepORM.tool == "katana")
+                            .values(
+                                status=ScanStatus.completed,
+                                started_at=cached_at,
+                                finished_at=cached_at,
+                            )
+                        )
+                    else:
+                        katana_step.status = ScanStatus.completed
+                        katana_step.started_at = cached_at
+                        katana_step.finished_at = cached_at
+
+                    scan.config = {
+                        **scan.config,
+                        "endpoint_cache_used": True,
+                        "endpoint_cache_source": str(source_scan_id),
+                        "endpoint_cache_count": injected,
+                    }
+                    endpoint_cache_used = True
+                    logger.info(
+                        f"[endpoint_cache] Warm-start: injected {injected} endpoints "
+                        f"from scan {source_scan_id} into {scan_id}"
+                    )
+
         await session.commit()
 
         # Reload with steps for response
@@ -533,8 +603,26 @@ async def create_scan(payload: ScanCreateRequest, session: AsyncSession = Depend
         scan_with_steps = result.scalars().first()
 
         # Publish ONLY the recon phase tools immediately
-        recon_tools = get_tools_for_initial_publish(set(payload.tools))
-        initial_phase_id = "recon"
+        # If the endpoint cache was used, katana is already completed — skip it
+        # and start from the probe phase instead.
+        if endpoint_cache_used:
+            tools_to_start = set(payload.tools) - {"katana"}
+            recon_tools = get_tools_for_initial_publish(tools_to_start)
+            # If no other recon tools remain, find the first eligible probe phase
+            if not recon_tools:
+                for phase in PHASES:
+                    if phase["id"] == "recon":
+                        continue
+                    phase_tools = phase["tools"] & tools_to_start
+                    # Treat katana deps as already satisfied
+                    satisfied_deps = phase["trigger_after"] - {"katana"}
+                    if phase_tools and not (satisfied_deps & tools_to_start):
+                        recon_tools = list(phase_tools)
+                        break
+            initial_phase_id = "probe" if recon_tools else "recon"
+        else:
+            recon_tools = get_tools_for_initial_publish(set(payload.tools))
+            initial_phase_id = "recon"
 
         # If no recon tools selected, skip directly to the first eligible phase
         if not recon_tools:

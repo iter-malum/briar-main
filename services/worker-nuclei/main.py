@@ -91,6 +91,7 @@ class NucleiWorker(BaseWorker):
             cmd = [
                 "nuclei",
                 "-l", targets_file,       # multi-target list
+                "-t", "/root/nuclei-templates",  # explicit path — avoids template-not-found silently
                 "-jsonl",
                 "-silent",
                 "-rate-limit", str(self.rate_limit),
@@ -98,7 +99,7 @@ class NucleiWorker(BaseWorker):
                 "-timeout", "30",
                 "-retries", "1",
                 "-no-interactsh",         # don't depend on external interactsh.com — works offline
-                "-duc",                   # skip update check — faster startup, templates managed in image
+                "-duc",                   # skip update check — templates baked into image at build time
                 "-stats",                 # periodic progress log so we know it's running
             ]
 

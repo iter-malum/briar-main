@@ -658,6 +658,7 @@ async def _probe_seed_resources(
         async with semaphore:
             try:
                 resp = await client.get(url, headers=auth_headers)
+                logger.debug(f"[bola/seed] {url} → {resp.status_code}")
                 if resp.status_code not in (200, 201):
                     return
                 # Skip SPA wildcard responses: SPAs (Angular, React, Vue) return
@@ -679,8 +680,8 @@ async def _probe_seed_resources(
                     "orig_id":  1,
                 })
                 logger.info(f"[bola/seed] Live resource found: {url} → HTTP {resp.status_code}")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(f"[bola/seed] Exception for {url}: {exc}")
 
     await asyncio.gather(*[_check(p) for p in _SEED_RESOURCE_PATHS])
     return discovered
