@@ -4,11 +4,11 @@ FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app
 
-# Copy nuclei binary AND bundled templates from the official image.
-# Without copying templates, nuclei runs with 0 templates → 0 results.
-# The official nuclei image stores templates at /root/nuclei-templates.
+# Copy the nuclei binary from the official image.
+# Templates are no longer bundled in recent nuclei images — they are downloaded
+# at first run via `nuclei -update-templates`.  We download them here during
+# the build so the container starts immediately without an internet call.
 COPY --from=nuclei /usr/local/bin/nuclei /usr/local/bin/nuclei
-COPY --from=nuclei /root/nuclei-templates /root/nuclei-templates
 
 WORKDIR /app
 
@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir --timeout 120 --retries 5 -r requirements.txt
 
 COPY shared/ ./shared/
 COPY services/worker-nuclei/main.py ./
+
+# Download/update nuclei templates at build time.
+# HOME must be set so nuclei writes to a predictable path.
+ENV HOME=/root
+RUN nuclei -update-templates -silent || true
 
 RUN mkdir -p /tmp/nuclei && chmod 777 /tmp/nuclei
 
