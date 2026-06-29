@@ -289,7 +289,7 @@ PHASES: List[Dict] = [
     # and most modern Node apps use JWT — jwt_tool provides real coverage here.
     {
         "id": "dast",
-        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "playwright", "xxe", "creds", "bizlogic"},
+        "tools": {"nuclei", "zap", "nikto", "dalfox", "cors", "bola", "playwright", "xxe", "creds", "bizlogic", "sqlmap"},
         "trigger_after": {"httpx", "ffuf", "gobuster"},
         "source_tools": {
             "nuclei":     ["katana", "ffuf", "gobuster", "httpx"],
@@ -306,6 +306,9 @@ PHASES: List[Dict] = [
             "creds":      ["katana", "ffuf", "gobuster", "httpx"],
             # bizlogic tests business logic on the target directly
             "bizlogic":   ["katana", "ffuf", "gobuster", "httpx"],
+            # sqlmap in DAST phase: uses fallback Juice Shop targets when no
+            # upstream SQLi candidates exist; confirms injection without exploit mode
+            "sqlmap":     ["nuclei", "zap", "inspector"],
             # jwt_tool is finding-triggered only (via finding_router on jwt_found),
             # NOT phase-triggered — keeping it here caused the DAST phase to appear
             # "already started" whenever finding_router ran jwt_tool before ffuf finished.
@@ -329,17 +332,16 @@ PHASES: List[Dict] = [
     # candidates were emitted by inspector, so the cost is only one empty run.
     {
         "id": "exploit",
-        "tools": {"sqlmap", "tplmap", "commix"},
+        "tools": {"tplmap", "commix"},
         "trigger_after": {"nuclei", "zap", "inspector"},
         "source_tools": {
-            "sqlmap": ["nuclei", "zap", "inspector"],
             # tplmap + commix get their specific target from the finding_router
             # payload injected by _publish_phase → they use inspector findings
             "tplmap":  ["inspector"],
             "commix":  ["inspector"],
         },
         "requires_explicit": True,
-        "requires_sqli": False,   # sqlmap checks SQLi itself; tplmap/commix have own guards
+        "requires_sqli": False,
     },
 ]
 
@@ -425,6 +427,14 @@ APP_TYPE_SIGNATURES: Dict[str, Dict] = {
     "ember.js":       {"app_type": "spa", "is_spa": True,  "framework": "Ember.js"},
     "backbone.js":    {"app_type": "spa", "is_spa": True,  "framework": "Backbone.js"},
     "gatsby":         {"app_type": "spa", "is_spa": True,  "framework": "Gatsby"},
+    # Node.js / Express ecosystem — placed BEFORE API signatures so that
+    # Node.js/Express apps (like Juice Shop) are correctly classified as SPA
+    # even when they also expose GraphQL/Swagger endpoints.
+    "express":        {"app_type": "spa", "is_spa": True,  "framework": "Express"},
+    "node.js":        {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "nodejs":         {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "socket.io":      {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    "connect.sid":    {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     # API backends — focus on endpoint fuzzing + auth testing
     "graphql":        {"app_type": "api", "is_spa": False, "framework": "GraphQL"},
     "rest":           {"app_type": "api", "is_spa": False, "framework": "REST"},
@@ -439,16 +449,8 @@ APP_TYPE_SIGNATURES: Dict[str, Dict] = {
     "drupal":         {"app_type": "cms", "is_spa": False, "framework": "Drupal"},
     "magento":        {"app_type": "cms", "is_spa": False, "framework": "Magento"},
     "shopify":        {"app_type": "cms", "is_spa": False, "framework": "Shopify"},
-    # Node.js / Express ecosystem — treat as SPA+API target
-    # Juice Shop and many modern apps expose Express + Angular together.
-    # Detecting Express as `app_type=spa` ensures headless AJAX crawling,
-    # correct nuclei tags (nodejs/express), and no traditional-spider explosions.
-    "express":        {"app_type": "spa", "is_spa": True,  "framework": "Express"},
-    "node.js":        {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
-    "nodejs":         {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
+    # Fallback Node.js detection (broader keyword)
     "node":           {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
-    "socket.io":      {"app_type": "spa", "is_spa": True,  "framework": "Node.js"},
-    "connect.sid":    {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     # OWASP Juice Shop — explicitly detected by title / X-Powered-By header
     "juice":          {"app_type": "spa", "is_spa": True,  "framework": "Express"},
     "owasp":          {"app_type": "spa", "is_spa": True,  "framework": "Express"},

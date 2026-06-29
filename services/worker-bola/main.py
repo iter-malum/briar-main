@@ -257,7 +257,7 @@ class BOLAWorker(BaseWorker):
             except Exception:
                 continue
 
-        if len(basket_sizes) >= 2:
+        if len(basket_sizes) >= 1:
             unique_sizes = len(set(basket_sizes.values()))
             findings.append({
                 "url":   f"{base}/rest/basket/{{id}}",

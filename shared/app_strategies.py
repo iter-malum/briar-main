@@ -51,16 +51,11 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {
             "wordlist_override":     None,
         },
         "nuclei": {
-            # SPA + REST API combo (Juice Shop, React/Express, Angular/Node):
-            # - jwt/auth: token manipulation, missing auth headers, weak JWT
-            # - nodejs/express: Node.js CVEs, prototype pollution, path traversal
-            # - api: REST API misconfigurations, undocumented endpoints
-            # - injection: broad injection category (SQL, SSTI, cmdi templates)
-            # - nosql: Sequelize/MongoDB ORM injection patterns
-            # - prototype-pollution: Node.js __proto__ merge attacks
-            "extra_tags":      ["xss", "cors", "csp", "clickjacking", "dom",
+            "extra_tags":      ["xss", "sqli", "lfi", "rce", "cve",
+                                "cors", "csp", "clickjacking", "dom",
                                 "jwt", "auth", "token", "nodejs", "api", "injection",
-                                "nosql", "prototype-pollution", "idor", "exposure"],
+                                "nosql", "prototype-pollution", "idor", "exposure",
+                                "misconfig", "traversal", "redirect"],
             "template_paths":  [],
         },
         "inspector": {
@@ -93,7 +88,9 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {
             "strategies":            ["root", "api_prefix", "idor"],
         },
         "nuclei": {
-            "extra_tags":      ["api", "rest", "swagger", "auth", "token", "jwt", "ssrf"],
+            "extra_tags":      ["api", "rest", "swagger", "auth", "token", "jwt", "ssrf",
+                                "sqli", "xss", "lfi", "rce", "cve", "injection",
+                                "misconfig", "exposure", "idor", "cors"],
             "template_paths":  [],
         },
         "inspector": {

@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger("dalfox-worker")
 
 DALFOX_WORKER  = int(os.getenv("DALFOX_WORKER", "10"))
-DALFOX_TIMEOUT = int(os.getenv("DALFOX_TIMEOUT", "10"))
+DALFOX_TIMEOUT = int(os.getenv("DALFOX_TIMEOUT", "30"))
 DALFOX_BLIND_URL = os.getenv("DALFOX_BLIND_URL", "")
 
 WORK_DIR    = "/tmp/dalfox"
@@ -52,6 +52,7 @@ class DalfoxWorker(BaseWorker):
     ) -> List[Dict[str, Any]]:
 
         endpoints: List[str] = task_payload.get("endpoints", [])
+
         if not endpoints:
             logger.info("[dalfox] No endpoints provided — skipping")
             return []
@@ -140,6 +141,15 @@ class DalfoxWorker(BaseWorker):
 
         if mining_dict:
             cmd.append("--mining-dict")
+
+        # Follow redirects — catches reflected XSS in redirect chains
+        cmd.append("--follow-redirects")
+
+        # Deep DOM XSS analysis via headless browser
+        cmd.append("--deep-domxss")
+
+        # Also fuzz POST body parameters using common param names
+        cmd.extend(["--mining-dom", "--output-all"])
 
         # Auth cookies
         cookies = auth_context.get("cookies", [])

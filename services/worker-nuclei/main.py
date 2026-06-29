@@ -130,10 +130,15 @@ class NucleiWorker(BaseWorker):
                 db_tags = await self.get_tech_tags(scan_id)
                 tech_tags.update(db_tags)
 
-            # Always include broad detection categories regardless of app type:
-            # 'exposure' → /ftp/, /.git/, backup files, swagger.json, etc.
-            # 'misconfig' → security headers, TLS, CORS
-            tech_tags.update({"exposure", "misconfig"})
+            # Always include core vuln categories regardless of app type.
+            # These tags are present across all nuclei template libraries and
+            # must never be filtered out by a narrow app_type tag set.
+            tech_tags.update({
+                "exposure", "misconfig",
+                "sqli", "xss", "injection",
+                "lfi", "rce", "cve",
+                "cors", "auth",
+            })
 
             if app_type == "unknown":
                 # Drop the tag filter entirely for unknown apps.

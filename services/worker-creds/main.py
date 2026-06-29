@@ -339,21 +339,27 @@ class CredsWorker(BaseWorker):
     async def _discover_login_urls(
         self, origin: str, headers: Dict[str, str]
     ) -> List[str]:
-        """Return login paths that respond (not 404/405)."""
+        """Return login paths that respond (not 404/405). Retries if server is starting."""
         active: List[str] = []
-        async with httpx.AsyncClient(verify=False, timeout=5) as client:
-            for path in _LOGIN_PATHS:
-                url = origin + path
-                try:
-                    resp = await client.post(
-                        url,
-                        json={"email": "probe@probe.com", "password": "probe"},
-                        headers={**headers, "Content-Type": "application/json"},
-                    )
-                    if resp.status_code not in (404, 405, 501):
-                        active.append(url)
-                except Exception:
-                    pass
+        for attempt in range(3):
+            async with httpx.AsyncClient(verify=False, timeout=8) as client:
+                for path in _LOGIN_PATHS:
+                    url = origin + path
+                    try:
+                        resp = await client.post(
+                            url,
+                            json={"email": "probe@probe.com", "password": "probe"},
+                            headers={**headers, "Content-Type": "application/json"},
+                        )
+                        if resp.status_code not in (404, 405, 501):
+                            active.append(url)
+                    except Exception:
+                        pass
+            if active:
+                return active
+            if attempt < 2:
+                logger.info(f"[creds] No login endpoints found (attempt {attempt + 1}/3), retrying in 15s...")
+                await asyncio.sleep(15)
         return active
 
     async def _try_login(

@@ -233,12 +233,16 @@ class ZAPWorker(BaseWorker):
                 else:
                     logger.info(f"[zap] Traditional Spider skipped (app_type={app_type!r})")
 
-                # ── Phase 3.5: Exclusions — keep active scanner on API paths ──
-                # Exclude static assets and SPA frontend routes from active scan.
-                # Without this, ZAP attacks hundreds of .js/.css files and
-                # Angular router paths that all return the same index.html,
-                # producing zero findings while consuming the entire scan budget.
+                # ── Phase 3.5: Seed all discovered endpoints into ZAP site tree ─
+                # Without this, ZAP only attacks URLs found by spider, missing
+                # all REST API paths discovered by katana/ffuf/gobuster.
+                await self._seed_endpoints(client, dynamic_endpoints, auth_context)
+
+                # ── Phase 3.6: Exclusions — keep active scanner on API paths ──
                 await self._add_ascan_exclusions(client)
+
+                # ── Phase 3.7: Configure HIGH strength + LOW threshold ─────────
+                await self._configure_scan_policy(client)
 
                 # ── Phase 4: Active Scan ───────────────────────────────────────
                 ascan_id = await self._start_ascan(client, base_url)
@@ -565,6 +569,81 @@ class ZAPWorker(BaseWorker):
             except Exception as exc:
                 logger.debug(f"[zap] Exclusion failed for {pattern!r}: {exc}")
         logger.info(f"[zap] Registered {ok}/{len(self._PROXY_EXCLUDES)} proxy exclusion patterns")
+
+    # ── Scan policy ────────────────────────────────────────────────────────────
+
+    async def _configure_scan_policy(self, client: httpx.AsyncClient):
+        """
+        Set all active scan rules to HIGH strength + LOW threshold.
+        This dramatically increases findings at the cost of more requests and
+        false positives — acceptable for a pentest-grade scanner.
+        """
+        try:
+            await self._zap(
+                client,
+                "ascan/action/setOptionAttackStrength/",
+                String="HIGH",
+            )
+            await self._zap(
+                client,
+                "ascan/action/setOptionAlertThreshold/",
+                String="LOW",
+            )
+            # Enable all scan rules (some are disabled by default)
+            await self._zap(
+                client,
+                "ascan/action/enableAllScanners/",
+            )
+            logger.info("[zap] Scan policy: strength=HIGH, threshold=LOW, all rules enabled")
+        except Exception as exc:
+            logger.warning(f"[zap] Failed to configure scan policy: {exc}")
+
+    async def _seed_endpoints(
+        self,
+        client: httpx.AsyncClient,
+        endpoints: List[str],
+        auth_context: Dict[str, Any],
+    ):
+        """
+        Force every discovered endpoint into ZAP's site tree via sendRequest.
+        Without this, ZAP's active scanner only attacks URLs it found via spider,
+        missing most of the REST API surface discovered by katana/ffuf/gobuster.
+        """
+        headers = auth_context.get("headers", {})
+        auth_header_str = ""
+        for k, v in headers.items():
+            if k.lower() == "authorization":
+                auth_header_str = f"Authorization: {v}\r\n"
+                break
+
+        seeded = 0
+        for ep in endpoints[:300]:  # cap to avoid flooding ZAP's DB
+            try:
+                # Build a minimal HTTP/1.1 request string for ZAP's sendRequest API
+                from urllib.parse import urlparse as _up
+                parsed = _up(ep)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                host = parsed.netloc
+                raw_req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"{auth_header_str}"
+                    f"User-Agent: Mozilla/5.0\r\n"
+                    f"\r\n"
+                )
+                await self._zap(
+                    client,
+                    "core/action/sendRequest/",
+                    request=raw_req,
+                    followRedirects="false",
+                )
+                seeded += 1
+            except Exception:
+                pass
+
+        logger.info(f"[zap] Seeded {seeded}/{len(endpoints)} endpoints into ZAP site tree")
 
     # ── Active scan ────────────────────────────────────────────────────────────
 

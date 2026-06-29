@@ -115,15 +115,27 @@ SENSITIVE_PROBE_PATHS = [
     "/manage",
     "/dashboard",
     "/private",
-    # Juice Shop specific well-known paths
-    "/rest/user/whoami",
-    "/rest/products/search?q=test",
-    "/api/Users",
-    "/api/Users/1",
+    # Monitoring / diagnostics
     "/metrics",
-    "/robot.txt",
+    "/actuator",
+    "/actuator/health",
+    "/actuator/env",
+    "/health",
+    "/status",
+    "/debug",
+    # Common disclosure files
+    "/robots.txt",
     "/security.txt",
     "/.well-known/security.txt",
+    "/sitemap.xml",
+    "/crossdomain.xml",
+    "/clientaccesspolicy.xml",
+    # Common API roots (version-agnostic)
+    "/api/",
+    "/api/v1/",
+    "/api/v2/",
+    "/rest/",
+    "/graphql",
 ]
 
 # Paths that may return Swagger JSON when requested with Accept: application/json

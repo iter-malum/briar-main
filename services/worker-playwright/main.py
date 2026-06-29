@@ -400,7 +400,7 @@ class PlaywrightWorker(BaseWorker):
                         render_path = render_path.replace("{id}", str(entity_id))
 
                     body = {
-                        k: v.replace("{payload}", payload)
+                        k: v.replace("{payload}", payload) if isinstance(v, str) else v
                         for k, v in pattern["post_body"].items()
                     }
                     post_url = origin + post_path
