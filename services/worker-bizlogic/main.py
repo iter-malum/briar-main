@@ -613,6 +613,17 @@ class BizLogicWorker(BaseWorker):
         return None
 
 
-if __name__ == "__main__":
+async def main():
     worker = BizLogicWorker()
-    asyncio.run(worker.start())
+    await worker.start()
+    try:
+        while worker.running:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await worker.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
