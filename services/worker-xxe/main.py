@@ -474,4 +474,4 @@ class XXEWorker(BaseWorker):
 
 if __name__ == "__main__":
     worker = XXEWorker()
-    asyncio.run(worker.run())
+    asyncio.run(worker.start())

@@ -843,4 +843,4 @@ class PlaywrightWorker(BaseWorker):
 
 if __name__ == "__main__":
     worker = PlaywrightWorker()
-    asyncio.run(worker.run())
+    asyncio.run(worker.start())

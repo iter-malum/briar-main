@@ -615,4 +615,4 @@ class BizLogicWorker(BaseWorker):
 
 if __name__ == "__main__":
     worker = BizLogicWorker()
-    asyncio.run(worker.run())
+    asyncio.run(worker.start())

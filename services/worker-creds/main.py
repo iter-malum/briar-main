@@ -603,4 +603,4 @@ class CredsWorker(BaseWorker):
 
 if __name__ == "__main__":
     worker = CredsWorker()
-    asyncio.run(worker.run())
+    asyncio.run(worker.start())
